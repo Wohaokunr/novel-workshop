@@ -265,6 +265,14 @@ export interface RunAgentOptions {
   onCheckpoint?(cp: AgentCheckpoint): void;
   beforeRequest?(): void | Promise<void>;
   maxTurns?: number;
+  /** Deterministic work in place of the next model turn: calls to execute as if the model had made them (recorded in the
+   * conversation like its own), `true` to finish without another request, or nothing to ask the model. */
+  next?(cp: AgentCheckpoint): RuntimeCall[] | true | undefined;
+}
+export interface RuntimeCall { name: string; arguments: Record<string, unknown> }
+/** Runtime-owned calls carry no item id: the service validates ids it issued, and these were never issued by it. */
+export function runtimeCalls(calls: RuntimeCall[]): FunctionCall[] {
+  return calls.map(call => ({ type: 'function_call', call_id: `runtime-${randomUUID()}`, name: call.name, arguments: JSON.stringify(call.arguments) }));
 }
 
 type FunctionCall = Extract<ResponseOutputItem, { type: 'function_call' }>;
@@ -439,6 +447,27 @@ export async function runAgent(definition: AgentDefinition, options: RunAgentOpt
         cp.cursor = 0;
         save();
         continue;
+      }
+      if (options.next) {
+        const work = options.next(cp);
+        if (work === true) {
+          step.status = 'completed';
+          step.finishedAt = new Date().toISOString();
+          cp.phase = 'completed';
+          save();
+          publish();
+          return step;
+        }
+        if (work?.length) {
+          const calls = runtimeCalls(work);
+          cp.input.push(...calls);
+          cp.pendingCalls = calls;
+          cp.cursor = 0;
+          cp.phase = 'tools';
+          save();
+          publish();
+          continue;
+        }
       }
       if (cp.turn >= maxTurns) {
         const reason = `智能体达到 ${maxTurns} 轮上限，请缩小本次任务`;

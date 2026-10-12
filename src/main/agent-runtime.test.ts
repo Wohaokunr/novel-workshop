@@ -437,27 +437,24 @@ test('明确作者记忆、确认与失效按项目隔离，导入副本不串�
   } finally { store.close(); }
 });
 
-test('协调者制定计划后只回文字也会被提醒继续执行；人物塑造用故事操作落到画布并免审批准', { timeout: 15000 }, async () => {
+test('计划保存后由运行时执行到作者批准，协调者只规划和总结；人物塑造用故事操作落到画布并免审批准', { timeout: 15000 }, async () => {
   const store = new NovelStore(':memory:');
   try {
-    const project = store.createProject('人物');
-    let stopped = false;
-    const h = harness(store, (request, signal, demo) => {
-      const calls = request.input.filter(item => item.type === 'function_call') as Array<{ name: string }>;
-      if (request.agentId === 'coordinator' && !stopped && request.input.at(-1)?.type === 'function_call_output' && calls.at(-1)?.name === 'set_plan') {
-        stopped = true;
-        return stream(reply('计划已经制定好了。'));
-      }
-      return demo.stream(request, signal);
-    });
+    const project = store.createProject('人物'), h = harness(store);
     const run = h.start({ projectId: project.id, stage: 'agent', objective: '为作品设计人物阵容' });
     const pending = await wait(store, run);
-    assert.ok(stopped);
     assert.equal(pending.status, 'awaitingApproval', pending.error ?? pending.runtime?.pauseReason ?? '');
-    assert.ok(h.requests.some(request => request.agentId === 'coordinator' && JSON.stringify(request.input).includes('运行时提醒')));
+    const coordinator = () => h.requests.filter(request => request.agentId === 'coordinator');
+    assert.equal(coordinator().length, 1, '保存计划后不再请求协调模型');
+    const tools = pending.steps.find(step => step.agentId === 'coordinator')!.tools.map(activity => activity.name);
+    assert.deepEqual(tools, ['set_plan', 'delegate_tasks', 'propose_changes', 'commit_candidate']);
+    const native = (store.getAgentState(run.id)!.checkpoints.coordinator as AgentCheckpoint).input;
+    assert.ok(native.filter(item => item.type === 'function_call').slice(1).every(item => item.type === 'function_call' && item.call_id.startsWith('runtime-') && !item.id),
+      '运行时步骤记入对话，且不带服务端条目 ID');
     assert.ok(!h.requests.some(request => request.agentId === 'continuity'), '人物候选不经审查');
     const completed = await approve(store, h.scheduler, run);
     assert.equal(completed.status, 'completed', completed.error ?? completed.runtime?.pauseReason ?? '');
+    assert.equal(coordinator().length, 2, '作者决定后只请求一次总结');
     const current = store.getProject(project.id);
     assert.deepEqual(current.objects.filter(object => object.typeId === 'character').map(object => object.name).sort(), ['沈照', '许砚'].sort());
     assert.equal(current.cards.filter(card => card.kind === 'object').length, 2);
@@ -476,10 +473,9 @@ test('propose_changes 的 opsJson 经故事操作换算，ask_author 的选项�
       step++;
       if (step === 1) return stream(tool('ask_author', { question: '主角是谁？', options: ['学徒', '守钟人'] }));
       if (step === 2) return stream(tool('propose_changes', { label: '人物', artifactIds: [], commandsJson: '', opsJson: ops }));
+      // The runtime submitted the coordinator's own proposal for approval; it is asked again only after the author's decision.
       const output = request.input.filter(item => item.type === 'function_call_output').at(-1) as { output: string };
-      const result = JSON.parse(output.output);
-      if (step === 3) { assert.equal(result.nextAction, 'commit_candidate'); return stream(tool('commit_candidate', { candidateId: result.candidateId, candidateHash: result.candidateHash })); }
-      if (result.completed) return stream(reply('已完成。'));
+      assert.equal(JSON.parse(output.output).ok, true);
       return stream(tool('finish_run', { summary: '已建立人物。', artifactIds: [] }));
     });
     const run = h.start({ projectId: project.id, stage: 'agent', objective: '建立主角' });
@@ -489,6 +485,7 @@ test('propose_changes 的 opsJson 经故事操作换算，ask_author 的选项�
     await h.scheduler.answer(run.id, '学徒');
     const completed = await approve(store, h.scheduler, run);
     assert.equal(completed.status, 'completed', completed.error ?? completed.runtime?.pauseReason ?? '');
+    assert.equal(step, 3); assert.equal(completed.runtime!.finalSummary, '已建立人物。');
     const current = store.getProject(project.id);
     assert.equal(current.objects[0]!.name, '林舟');
     assert.equal(current.cards.length, 2);
@@ -496,61 +493,68 @@ test('propose_changes 的 opsJson 经故事操作换算，ask_author 的选项�
   } finally { store.close(); }
 });
 
-/** Coordinator that plans one planner node, then delegates it `times` times and records each delegate result. */
-function delegatingCoordinator(results: unknown[], times: number) {
-  let turn = 0;
+/** Coordinator that plans one planner node and leaves the rest to the runtime. When handed a failure it re-delegates the node up to
+ * `retries` times, then asks the author; otherwise it finishes. Records every result it is handed. */
+function planningCoordinator(results: unknown[], retries = 0) {
+  let delegated = 0;
   return (request: ModelRequest) => {
     const outputs = request.input.filter(item => item.type === 'function_call_output');
-    if (turn >= 2) results.push(JSON.parse(String((outputs.at(-1) as { output: string }).output)));
-    turn++;
-    if (turn === 1) return stream(tool('set_plan', { summary: '编排', nodes: [{ id: 'n1', role: 'planner', objective: '补一个人物', dependsOn: [], acceptance: '人物候选',
+    if (!outputs.length) return stream(tool('set_plan', { summary: '编排', nodes: [{ id: 'n1', role: 'planner', objective: '补一个人物', dependsOn: [], acceptance: '人物候选',
       sceneId: null, chapterId: null, characterId: null, eventId: null }] }));
-    if (turn <= 1 + times) return stream(tool('delegate_tasks', { nodeIds: ['n1'] }));
-    return stream(tool('ask_author', { question: '继续吗？', options: [] }));
+    const last = JSON.parse(String((outputs.at(-1) as { output: string }).output));
+    results.push(last);
+    if (last.ok === false && delegated++ < retries) return stream(tool('delegate_tasks', { nodeIds: ['n1'] }));
+    if (last.ok === false) return stream(tool('ask_author', { question: '继续吗？', options: [] }));
+    return stream(tool('finish_run', { summary: '已完成。', artifactIds: [] }));
   };
 }
 const rewritesProse = (project: Workspace) => reply({ summary: '改写正文', opsJson: '[]', commandsJson: JSON.stringify([{ type: 'putScene', value: { ...project.scenes[0]!, text: '覆盖作者正文' } }]) });
 const addsCharacter = reply({ summary: '补人物', commandsJson: '[]', opsJson: JSON.stringify([{ op: 'addCharacter', ref: 'c1', title: '许砚', content: '修钟学徒' }]) });
+const proposedCommands = (store: NovelStore, run: AgentRun) => store.getAgentState(run.id)!.candidates.at(-1)!.commands;
 
 test('专长输出未通过领域校验时带着原因让同一专长修正，而不是重放被拒的旧输出', { timeout: 15000 }, async () => {
   const store = new NovelStore(':memory:');
   try {
     const project = scenes(store, ['人工正文']), results: unknown[] = [], planner: ModelRequest[] = [];
-    const coordinate = delegatingCoordinator(results, 1);
+    const coordinate = planningCoordinator(results);
     const h = harness(store, request => {
       if (request.agentId !== 'planner') return coordinate(request);
       planner.push(request);
       return stream(planner.length === 1 ? rewritesProse(project) : addsCharacter);
     });
     const run = h.start({ projectId: project.id, stage: 'agent', objective: '补一个人物' });
-    assert.equal((await wait(store, run)).status, 'awaitingInput');
+    const pending = await wait(store, run);
+    assert.equal(pending.status, 'awaitingApproval', pending.error ?? pending.runtime?.pauseReason ?? '');
     assert.equal(planner.length, 2);
     const repair = planner[1]!.input.at(-1) as { role: string; content: string };
     assert.equal(repair.role, 'user'); assert.match(repair.content, /运行时校验未通过：编排专家不能删除或改写已有正式正文/);
-    const delegated = results[0] as { artifacts: Array<{ structured: { commands: Command[] } }> };
-    assert.equal(delegated.artifacts.length, 1); assert.ok(delegated.artifacts[0]!.structured.commands.some(command => command.type === 'putObject'));
-    assert.equal(store.getRun(run.id)!.runtime!.plan!.nodes[0]!.status, 'completed');
+    assert.ok(proposedCommands(store, run).some(command => command.type === 'putObject'));
+    assert.equal(pending.runtime!.plan!.nodes[0]!.status, 'completed');
+    assert.equal(results.length, 0, '修正在专长内部完成，没有交还协调者');
   } finally { store.close(); }
 });
 
-test('修正次数用尽后节点失败并说明原因，再次委派从头开始而不是复用同一份被拒输出', { timeout: 15000 }, async () => {
+test('修正次数用尽后节点失败并把原因交还协调者，再次委派从头开始而不是复用同一份被拒输出', { timeout: 15000 }, async () => {
   const store = new NovelStore(':memory:');
   try {
     const project = scenes(store, ['人工正文']), results: unknown[] = [], planner: ModelRequest[] = [];
-    const coordinate = delegatingCoordinator(results, 2);
+    const coordinate = planningCoordinator(results, 1);
     const h = harness(store, request => {
       if (request.agentId !== 'planner') return coordinate(request);
       planner.push(request);
       return stream(planner.length <= MAX_OUTPUT_REPAIRS + 1 ? rewritesProse(project) : addsCharacter);
     });
     const run = h.start({ projectId: project.id, stage: 'agent', objective: '补一个人物' });
-    assert.equal((await wait(store, run)).status, 'awaitingInput');
-    const [failed, retried] = results as [{ ok: boolean; reason: string }, { artifacts: unknown[] }];
-    assert.equal(failed.ok, false); assert.match(failed.reason, new RegExp(`连续 ${MAX_OUTPUT_REPAIRS + 1} 次输出未通过校验`));
+    const pending = await wait(store, run);
+    assert.equal(pending.status, 'awaitingApproval', pending.error ?? pending.runtime?.pauseReason ?? '');
+    const failed = results[0] as { ok: boolean; reason: string; failedNodeIds: string[]; options: string };
+    assert.equal(failed.ok, false); assert.match(failed.reason, new RegExp(`^n1：.*连续 ${MAX_OUTPUT_REPAIRS + 1} 次输出未通过校验`));
+    assert.deepEqual(failed.failedNodeIds, ['n1']); assert.match(failed.options, /set_plan/);
     assert.equal(planner.length, MAX_OUTPUT_REPAIRS + 2);
     // The fresh attempt sees only its context, not the rejected history.
     assert.equal(planner[MAX_OUTPUT_REPAIRS + 1]!.input.length, 1);
-    assert.equal(retried.artifacts.length, 1);
+    assert.ok(proposedCommands(store, run).some(command => command.type === 'putObject'));
+    assert.equal(pending.runtime!.plan!.nodes[0]!.error, undefined, '重新委派成功后清除失败原因');
     const steps = store.getRun(run.id)!.steps.filter(step => step.agentId === 'planner');
     assert.deepEqual(steps.map(step => step.status), ['failed', 'completed']);
   } finally { store.close(); }
@@ -560,16 +564,16 @@ test('不严格遵守 JSON Schema 的模型返回非 JSON 时同样获得修正�
   const store = new NovelStore(':memory:');
   try {
     const project = scenes(store, ['人工正文']), results: unknown[] = [], planner: ModelRequest[] = [];
-    const coordinate = delegatingCoordinator(results, 1);
+    const coordinate = planningCoordinator(results);
     const h = harness(store, request => {
       if (request.agentId !== 'planner') return coordinate(request);
       planner.push(request);
       return stream(planner.length === 1 ? reply('好的，下面是我的方案：新增人物许砚。') : addsCharacter);
     });
     const run = h.start({ projectId: project.id, stage: 'agent', objective: '补一个人物' });
-    assert.equal((await wait(store, run)).status, 'awaitingInput');
+    assert.equal((await wait(store, run)).status, 'awaitingApproval');
     assert.equal(planner.length, 2); assert.match(String((planner[1]!.input.at(-1) as { content: string }).content), /运行时校验未通过/);
-    assert.equal((results[0] as { artifacts: unknown[] }).artifacts.length, 1);
+    assert.ok(proposedCommands(store, run).some(command => command.type === 'putObject'));
   } finally { store.close(); }
 });
 
@@ -607,31 +611,26 @@ test('依赖节点读到前置结论：角色代入进入写作上下文，后�
       { type: 'putObject', value: { id: 'ev', typeId: 'event', name: '钟声', fields: {}, event: { worldOrder: 1, timeLabel: '', thread: '主线', participants: ['hero'], causes: [], critical: true, observations: { hero: '听见第十三声钟响' } } } },
       ...[0, 1].map(order => ({ type: 'putScene' as const, value: { id: `s${order}`, chapterId, order, title: `场景${order}`, text: '', outline: '林舟追查钟声', povId: 'hero', eventIds: ['ev'] } })),
     ] });
-    const writers = new Map<string, Record<string, any>>(), results: any[] = [];
-    let turn = 0;
+    const writers = new Map<string, Record<string, any>>(), order: string[] = [];
     const h = harness(store, (request, signal, demo) => {
       if (request.agentId === 'writer') {
         const { context } = JSON.parse(String((request.input[0] as { content: string }).content));
-        writers.set(context.scene.id, context);
+        writers.set(context.scene.id, context); order.push(context.scene.id);
         return stream(reply(context.scene.id === 's0' ? '铜钟响了第十三下，林舟攥紧了扳手。' : '他沿着钟楼的台阶往上走。'));
       }
       if (request.agentId !== 'coordinator') return demo.stream(request, signal);
-      const outputs = request.input.filter(item => item.type === 'function_call_output');
-      if (outputs.length) results.push(JSON.parse(String((outputs.at(-1) as { output: string }).output)));
-      turn++;
       const node = (id: string, role: PlanNode['role'], patch: Partial<Record<string, string | string[] | null>>) => ({ id, role, objective: '写本章', acceptance: '完成', dependsOn: [],
         sceneId: null, chapterId: null, characterId: null, eventId: null, ...patch });
-      if (turn === 1) return stream(tool('set_plan', { summary: '先代入再写', nodes: [node('p', 'character', { sceneId: 's0', characterId: 'hero', eventId: 'ev' }),
+      return stream(tool('set_plan', { summary: '先代入再写', nodes: [node('p', 'character', { sceneId: 's0', characterId: 'hero', eventId: 'ev' }),
         node('w1', 'writer', { sceneId: 's1' }), node('w0', 'writer', { sceneId: 's0', dependsOn: ['p'] })] }));
-      if (turn === 2) return stream(tool('delegate_tasks', { nodeIds: ['p'] }));
-      if (turn === 3) return stream(tool('delegate_tasks', { nodeIds: ['w0'] }));
-      if (turn === 4) return stream(tool('delegate_tasks', { nodeIds: ['w1'] }));
-      return stream(tool('ask_author', { question: '继续吗？', options: [] }));
     });
     const run = h.start({ projectId: project.id, stage: 'chapter', chapterId, objective: '写完本章' });
-    assert.equal((await wait(store, run)).status, 'awaitingInput');
-    const plan = results[0] as { nodes: PlanNode[]; next: { notice: string } };
-    assert.deepEqual(plan.nodes.find(node => node.id === 'w1')!.dependsOn, ['w0']); assert.match(plan.next.notice, /按阅读顺序串联/);
+    const pending = await wait(store, run);
+    assert.equal(pending.status, 'awaitingApproval', pending.error ?? pending.runtime?.pauseReason ?? '');
+    assert.deepEqual(order, ['s0', 's1']);
+    const native = (store.getAgentState(run.id)!.checkpoints.coordinator as AgentCheckpoint).input;
+    const planned = JSON.parse(String((native.find(item => item.type === 'function_call_output') as { output: string }).output)) as { nodes: PlanNode[]; notice: string };
+    assert.deepEqual(planned.nodes.find(node => node.id === 'w1')!.dependsOn, ['w0']); assert.match(planned.notice, /按阅读顺序串联/);
     const first = writers.get('s0')!, second = writers.get('s1')!;
     const perspective = first.upstream.results.find((item: UpstreamResult) => item.role === 'character');
     assert.ok(perspective?.result.conclusion.perspective, '角色代入结论进入写作上下文');
@@ -641,31 +640,34 @@ test('依赖节点读到前置结论：角色代入进入写作上下文，后�
   } finally { store.close(); }
 });
 
-test('协调者中途只用文字作答时，运行时提醒把尚未组成候选的后续产物并入候选', { timeout: 15000 }, async () => {
+test('部分节点失败后协调者只用文字作答：已完成部分照常组成候选送作者批准，未完成的节点记在总结之后', { timeout: 20000 }, async () => {
   const store = new NovelStore(':memory:');
   try {
-    const project = store.createProject('补全候选'), coordinator: ModelRequest[] = [];
-    const planner = (title: string) => reply({ summary: title, commandsJson: '[]', opsJson: JSON.stringify([{ op: 'addCharacter', ref: 'c1', title }]) });
+    const project = scenes(store, ['人工正文']), coordinator: ModelRequest[] = [];
     const h = harness(store, (request, signal, demo) => {
-      if (request.agentId === 'planner') return stream(planner(JSON.parse(String((request.input[0] as { content: string }).content)).objective));
+      if (request.agentId === 'planner') {
+        const { objective } = JSON.parse(String((request.input[0] as { content: string }).content));
+        return stream(objective === '许砚' ? addsCharacter : rewritesProse(project));
+      }
       if (request.agentId !== 'coordinator') return demo.stream(request, signal);
       coordinator.push(request);
-      const last = JSON.parse(String((request.input.filter(item => item.type === 'function_call_output').at(-1) as { output?: string } | undefined)?.output ?? '{}'));
       const node = (id: string, objective: string) => ({ id, role: 'planner', objective, acceptance: '人物', dependsOn: [], sceneId: null, chapterId: null, characterId: null, eventId: null });
-      switch (coordinator.length) {
-        case 1: return stream(tool('set_plan', { summary: '两个人物', nodes: [node('n1', '许砚'), node('n2', '沈照')] }));
-        case 2: return stream(tool('delegate_tasks', { nodeIds: ['n1'] }));
-        case 3: return stream(tool('propose_changes', { label: '许砚', artifactIds: last.artifacts.map((artifact: { id: string }) => artifact.id), commandsJson: '', opsJson: '' }));
-        case 4: return stream(tool('delegate_tasks', { nodeIds: ['n2'] }));
-        case 5: return stream(reply('两个人物都设计好了。'));
-        default: return stream(tool('ask_author', { question: '继续吗？', options: [] }));
-      }
+      if (coordinator.length === 1) return stream(tool('set_plan', { summary: '两个人物', nodes: [node('n1', '许砚'), node('n2', '沈照')] }));
+      return stream(reply(coordinator.length === 2 ? '沈照没能设计出来，先交许砚。' : '许砚已加入，沈照未完成。'));
     });
     const run = h.start({ projectId: project.id, stage: 'agent', objective: '设计两个人物' });
-    assert.equal((await wait(store, run)).status, 'awaitingInput');
-    const second = store.getRun(run.id)!.runtime!.plan!.nodes.find(node => node.id === 'n2')!.artifactId!;
-    const reminder = coordinator[5]!.input.at(-1) as { role: string; content: string };
-    assert.equal(reminder.role, 'user'); assert.match(reminder.content, /propose_changes/); assert.ok(reminder.content.includes(second));
+    const pending = await wait(store, run);
+    assert.equal(pending.status, 'awaitingApproval', pending.error ?? pending.runtime?.pauseReason ?? '');
+    assert.equal(coordinator.length, 2, '文字作答之后不需要提醒');
+    const failure = JSON.parse(String((coordinator[1]!.input.at(-1) as { output: string }).output));
+    assert.equal(failure.ok, false); assert.deepEqual(failure.failedNodeIds, ['n2']); assert.equal(failure.artifacts[0].nodeId, 'n1');
+    const n2 = pending.runtime!.plan!.nodes.find(node => node.id === 'n2')!;
+    assert.equal(n2.status, 'failed'); assert.match(n2.error!, /连续 3 次输出未通过校验/);
+    const done = await approve(store, h.scheduler, run);
+    assert.equal(done.status, 'completed', done.error ?? done.runtime?.pauseReason ?? '');
+    assert.equal(coordinator.length, 3);
+    assert.match(done.runtime!.finalSummary!, /^许砚已加入，沈照未完成。\n\n运行时记录：计划节点未完成：n2「沈照」（.*连续 3 次输出未通过校验/);
+    assert.ok(store.getProject(project.id).objects.some(object => object.name === '许砚'));
   } finally { store.close(); }
 });
 
@@ -688,12 +690,14 @@ test('任务日志每轮只增量写入新内容，可还原完整请求；完�
   try {
     const project = scenes(store), h = harness(store);
     const run = h.start({ projectId: project.id, stage: 'chapter', chapterId: project.chapters[0]!.id, objective: '写完本章空白场景' });
-    assert.equal((await wait(store, run)).status, 'awaitingApproval');
+    assert.equal((await approve(store, h.scheduler, run)).status, 'completed');
     const state = store.getAgentState(run.id)!, coordinator = state.checkpoints.coordinator as AgentCheckpoint;
     const db = new DatabaseSync(filename, { readOnly: true });
     const turns = db.prepare('SELECT turn, request FROM agent_turns WHERE run_id=? AND step_id=? ORDER BY turn').all(run.id, coordinator.step.id) as Array<{ turn: number; request: string }>;
     db.close();
-    assert.ok(turns.length > 3);
+    assert.equal(turns.length, 2, '规划一轮，作者决定后总结一轮');
+    // The runtime's own steps are not model requests; they reach the log inside the next request's increment.
+    assert.ok((JSON.parse(turns[1]!.request) as { input: Array<{ call_id?: string }> }).input.some(item => item.call_id?.startsWith('runtime-')));
     let input: unknown[] = [];
     for (const { turn, request } of turns) {
       const value = JSON.parse(request) as { instructions?: string; from?: number; input: unknown[] };
@@ -786,14 +790,14 @@ test('专长的结构化输出被截断时要求精简重写；协调者被截�
   let store = new NovelStore(':memory:');
   try {
     const project = scenes(store, ['人工正文']), results: unknown[] = [], planner: ModelRequest[] = [];
-    const coordinate = delegatingCoordinator(results, 1);
+    const coordinate = planningCoordinator(results);
     const h = harness(store, request => {
       if (request.agentId !== 'planner') return coordinate(request);
       planner.push(request);
       return stream(planner.length === 1 ? truncated('{"summary":"补人物","opsJson":"[{\\"op') : addsCharacter);
     });
     const run = h.start({ projectId: project.id, stage: 'agent', objective: '补一个人物' });
-    assert.equal((await wait(store, run)).status, 'awaitingInput');
+    assert.equal((await wait(store, run)).status, 'awaitingApproval');
     assert.equal(planner.length, 2);
     assert.equal(planner[1]!.input.length, 2, 'the cut answer is not replayed');
     const repair = planner[1]!.input.at(-1) as { role: string; content: string };
@@ -854,4 +858,107 @@ test('写作者正文达到输出上限时自动续写拼接，截断的回答�
     assert.equal((JSON.parse(turns[0]!.response!) as ModelResponse).status, 'incomplete');
     assert.deepEqual(JSON.parse(turns[1]!.request), { from: 1, input: [{ role: 'assistant', content: partial }, { role: 'user', content: CONTINUE_NOTICE }] });
   } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('重新规划时未改动的已完成节点保留结果，只重做失败的节点；finish_run 完成后不再请求协调模型', { timeout: 20000 }, async () => {
+  const store = new NovelStore(':memory:');
+  try {
+    const project = scenes(store, ['人工正文']), coordinator: ModelRequest[] = [], planner: string[] = [];
+    const node = (id: string, objective: string) => ({ id, role: 'planner', objective, acceptance: '人物', dependsOn: [], sceneId: null, chapterId: null, characterId: null, eventId: null });
+    const h = harness(store, (request, signal, demo) => {
+      if (request.agentId === 'planner') {
+        const { objective } = JSON.parse(String((request.input[0] as { content: string }).content));
+        planner.push(objective);
+        if (objective === '沈照') return stream(rewritesProse(project));
+        return stream(reply({ summary: objective, commandsJson: '[]', opsJson: JSON.stringify([{ op: 'addCharacter', ref: 'c1', title: objective.slice(0, 2) }]) }));
+      }
+      if (request.agentId !== 'coordinator') return demo.stream(request, signal);
+      coordinator.push(request);
+      if (coordinator.length === 1) return stream(tool('set_plan', { summary: '两个人物', nodes: [node('n1', '许砚'), node('n2', '沈照')] }));
+      if (coordinator.length === 2) return stream(tool('set_plan', { summary: '调整第二个人物', nodes: [node('n1', '许砚'), node('n2', '沈照（只建人物卡）')] }));
+      return stream(tool('finish_run', { summary: '两个人物都已建立。', artifactIds: [] }));
+    });
+    const run = h.start({ projectId: project.id, stage: 'agent', objective: '设计两个人物' });
+    const pending = await wait(store, run);
+    assert.equal(pending.status, 'awaitingApproval', pending.error ?? pending.runtime?.pauseReason ?? '');
+    assert.equal(planner.filter(objective => objective === '许砚').length, 1, '未改动的节点没有重做');
+    assert.equal(planner.filter(objective => objective === '沈照').length, MAX_OUTPUT_REPAIRS + 1);
+    const native = (store.getAgentState(run.id)!.checkpoints.coordinator as AgentCheckpoint).input;
+    const plans = native.filter(item => item.type === 'function_call_output').map(item => JSON.parse(String((item as { output: string }).output)))
+      .filter((output: { notice?: string }) => output.notice?.startsWith('计划已保存'));
+    assert.match(plans[1].notice, /沿用上一版计划中已完成节点的结果：n1/);
+    assert.equal(pending.runtime!.budget.replans, 1);
+    const done = await approve(store, h.scheduler, run);
+    assert.equal(done.status, 'completed', done.error ?? done.runtime?.pauseReason ?? '');
+    assert.equal(coordinator.length, 3, 'finish_run 之后不再请求');
+    assert.equal(done.runtime!.finalSummary, '两个人物都已建立。');
+    assert.deepEqual(store.getProject(project.id).objects.filter(object => object.typeId === 'character').map(object => object.name).sort(), ['沈照', '许砚'].sort());
+  } finally { store.close(); }
+});
+
+test('finish_run 可以在节点失败后结束任务，运行时把未完成的节点记在总结之后', { timeout: 15000 }, async () => {
+  const store = new NovelStore(':memory:');
+  try {
+    const project = scenes(store, ['人工正文']);
+    const node = (id: string, role: string, objective: string) => ({ id, role, objective, acceptance: '完成', dependsOn: [], sceneId: null, chapterId: null, characterId: null, eventId: null });
+    let turn = 0;
+    const h = harness(store, (request, signal, demo) => {
+      if (request.agentId === 'planner') return stream(rewritesProse(project));
+      if (request.agentId !== 'coordinator') return demo.stream(request, signal);
+      turn++;
+      if (turn === 1) return stream(tool('set_plan', { summary: '分析并补人物', nodes: [node('check', 'continuity', '检查作品'), node('cast', 'planner', '补一个人物')] }));
+      return stream(tool('finish_run', { summary: '分析已完成，人物没有补上。', artifactIds: [] }));
+    });
+    const done = await wait(store, h.start({ projectId: project.id, stage: 'agent', objective: '分析作品并补一个人物' }));
+    assert.equal(done.status, 'completed', done.error ?? done.runtime?.pauseReason ?? '');
+    assert.equal(turn, 2);
+    assert.match(done.runtime!.finalSummary!, /^分析已完成，人物没有补上。\n\n运行时记录：计划节点未完成：cast「补一个人物」（/);
+    assert.equal(done.runtime!.candidates.length, 0);
+  } finally { store.close(); }
+});
+
+test('协调者直接作答即完成任务并保存为答复；空回答只提醒一次', { timeout: 15000 }, async () => {
+  for (const first of ['这部作品目前只有一章，节奏偏慢。', '']) {
+    const store = new NovelStore(':memory:');
+    try {
+      const project = scenes(store, ['人工正文']), coordinator: ModelRequest[] = [];
+      const h = harness(store, request => {
+        coordinator.push(request);
+        return stream(reply(coordinator.length === 1 ? first : '补充：第一章的冲突出现得太晚。'));
+      });
+      const done = await wait(store, h.start({ projectId: project.id, stage: 'agent', objective: '这部作品现在有什么问题？' }));
+      assert.equal(done.status, 'completed', done.error ?? done.runtime?.pauseReason ?? '');
+      assert.equal(coordinator.length, first ? 1 : 2);
+      if (!first) assert.match(String((coordinator[1]!.input.at(-1) as { content: string }).content), /^运行时提醒：请用 finish_run/);
+      const answer = first || '补充：第一章的冲突出现得太晚。';
+      assert.equal(done.runtime!.finalSummary, answer);
+      assert.deepEqual(done.runtime!.artifacts.map(artifact => [artifact.label, artifact.text]), [['协调者答复', answer]]);
+    } finally { store.close(); }
+  }
+});
+
+test('运行时不重复已失败的步骤：作者中途修改作品使候选无法组成，协调者作答后任务结束并记下未提交的产物', { timeout: 15000 }, async () => {
+  const store = new NovelStore(':memory:');
+  try {
+    const project = scenes(store, ['人工正文']), coordinator: ModelRequest[] = [];
+    const h = harness(store, (request, signal, demo) => {
+      if (request.agentId === 'planner') {
+        store.execute({ projectId: project.id, expectedRevision: store.getProject(project.id).revision, actor: 'human',
+          commands: [{ type: 'putCard', value: { id: 'human-note', kind: 'note', title: '作者便笺', content: '任务进行中的人工修改', x: 0, y: 0 } }] });
+        return stream(addsCharacter);
+      }
+      if (request.agentId !== 'coordinator') return demo.stream(request, signal);
+      coordinator.push(request);
+      if (coordinator.length === 1) return stream(tool('set_plan', { summary: '补人物', nodes: [{ id: 'n1', role: 'planner', objective: '补一个人物', acceptance: '人物', dependsOn: [],
+        sceneId: null, chapterId: null, characterId: null, eventId: null }] }));
+      return stream(reply('作品在任务进行中被修改，候选没有组成，请重新发起。'));
+    });
+    const run = h.start({ projectId: project.id, stage: 'agent', objective: '补一个人物' });
+    const done = await until(store, run.id, value => !!value.finishedAt || value.status === 'paused');
+    assert.equal(done.status, 'completed', done.error ?? done.runtime?.pauseReason ?? '');
+    assert.equal(coordinator.length, 2);
+    const tools = done.steps.find(step => step.agentId === 'coordinator')!.tools.map(activity => activity.name);
+    assert.deepEqual(tools, ['set_plan', 'delegate_tasks', 'propose_changes'], '失败的 propose_changes 不再重试');
+    assert.match(done.runtime!.finalSummary!, /运行时记录：尚未组成候选的修改产物：/);
+  } finally { store.close(); }
 });

@@ -7,6 +7,7 @@ import { emptyUsage } from './responses.js';
 import { boundedContext, collectContext, fingerprint, MAX_CONTEXT_CHARS, refreshMemories, searchContext, selectAuthorRules, sourceFor, sourceValid, sourcesForWorkspace } from './agent/memory.js';
 import { assertWriteScope, canReadAuthor, chainWriterNodes, createBudget, validatePlan } from './agent/policy.js';
 import { reviewSchema, specialistDefinition } from './agent/specialists.js';
+import { keepCompleted } from './agent/runtime.js';
 
 function fixture(id = 'project-a'): Workspace {
   const original = createWorkspace('雾港小说', id);
@@ -287,4 +288,22 @@ test('作者确认的规则交给所有作者侧专长，角色代入与读者�
   for (const [role, patch] of [['planner', {}], ['world', {}], ['narrative', {}], ['canvas', {}], ['cast', {}], ['theme', {}], ['continuity', { sceneId: 'target' }],
     ['evolution', { characterId: 'person', eventId: 'now' }], ['writer', { sceneId: 'blank' }]] as const) assert.match(build(role, patch), /全书不出现穿越元素/, role);
   for (const [role, patch] of [['character', { characterId: 'person', eventId: 'now' }], ['reader', { sceneId: 'target' }]] as const) assert.doesNotMatch(build(role, patch), /穿越/, role);
+});
+
+test('重新规划沿用未改动的已完成节点；改动的节点及依赖它的节点重新执行', () => {
+  const node = (id: string, patch: Partial<PlanNode> = {}): PlanNode => ({ id, role: 'planner', objective: id, dependsOn: [], acceptance: '完成', status: 'pending', ...patch });
+  const previous = { version: 1, summary: '旧计划', nodes: [
+    node('a', { status: 'completed', artifactId: 'artifact-a' }), node('b', { dependsOn: ['a'], status: 'completed', artifactId: 'artifact-b' }),
+    node('c', { status: 'completed', artifactId: 'artifact-c' }), node('d', { dependsOn: ['c'], status: 'completed', artifactId: 'artifact-d' }),
+    node('e', { status: 'failed', error: '失败' }), node('f', { status: 'completed', artifactId: 'artifact-f', sceneId: 's1' }),
+  ] };
+  const next = [node('a'), node('b', { dependsOn: ['a'] }), node('c', { objective: '改过的目标' }), node('d', { dependsOn: ['c'] }), node('e'), node('f', { sceneId: 's2' }), node('g')];
+  assert.deepEqual(keepCompleted(next, previous).sort(), ['a', 'b']);
+  assert.deepEqual(next.map(item => [item.id, item.status, item.artifactId]), [
+    ['a', 'completed', 'artifact-a'], ['b', 'completed', 'artifact-b'], ['c', 'pending', undefined], ['d', 'pending', undefined],
+    ['e', 'pending', undefined], ['f', 'pending', undefined], ['g', 'pending', undefined],
+  ]);
+  assert.deepEqual(keepCompleted([node('a')], undefined), []);
+  const again = [node('a'), node('b', { dependsOn: ['a'] })];
+  assert.deepEqual(keepCompleted(again, previous, new Set(['artifact-a'])), [], '作者拒绝过的结果不沿用，依赖它的节点也重做');
 });

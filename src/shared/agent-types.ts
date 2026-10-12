@@ -11,6 +11,8 @@ export interface PlanNode {
   id: string; role: Exclude<AgentRole, 'coordinator'>; objective: string; dependsOn: string[];
   sceneId?: string; characterId?: string; eventId?: string; chapterId?: string;
   acceptance: string; status: 'pending' | 'running' | 'completed' | 'failed'; artifactId?: string;
+  /** Why a failed node failed, as reported to the coordinator and the author. */
+  error?: string;
 }
 export interface AgentPlan { version: number; summary: string; nodes: PlanNode[] }
 export interface EvidenceSource { projectId: string; kind: string; id: string; hash: string; start?: number; end?: number }

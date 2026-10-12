@@ -80,41 +80,22 @@ export class DemoAgentTransport implements ResponseTransport {
     const role = this.request.stage === 'assist' && ['world', 'narrative', 'canvas'].includes(this.request.tool ?? '') ? this.request.tool as 'world' | 'narrative' | 'canvas' : 'planner';
     return [node(role, 'prepare')];
   }
+  /** Plans, then acts only where the runtime hands control back: after the author's decision, a failure or an analysis. */
   private coordinate(request: ModelRequest): ResponseOutputItem[] {
     const history = this.history(request), last = history.at(-1);
-    const artifacts = history.filter(item => item.name === 'delegate_tasks').flatMap(item => item.result.artifacts ?? []);
-    const artifactIds = artifacts.map((artifact: any) => artifact.id);
-    const plans = history.filter(item => item.name === 'set_plan');
-    const plan = plans.at(-1)?.result as { nodes?: PlanNode[] } | undefined;
-    const done = new Set(history.filter(item => item.name === 'delegate_tasks' && item.result.artifacts).flatMap(item => item.args.nodeIds as string[]));
-    const nextNodes = (plan?.nodes ?? []).filter(node => !done.has(node.id) && node.dependsOn.every(id => done.has(id))).slice(0, 2);
-    const pendingNodes = (plan?.nodes ?? []).some(node => !done.has(node.id));
-    if (!last) return [invoke('read_project', {})];
-    if (last.name === 'read_project') return [invoke('set_plan', { summary: '根据目标选择必要专长，生成候选、审查后等待作者批准', nodes: this.plan().map(node => ({ ...node, status: undefined,
+    const artifactIds = [...new Set(history.flatMap(item => (item.result.artifacts ?? []).map((artifact: any) => artifact.artifactId)).filter(Boolean))];
+    if (!last) return [invoke('set_plan', { summary: '根据目标选择必要专长，生成候选、审查后等待作者批准', nodes: this.plan().map(node => ({ ...node, status: undefined,
       sceneId: node.sceneId ?? null, chapterId: node.chapterId ?? null, characterId: node.characterId ?? null, eventId: node.eventId ?? null })) })];
-    if (last.name === 'set_plan') return [invoke('delegate_tasks', { nodeIds: nextNodes.map(node => node.id) })];
+    if (last.result.ok === false && last.name !== 'commit_candidate') {
+      return [invoke('ask_author', { question: `${last.name === 'propose_changes' ? '候选未能形成' : '执行遇到问题'}：${last.result.reason}。请补充目标或结束任务后选择新范围。`, options: ['缩小范围后重试', '结束本次任务'] })];
+    }
     if (last.name === 'delegate_tasks') {
-      const proposed = (last.result.artifacts ?? []).filter((artifact: any) => Array.isArray(artifact.structured?.commands) && artifact.structured.commands.length);
-      if (proposed.length) return [invoke('propose_changes', { label: '目标任务创作候选', artifactIds: proposed.map((artifact: any) => artifact.id), commandsJson: '', opsJson: '' })];
-      if (pendingNodes && nextNodes.length) return [invoke('delegate_tasks', { nodeIds: nextNodes.map(node => node.id) })];
-      return [invoke('save_report', { label: '目标分析报告', text: (last.result.artifacts ?? []).map((artifact: any) => artifact.text).join('\n\n') || '已检查现有资料。本次不修改正式作品。' })];
+      const text = (last.result.artifacts ?? []).map((artifact: any) => `${artifact.label}：${typeof artifact.conclusion === 'string' ? artifact.conclusion : JSON.stringify(artifact.conclusion)}`).join('\n\n');
+      return [invoke('save_report', { label: '目标分析报告', text: text || '已检查现有资料。本次不修改正式作品。' })];
     }
     if (last.name === 'save_report') return [invoke('finish_run', { summary: '已保存分析报告；本次没有修改正式作品。', artifactIds: [...artifactIds, last.result.artifactId] })];
-    if (last.name === 'propose_changes') {
-      if (last.result.ok === false) return [invoke('ask_author', { question: `候选未能形成：${last.result.reason}。请补充目标或结束任务后选择新范围。`, options: ['缩小范围后重试', '结束本次任务'] })];
-      if (pendingNodes && nextNodes.length) return [invoke('delegate_tasks', { nodeIds: nextNodes.map(node => node.id) })];
-      if (last.result.nextAction === 'commit_candidate') return [invoke('commit_candidate', { candidateId: last.result.candidateId, candidateHash: last.result.candidateHash })];
-      return [invoke('review_candidate', { candidateId: last.result.candidateId })];
-    }
-    if (last.name === 'review_candidate') {
-      if (last.result.nextAction === 'revise_candidate') return [invoke('ask_author', { question: '审查提出了设定修订建议，请确认要保留的方向，或结束本次演示任务。', options: ['保留当前方向', '按审查意见调整'] })];
-      return [invoke('commit_candidate', { candidateId: last.result.candidateId, candidateHash: last.result.candidateHash })];
-    }
+    if (last.name === 'review_candidate' && last.result.nextAction === 'revise_candidate') return [invoke('ask_author', { question: '审查提出了设定修订建议，请确认要保留的方向，或结束本次演示任务。', options: ['保留当前方向', '按审查意见调整'] })];
     if (last.name === 'commit_candidate') return [invoke('finish_run', { summary: last.result.ok ? '已按目标生成并审查候选，经作者批准后保存到正式作品。' : '作者已拒绝候选；正式作品保持不变，分析与草稿保留在任务记录。', artifactIds })];
-    if (last.name === 'finish_run') {
-      if (last.result.completed !== true) return [invoke('finish_run', { summary: last.result.ok ? '候选经作者批准后已写入正式作品。' : '作者拒绝了候选，正式作品保持不变。', artifactIds })];
-      return [message(last.result.summary ?? '目标任务已完成。')];
-    }
     if (last.name === 'ask_author') return [invoke('save_report', { label: '作者补充意见', text: String(last.result.answer ?? '已保留任务记录。') })];
     return [message('本地演示保留了真实执行记录，请查看任务当前状态。')];
   }
