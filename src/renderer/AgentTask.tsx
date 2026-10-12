@@ -1,9 +1,10 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Check, Circle, CircleAlert, FilePlus2, FileMinus2, FilePen, LoaderCircle, Pause, Play, Square } from 'lucide-react';
 import type { AgentRun, Change, Workspace } from '../shared/types';
 import type { AgentDecision, AgentMemory, AgentRole, AgentRuntimeSummary, AgentSession } from '../shared/agent-types';
 import { diffStats, diffText } from '../shared/text-diff';
 import { Callout, StatusPill, canResumeRun, fire, isAgentRun, isRunActive, runStatus, showValue } from './ui';
+import Markdown from './Markdown';
 
 export interface AgentTaskActions {
   onPause: (id: string) => Promise<unknown>;
@@ -165,21 +166,42 @@ export function CandidateReview({ candidate, run, onDecide, busy, workspace, com
   </section>;
 }
 
+/** Completed and total steps of a run, from its plan when it has one. */
+export function runProgress(run: AgentRun): { done: number; total: number } {
+  const nodes = run.runtime?.plan?.nodes;
+  if (nodes?.length) return { done: nodes.filter(node => node.status === 'completed').length, total: nodes.length };
+  return { done: run.steps.filter(step => step.status === 'completed').length, total: run.steps.length };
+}
+
+export function ProgressBar({ run }: { run: AgentRun }) {
+  const { done, total } = runProgress(run);
+  const percent = total ? Math.round(done / total * 100) : 0;
+  return <div className={`run-progress-bar ${isRunActive(run) && done < total ? 'active' : ''}`} role="progressbar" aria-label="执行进度" aria-valuemin={0} aria-valuemax={total || 1} aria-valuenow={done}>
+    <span className="track"><i style={{ width: `${total ? Math.max(4, percent) : 4}%` }}/></span><small>{total ? `${done} / ${total} 步` : '准备中'}</small>
+  </div>;
+}
+
+function LiveOutput({ label, text }: { label: string; text: string }) {
+  const box = useRef<HTMLDivElement>(null);
+  useEffect(() => { const element = box.current; if (element) element.scrollTop = element.scrollHeight; }, [text]);
+  return <div className="live-output" aria-live="polite"><span><i className="live-dot" aria-hidden="true"/>实时输出 · {label}</span><div ref={box} className="live-output-text"><Markdown text={text.slice(-800)} streaming/></div></div>;
+}
+
 export function PlanStepper({ run, live = false }: { run: AgentRun; live?: boolean }) {
   const plan = run.runtime?.plan;
   if (plan) return <div className="plan" data-testid="agent-plan">
-    <p className="plan-summary">{plan.summary}</p>
-    <ol className="plan-stepper">{plan.nodes.map(node => <li key={node.id} className={`step ${node.status}`} data-testid="agent-plan-node" data-node-id={node.id} data-node-status={node.status}>
+    {plan.summary && <Markdown text={plan.summary} className="plan-summary"/>}
+    <ol className="plan-stepper">{plan.nodes.map((node, index) => <li key={node.id} className={`step ${node.status}`} style={{ '--i': Math.min(index, 8) } as React.CSSProperties} data-testid="agent-plan-node" data-node-id={node.id} data-node-status={node.status}>
       <StepIcon status={node.status}/>
       <div><strong>{roleNames[node.role]}</strong><span>{node.objective}</span>{node.status === 'running' && node.acceptance && <small>完成要求：{node.acceptance}</small>}</div>
       <span className="sr-only">{nodeStatuses[node.status]}</span>
     </li>)}</ol>
   </div>;
-  if (!run.steps.length) return <p className="muted">正在安排创作步骤…</p>;
+  if (!run.steps.length) return <div className="plan-skeleton" aria-label="正在安排创作步骤"><p className="muted">正在安排创作步骤…</p><i/><i/><i/></div>;
   const current = [...run.steps].reverse().find(step => step.status === 'running') ?? run.steps.at(-1);
   return <div className="plan">
-    <ol className="plan-stepper">{run.steps.map(step => <li key={step.id} className={`step ${step.status}`}><StepIcon status={step.status}/><div><strong>{step.label}</strong><span>{step.agentId}</span></div></li>)}</ol>
-    {live && current?.output && <div className="live-output" aria-live="polite"><span>{current.label}</span><p>{current.output.slice(-600)}</p></div>}
+    <ol className="plan-stepper">{run.steps.map((step, index) => <li key={step.id} className={`step ${step.status}`} style={{ '--i': Math.min(index, 8) } as React.CSSProperties}><StepIcon status={step.status}/><div><strong>{step.label}</strong><span>{step.agentId}</span></div></li>)}</ol>
+    {live && current?.output && <LiveOutput label={current.label} text={current.output}/>}
   </div>;
 }
 
@@ -215,7 +237,7 @@ export default function AgentTask({ run, actions, busy = false, otherActive = fa
     {runtime?.plan && <PlanStepper run={run}/>}
     <AgentInputForm run={run} actions={actions} busy={busy}/>
     {!!runtime?.candidates.length && <div className="agent-candidates">{runtime.candidates.map(candidate => <CandidateReview key={`${candidate.id}:${candidate.hash}`} candidate={candidate} run={run} onDecide={actions.onDecide} busy={busy} workspace={workspace}/>)}</div>}
-    {runtime?.finalSummary && <section className="agent-final-summary" data-testid="agent-final-summary"><h3>任务总结</h3><p>{runtime.finalSummary}</p></section>}
+    {runtime?.finalSummary && <section className="agent-final-summary" data-testid="agent-final-summary"><h3>任务总结</h3><Markdown text={runtime.finalSummary}/></section>}
     {!!runtime?.artifacts.length && <details className="technical-details" data-testid="agent-artifacts"><summary>过程产物 · {runtime.artifacts.length} 份（不等于已保存修改）</summary>{runtime.artifacts.map(artifact => <details className="agent-artifact" key={artifact.id} data-testid="agent-artifact"><summary>{roleNames[artifact.role]} · {artifact.label}</summary><pre>{artifact.text}</pre>{artifact.structured !== undefined && <details><summary>结构化内容</summary><pre>{showValue(artifact.structured)}</pre></details>}</details>)}</details>}
     {runtime?.budget && <RunBudget budget={runtime.budget}/>}
   </section>;

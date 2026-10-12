@@ -1,7 +1,8 @@
-import { ArrowUpRight, BookmarkPlus, ChevronRight, CornerDownLeft, FileText, LoaderCircle, Plus, RefreshCw, Sparkles, Square, Undo2, X } from 'lucide-react';
+import { ArrowUpRight, BookmarkPlus, ChevronRight, CircleAlert, CircleCheck, CircleSlash, CornerDownLeft, FileText, Film, Hourglass, LoaderCircle, Plus, RefreshCw, Sparkles, Square, StickyNote, Undo2, UserRound, X } from 'lucide-react';
 import type { AgentRun, AssistTool, OperationBatch, ProviderSettings, RunRequest, SourceReference, Workspace } from '../shared/types';
 import { Callout, Combobox, Kbd, Popover, StatusPill, assistTools, finalReview, fire, isAgentRun, isRunActive, orderedChapters, orderedScenes, runStatus, stageNames, taskLabel, taskObjective, type ComboItem, type TaskDraft } from './ui';
-import { AgentInputForm, AgentMemoryPanel, AgentRunControls, CandidateReview, PlanStepper, type AgentMemoryActions, type AgentTaskActions } from './AgentTask';
+import { AgentInputForm, AgentMemoryPanel, AgentRunControls, CandidateReview, PlanStepper, ProgressBar, type AgentMemoryActions, type AgentTaskActions } from './AgentTask';
+import Markdown from './Markdown';
 import type { AgentMemory, AgentSession } from '../shared/agent-types';
 import { CompanionPanel, useCompanion } from './Companion';
 import { MessagesSquare } from 'lucide-react';
@@ -59,10 +60,12 @@ export function TaskOutcome({ workspace, run, history, onOpenReference, onNextSt
     : isRunActive(run) ? '任务仍在进行，尚无写入的修改。'
     : run.status === 'failed' ? '任务未完成，作品没有被修改。' : '没有写入作品的修改。';
   const next = run.stage === 'idea' ? 'outline' : run.stage === 'outline' && workspace.scenes.length ? 'chapter' : undefined;
-  const resultLink = (ref: SourceReference) => <button key={`${ref.kind}:${ref.id}`} data-testid={`open-result-${ref.id}`} onClick={() => onOpenReference(ref.kind, ref.id)}><span>{referenceLabel(workspace, ref)}</span><ArrowUpRight aria-hidden="true"/></button>;
+  const RefIcon = (ref: SourceReference) => ref.kind === 'scene' ? Film : ref.kind === 'object' ? UserRound : StickyNote;
+  const resultLink = (ref: SourceReference) => { const Icon = RefIcon(ref); return <button key={`${ref.kind}:${ref.id}`} data-testid={`open-result-${ref.id}`} onClick={() => onOpenReference(ref.kind, ref.id)}><Icon className="ref-icon" aria-hidden="true"/><span>{referenceLabel(workspace, ref)}</span><ArrowUpRight aria-hidden="true"/></button>; };
+  const StatusIcon = run.status === 'completed' ? (review?.verdict === 'revise' ? CircleAlert : CircleCheck) : run.status === 'failed' ? CircleAlert : run.status === 'cancelled' ? CircleSlash : Hourglass;
   const retryable = !!onRetry && !isAgentRun(run) && ['failed', 'cancelled'].includes(run.status);
   return <section className={`task-outcome status-${run.status} ${bare ? 'bare' : ''}`} data-testid="task-outcome">
-    {!bare && <header><div><span className="eyebrow">{taskLabel(run)}</span><StatusPill status={review?.verdict === 'revise' && run.status === 'completed' ? 'revise' : run.status}>{runStatus(run)}</StatusPill></div>
+    {!bare && <header><span className="outcome-icon" aria-hidden="true"><StatusIcon/></span><div><span className="eyebrow">{taskLabel(run)}</span><StatusPill status={review?.verdict === 'revise' && run.status === 'completed' ? 'revise' : run.status}>{runStatus(run)}</StatusPill></div>
       <div className="button-row">{onMonitor && <button className="small ghost" onClick={() => onMonitor(run.id)}>查看记录</button>}{onDismiss && <button className="icon-button small ghost" aria-label="收起上次任务结果" title="收起" onClick={onDismiss}><X aria-hidden="true"/></button>}</div></header>}
     <p>{outcome}</p>
     {isAgentRun(run) && run.runtime?.waiting?.kind === 'input' && <p>{run.runtime.waiting.question || '需要你补充信息。'}</p>}
@@ -71,7 +74,7 @@ export function TaskOutcome({ workspace, run, history, onOpenReference, onNextSt
     {review && <div className={`review-result ${review.verdict}`} data-testid="final-review">
       <div className="review-head"><StatusPill status={review.verdict}>{review.verdict === 'revise' ? '仍有修改建议' : '读者评审通过'}</StatusPill></div>
       {!!review.issues.length && <ul>{review.issues.map((issue, i) => <li key={i}>{issue}</li>)}</ul>}
-      {review.recommendation && <p>{review.recommendation}</p>}
+      {review.recommendation && <Markdown text={review.recommendation}/>}
     </div>}
     {!!refs.length && <div className="outcome-links">{refs.slice(0, 4).map(resultLink)}</div>}
     {refs.length > 4 && <details className="more-references"><summary>其他 {refs.length - 4} 项产出</summary><div className="outcome-links">{refs.slice(4).map(resultLink)}</div></details>}
@@ -174,11 +177,13 @@ export default function Assistant(props: AssistantProps) {
       <button role="tab" data-testid="ai-tab-task" aria-selected={tab === 'task'} className={tab === 'task' ? 'active' : ''} onClick={() => setTab('task')}>{active ? <StatusPill status={active.status}>{runStatus(active)}</StatusPill> : '任务'}</button>
       <button role="tab" data-testid="ai-tab-memory" aria-selected={tab === 'memory'} className={tab === 'memory' ? 'active' : ''} onClick={() => setTab('memory')}><BookmarkPlus aria-hidden="true"/>偏好记忆{!!props.memories.length && <small>{props.memories.length}</small>}</button>
     </div>
-    {tab === 'chat' ? <div className="ai-scroll">{workspace ? <CompanionPanel workspace={workspace} defaultAnchor={{ surface: 'panel', references }}/> : <p className="muted">先创建或打开一部作品。</p>}</div>
-    : tab === 'memory' ? <div className="ai-scroll">{workspace && <AgentMemoryPanel key={workspace.id} memories={props.memories} session={props.session} actions={props.memoryActions} loading={props.memoryLoading} busy={props.memoryBusy} error={props.memoryError}/>}</div>
-    : active ? <div className="ai-scroll run-view" data-testid="active-run">
+    {tab === 'chat' ? <div key="chat" className="ai-scroll">{workspace ? <CompanionPanel workspace={workspace} defaultAnchor={{ surface: 'panel', references }}/> : <p className="muted">先创建或打开一部作品。</p>}</div>
+    : tab === 'memory' ? <div key="memory" className="ai-scroll">{workspace && <AgentMemoryPanel key={workspace.id} memories={props.memories} session={props.session} actions={props.memoryActions} loading={props.memoryLoading} busy={props.memoryBusy} error={props.memoryError}/>}</div>
+    : active ? <div key="run" className="ai-scroll run-view" data-testid="active-run">
       <header className="run-head">
-        <div><span className="eyebrow">{taskLabel(active)}</span><p className="run-goal" title={active.objective}>{active.objective}</p></div>
+        <div className="run-head-top"><span className="eyebrow"><span className="ai-mark run-mark" aria-hidden="true"><Sparkles/></span>{taskLabel(active)}</span><StatusPill status={active.status}>{runStatus(active)}</StatusPill></div>
+        <p className="run-goal" title={active.objective}>{active.objective}</p>
+        <ProgressBar run={active}/>
         {isAgentRun(active) ? <AgentRunControls run={active} actions={props.agentActions} busy={props.busy || !!props.agentBusy} compact/>
           : <button className="small ghost-danger" disabled={active.status === 'cancelled'} onClick={() => fire(props.onCancel(active.id))}><Square aria-hidden="true"/>{active.status === 'cancelled' ? '正在停止…' : '停止'}</button>}
       </header>
@@ -190,7 +195,7 @@ export default function Assistant(props: AssistantProps) {
       <button className="link-button" data-testid={active.status === 'awaitingApproval' ? 'review-current-candidate' : 'open-active-run'} onClick={() => props.onMonitor(active.id)}>{active.status === 'awaitingApproval' ? '在创作记录中全屏审阅' : '查看完整记录'}<ArrowUpRight aria-hidden="true"/></button>
     </div>
     : <>
-      <div className="ai-scroll compose-view">
+      <div key="compose" className="ai-scroll compose-view">
         {needsFollowUp && <button className="suggestion" data-testid="follow-up-change" onClick={() => props.onPrepare('assist', followUpRefs, 'continuity')}><Sparkles aria-hidden="true"/><span><strong>有新的人工修改</strong>让 AI 跟进相关设定的一致性</span><ChevronRight aria-hidden="true"/></button>}
         {workspace && showResult && <TaskOutcome workspace={workspace} run={latest} history={history} onOpenReference={props.onOpenReference} onNextStage={props.onNextStage} onMonitor={props.onMonitor} onUndo={props.onUndo} onRetry={props.onRetry} onDismiss={() => props.onDismissRun(latest.id)} disabled={props.busy}/>}
         <div className="compose-card">

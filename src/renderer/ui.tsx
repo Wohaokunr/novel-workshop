@@ -237,3 +237,17 @@ export function Combobox({ items, onPick, placeholder = '搜索…', empty = '�
     </div>
   </div>;
 }
+
+/** "刚刚 / 5 分钟前 / 昨天 14:20 / 3月2日" for timestamps in conversations and lists. */
+export function relativeTime(iso: string, now = Date.now()): string {
+  const time = new Date(iso);
+  if (Number.isNaN(time.getTime())) return '';
+  const seconds = Math.round((now - time.getTime()) / 1000);
+  const clock = time.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+  if (seconds < 45) return '刚刚';
+  if (seconds < 3600) return `${Math.max(1, Math.round(seconds / 60))} 分钟前`;
+  const today = new Date(now); today.setHours(0, 0, 0, 0);
+  if (time >= today) return clock;
+  if (time.getTime() >= today.getTime() - 86_400_000) return `昨天 ${clock}`;
+  return time.getFullYear() === today.getFullYear() ? `${time.getMonth() + 1}月${time.getDate()}日` : time.toLocaleDateString('zh-CN');
+}
