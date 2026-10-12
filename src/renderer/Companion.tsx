@@ -1,13 +1,13 @@
 import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
-import { ArrowDown, ArrowRight, ArrowUp, Check, ChevronRight, CornerDownRight, GitBranch, GripHorizontal, Layers, Lightbulb, ListTree, LoaderCircle, MessageCircleQuestion, MessagesSquare, PanelRight, PenLine, RefreshCw, Sparkles, Square, StickyNote, Trash2, Undo2, UserPlus, Workflow, X, type LucideIcon } from 'lucide-react';
+import { ArrowDown, ArrowRight, ArrowUp, Check, ChevronRight, CornerDownRight, GitBranch, GripHorizontal, Layers, Lightbulb, ListTree, LoaderCircle, MapPin, MessageCircleQuestion, MessagesSquare, PanelRight, PenLine, RefreshCw, Sparkles, Square, StickyNote, Trash2, Undo2, UserPlus, Workflow, X, type LucideIcon } from 'lucide-react';
 import type { Workspace } from '../shared/types';
 import type { CompanionAnchor, CompanionIntensity, CompanionMode, CompanionNovelField, CompanionOp, CompanionProposal, CompanionThread, CompanionTurn } from '../shared/companion-types';
 import { companionModeNames, focusNames, ideaKindNames, intensityNames, novelFieldNames } from '../shared/companion-types';
 import { nextStage } from '../shared/story-flow';
 import { companionCommands, selectCompanionItems } from '../shared/companion';
 import { personNames, scaleNames } from '../shared/style-types';
-import { fire, orderedScenes, relativeTime, uid } from './ui';
+import { fire, relativeTime, uid } from './ui';
 import { usePresence } from './interaction';
 import Markdown from './Markdown';
 
@@ -25,7 +25,7 @@ interface CompanionApi {
   intensity: CompanionIntensity; setIntensity: (value: CompanionIntensity) => void;
   summon: (request: SummonRequest) => void;
   send: (target: { thread?: CompanionThread; mode: CompanionMode; anchor: CompanionAnchor }, message: string, retry?: boolean) => Promise<CompanionThread | undefined>;
-  adopt: (thread: CompanionThread, turn: CompanionTurn, itemIds: string[], options?: { group?: boolean; target?: 'canvas' | 'sceneOutline'; as?: 'character' }) => Promise<void>;
+  adopt: (thread: CompanionThread, turn: CompanionTurn, itemIds: string[], options?: { group?: boolean; target?: 'canvas' | 'sceneOutline'; as?: 'character' | 'setting' }) => Promise<void>;
   undo: (thread: CompanionThread, batchId: string) => Promise<void>;
   cancel: (thread: CompanionThread) => Promise<void>;
   remove: (thread: CompanionThread) => Promise<void>;
@@ -42,7 +42,7 @@ export function useOptionalCompanion() { return useContext(CompanionContext); }
 
 const surfaceNames = { canvas: '灵感画布', world: '世界因果', story: '叙述顺序', outline: '大纲', writer: '正文写作', panel: '对话', style: '文风' } as const;
 const opNames: Record<CompanionOp['op'], string> = { addAct: '新增幕/卷', updateAct: '调整幕/卷', addChapter: '新增章节', updateChapter: '调整章节', addScene: '新增场景', updateScene: '调整场景', moveScene: '移动场景', addEvent: '新增事件', addCard: '画布便笺',
-  updateNovel: '作品信息', addCharacter: '新增人物', updateCharacter: '丰富人物', link: '画布连线', addCause: '补充因果', updateStyle: '文风' };
+  updateNovel: '作品信息', addCharacter: '新增人物', updateCharacter: '丰富人物', addSetting: '新增环境', updateSetting: '丰富环境', link: '画布连线', addCause: '补充因果', updateStyle: '文风' };
 const placeholders: Record<CompanionMode, string> = {
   diverge: '说说你在想什么，或者直接让我发散…', causality: '想推演哪一步因果？', structure: '你对现在的节奏哪里不满意？',
   outline: '想怎么展开这一层？', beat: '卡在哪里了？', develop: '补充你的想法，或直接点选上面的选项…', style: '说说你想要的笔触，或点选上面的选项…',
@@ -325,6 +325,7 @@ function CompanionReply({ workspace, thread, turn, latest, onAnswer }: { workspa
             {batch ? <button className="small ghost" onClick={() => act(() => companion.undo(thread, batch))}><Undo2 aria-hidden="true"/>撤销</button>
               : <>{thread.mode === 'beat' && <button className="small" data-testid="adopt-idea-outline" onClick={() => act(() => companion.adopt(thread, turn, [idea.id], { target: 'sceneOutline' }))}>补进场景大纲</button>}
                 {idea.kind === 'character' && <button className="small" data-testid="adopt-idea-character" onClick={() => act(() => companion.adopt(thread, turn, [idea.id], { as: 'character' }))}><UserPlus aria-hidden="true"/>设为人物</button>}
+                {idea.kind === 'setting' && <button className="small" data-testid="adopt-idea-setting" onClick={() => act(() => companion.adopt(thread, turn, [idea.id], { as: 'setting' }))}><MapPin aria-hidden="true"/>设为环境</button>}
                 {canvas || thread.anchor.surface === 'writer' ? <button className="small" data-testid="adopt-idea" onClick={() => act(() => companion.adopt(thread, turn, [idea.id], { target: 'canvas' }))}><StickyNote aria-hidden="true"/>放到画布</button> : null}</>}
           </div>
         </article>;
@@ -360,13 +361,17 @@ function ProposalCard({ index, workspace, thread, turn, proposal, onAct }: { ind
   const nameOf = (id: string | null) => {
     if (!id) return '';
     const card = workspace.cards.find(item => item.id === id);
-    return proposal.ops.find(op => op.ref === id)?.title ?? workspace.acts?.find(item => item.id === id)?.title ?? workspace.chapters.find(item => item.id === id)?.title
+    return proposal.ops.find(op => op.ref === id)?.title ?? workspace.acts?.find(item => item.id === id)?.title ?? workspace.chapters.find(item => item.id === id || item.title.trim() === id)?.title
       ?? workspace.scenes.find(item => item.id === id)?.title ?? workspace.objects.find(item => item.id === id)?.name
       ?? (card && (card.kind === 'object' ? workspace.objects.find(item => item.id === card.refId)?.name : card.kind === 'scene' ? workspace.scenes.find(item => item.id === card.refId)?.title : card.title)) ?? '（已不存在）';
   };
   const fieldOf = (op: CompanionOp) => (op.field ?? op.purpose ?? '') as CompanionNovelField;
   const batches = [...new Set(proposal.ops.map(op => adopted[`${proposal.id}#${op.id}`]).filter((id): id is string => !!id))];
-  const preview = useMemo(() => thread.mode === 'structure' ? structurePreview(workspace, proposal) : [], [workspace, proposal, thread.mode]);
+  const preview = useMemo(() => thread.mode === 'structure' ? structurePreview(workspace, proposal, thread.anchor) : [], [workspace, proposal, thread.mode, thread.anchor]);
+  /** Whether a scene op's chapter handle names a chapter that exists or that this proposal creates; otherwise adoption opens one. */
+  const knownChapter = (handle: string | null) => !!handle && (proposal.ops.some(item => item.ref === handle && item.op === 'addChapter')
+    || workspace.chapters.some(item => item.id === handle || item.title.trim() === handle));
+  const names = (values: string[] | undefined) => (values ?? []).map(value => proposal.ops.find(item => item.ref === value)?.title ?? workspace.objects.find(item => item.id === value)?.name ?? value).join('、');
   const toggle = (node: OpNode, on: boolean) => setSelected(old => { const next = new Set(old); for (const id of descendants(node)) if (on) next.add(id); else next.delete(id); return next; });
   const chosen = pending.filter(op => selected.has(op.id));
   const itemIds = chosen.length === pending.length && !batches.length ? [proposal.id] : chosen.map(op => `${proposal.id}#${op.id}`);
@@ -393,10 +398,16 @@ function ProposalCard({ index, workspace, thread, turn, proposal, onAct }: { ind
         {!!node.children.length && <ul>{node.children.map(child => renderNode(child, depth + 1))}</ul>}
       </li>;
     }
-    const detail = [op.content, op.purpose && `作用：${op.purpose}`, op.povName && `视角：${op.povName}`,
-      op.op === 'moveScene' && `移到${op.parentId ? `「${nameOf(op.parentId)}」` : '本章'}${op.order === null || op.order > workspace.scenes.length ? '末尾' : `第 ${op.order} 位`}`,
-      op.targetId && op.op !== 'moveScene' && (op.op === 'addEvent' ? `引发「${nameOf(op.targetId)}」` : `「${nameOf(op.targetId)}」`),
-      op.parentId && !op.parentRef && op.op !== 'moveScene' && `归入「${nameOf(op.parentId)}」`,
+    const sceneOp = op.op === 'addScene' || op.op === 'updateScene';
+    const parent = op.parentRef ?? op.parentId;
+    const opensChapter = (op.op === 'addScene' || op.op === 'moveScene') && !knownChapter(parent) && (!!parent || (op.op === 'addScene' && !thread.anchor.sceneId));
+    const detail = [op.content, op.purpose && `${op.op === 'addSetting' || op.op === 'updateSetting' ? '规则' : '作用'}：${op.purpose}`, op.povName && `视角：${op.povName}`,
+      sceneOp && op.people.length && `出场：${names(op.people)}`, sceneOp && op.places?.length && `地点：${names(op.places)}`, sceneOp && op.events?.length && `事件：${names(op.events)}`,
+      opensChapter && `将新建章节「${parent && /\p{Script=Han}/u.test(parent) ? parent : op.title || nameOf(op.targetId)}」`,
+      op.op === 'moveScene' && !opensChapter && `移到${parent ? `「${nameOf(parent)}」` : '本章'}${op.order === null || op.order > workspace.scenes.length ? '末尾' : `第 ${op.order} 位`}`,
+      op.op === 'addChapter' && op.targetId && `插在「${nameOf(op.targetId)}」之后`,
+      op.targetId && op.op !== 'moveScene' && op.op !== 'addChapter' && (op.op === 'addEvent' ? `引发「${nameOf(op.targetId)}」` : `「${nameOf(op.targetId)}」`),
+      op.parentId && !op.parentRef && op.op !== 'moveScene' && !opensChapter && `归入「${nameOf(op.parentId)}」`,
       op.causes.length && `起因：${op.causes.map(id => proposal.ops.find(item => item.ref === id)?.title ?? nameOf(id)).join('、')}`].filter(Boolean).join(' · ');
     return <li key={op.id} className={`op-node depth-${Math.min(depth, 3)} ${done ? 'adopted' : ''}`}>
       <label><input type="checkbox" disabled={done} checked={done || selected.has(op.id)} onChange={event => toggle(node, event.target.checked)}/>
@@ -414,8 +425,8 @@ function ProposalCard({ index, workspace, thread, turn, proposal, onAct }: { ind
         {!(blind && !batches.length) && <span className="proposal-count">{done ? `${done}/${proposal.ops.length} 已采纳` : `${proposal.ops.length} 项`}</span>}</div>
       {proposal.summary && (blind ? <p className="style-passage">{proposal.summary}</p> : <Markdown text={proposal.summary} className="proposal-summary"/>)}
     </header>
-    {!!preview.length && <div className="structure-preview">{preview.map(row => <div key={row.chapter}><span className="eyebrow">{row.chapter}</span>
-      <ol className="before">{row.before.map(title => <li key={title}>{title}</li>)}</ol><span aria-hidden="true">→</span><ol className="after">{row.after.map(title => <li key={title}>{title}</li>)}</ol></div>)}</div>}
+    {!!preview.length && <div className="structure-preview">{preview.map(row => <div key={row.id} className={row.fresh ? 'fresh' : undefined}><span className="eyebrow">{row.chapter}{row.fresh && <b className="new-chapter">新章</b>}</span>
+      <ol className="before">{row.fresh ? <li className="muted">尚无此章</li> : row.before.map((title, index) => <li key={index}>{title}</li>)}</ol><span aria-hidden="true">→</span><ol className="after">{row.after.map((title, index) => <li key={index}>{title}</li>)}</ol></div>)}</div>}
     {blind && !batches.length ? <p className="muted blind-note">选中后揭晓这一版对应的笔调。</p> : <ul className="op-tree">{tree.map(node => renderNode(node, 0))}</ul>}
     <div className="button-row proposal-actions">
       {!!pending.length && <button className="small primary" data-testid="adopt-proposal" disabled={!chosen.length} onClick={() => onAct(() => companion.adopt(thread, turn, itemIds))}>
@@ -442,19 +453,20 @@ function styleOpLabel(op: CompanionOp, nameOf: (id: string | null) => string): {
   return { heading: field, detail: content };
 }
 
-/** Before/after reading order for chapters a structure proposal touches. */
-function structurePreview(workspace: Workspace, proposal: CompanionProposal) {
+/** Before/after reading order for chapters a structure proposal touches, including chapters it opens. */
+function structurePreview(workspace: Workspace, proposal: CompanionProposal, anchor: CompanionAnchor) {
   try {
     const { commands } = companionCommands(workspace, selectCompanionItems({ reply: '', questions: [], ideas: [], proposals: [proposal], followUps: [] }, [proposal.id]),
-      { mode: 'structure', anchor: { surface: 'story', references: [] }, newId: uid });
+      { mode: 'structure', anchor, newId: uid });
     const changed = new Map(commands.flatMap(command => command.type === 'putScene' ? [[command.value.id, command.value]] : []));
-    if (!changed.size) return [];
+    const opened = new Map(commands.flatMap(command => command.type === 'putChapter' && !workspace.chapters.some(chapter => chapter.id === command.value.id) ? [[command.value.id, command.value]] : []));
+    if (!changed.size && !opened.size) return [];
     const after = [...workspace.scenes.filter(scene => !changed.has(scene.id)), ...changed.values()];
-    const chapters = new Set([...changed.values()].map(scene => scene.chapterId));
-    for (const scene of changed.values()) { const old = workspace.scenes.find(item => item.id === scene.id); if (old) chapters.add(old.chapterId); }
+    const touched = new Set([...[...changed.values()].map(scene => scene.chapterId), ...opened.keys()]);
+    for (const scene of changed.values()) { const old = workspace.scenes.find(item => item.id === scene.id); if (old) touched.add(old.chapterId); }
     const titles = (scenes: Workspace['scenes'], chapterId: string) => scenes.filter(scene => scene.chapterId === chapterId).sort((a, b) => a.order - b.order).map(scene => scene.title);
-    return orderedScenes(workspace).map(scene => scene.chapterId).filter((id, index, all) => all.indexOf(id) === index && chapters.has(id))
-      .map(id => ({ chapter: workspace.chapters.find(chapter => chapter.id === id)?.title ?? '', before: titles(workspace.scenes, id), after: titles(after, id) }));
+    return [...workspace.chapters.filter(chapter => !opened.has(chapter.id)), ...opened.values()].sort((a, b) => a.order - b.order).filter(chapter => touched.has(chapter.id))
+      .map(chapter => ({ id: chapter.id, chapter: chapter.title, fresh: opened.has(chapter.id), before: titles(workspace.scenes, chapter.id), after: titles(after, chapter.id) }));
   } catch { return []; }
 }
 

@@ -149,6 +149,87 @@ test('结构方案只重排与改大纲，不改正文；无法对应的建议�
   assert.equal(s1.povId, 'shen');
 });
 
+test('结构方案可以在方案里新建章节：新章紧跟目标章，勾选场景自动带上章节，三要素一并写入', () => {
+  const base = sample(), first = base.chapters[0]!;
+  const project = applyCommands(base, [
+    { type: 'putChapter', value: { id: 'ch2', title: '第二章', order: 1 } },
+    { type: 'putScene', value: { id: 's4', chapterId: 'ch2', order: 1, title: '码头', povId: null, eventIds: [], outline: '', text: '' } },
+    { type: 'putObject', value: { id: 'tower', typeId: 'setting', name: '钟楼', fields: {} } },
+  ]);
+  const plan = response({ proposals: [{ id: 'p1', title: '插叙', summary: '', ops: [
+    op({ id: 'o1', op: 'addChapter', ref: 'c1', targetId: first.id, title: '插叙 · 三十年前', content: '交代旧案' }),
+    op({ id: 'o2', op: 'addScene', parentRef: 'c1', title: '旧案', content: '沉默的目击者', povName: '沈卿', people: ['林舟', '沈卿'], places: ['钟楼'], events: ['钟响'] }),
+    op({ id: 'o3', op: 'moveScene', targetId: 's3', parentRef: 'c1', order: 1 }),
+  ] }] });
+  const partial = selectCompanionItems(plan, ['p1#o2']);
+  assert.deepEqual(partial.ops.map(item => item.op.id), ['o1', 'o2'], '勾选场景会带上它的新章节');
+  const anchor: CompanionAnchor = { surface: 'story', references: [] };
+  const { commands, skipped } = companionCommands(project, partial, { mode: 'structure', anchor, newId });
+  assert.deepEqual(skipped, []);
+  const next = applyCommands(project, commands);
+  const ordered = [...next.chapters].sort((a, b) => a.order - b.order).map(chapter => chapter.title);
+  assert.deepEqual(ordered, ['第一章', '插叙 · 三十年前', '第二章']);
+  const flashback = next.chapters.find(chapter => chapter.title === '插叙 · 三十年前')!;
+  const scene = next.scenes.find(item => item.title === '旧案')!;
+  assert.equal(scene.chapterId, flashback.id);
+  assert.equal(scene.text, '');
+  assert.equal(scene.povId, 'shen');
+  assert.deepEqual(scene.castIds, ['lin'], '视角人物不重复列为出场人物');
+  assert.deepEqual(scene.settingIds, ['tower']);
+  assert.deepEqual(scene.eventIds, ['e1']);
+  const whole = applyCommands(project, companionCommands(project, selectCompanionItems(plan, ['p1']), { mode: 'structure', anchor, newId }).commands);
+  const moved = whole.scenes.filter(item => item.chapterId === whole.chapters.find(chapter => chapter.title === '插叙 · 三十年前')!.id).sort((a, b) => a.order - b.order);
+  assert.deepEqual(moved.map(item => item.id === 's3' ? 's3' : item.title), ['s3', '旧案']);
+  assert.equal(whole.scenes.find(item => item.id === 's1')!.text, '已经写好的正文。');
+});
+
+test('新场景找不到章节时自动建章：同一未知句柄只建一章，按标题能对上已有章节', () => {
+  const project = sample(), first = project.chapters[0]!;
+  const plan = response({ proposals: [{ id: 'p1', title: '补场景', summary: '', ops: [
+    op({ id: 'o1', op: 'addScene', parentId: '第二章 雨夜', title: '甲' }),
+    op({ id: 'o2', op: 'addScene', parentId: '第二章 雨夜', title: '乙' }),
+    op({ id: 'o3', op: 'addScene', title: '丙' }),
+    op({ id: 'o4', op: 'addScene', parentId: '第一章', title: '丁', people: ['不存在的人'] }),
+  ] }] });
+  const anchor: CompanionAnchor = { surface: 'story', references: [{ kind: 'scene', id: 's2' }] };
+  const { commands, skipped, refs } = companionCommands(project, selectCompanionItems(plan, ['p1']), { mode: 'structure', anchor, newId });
+  assert.equal(skipped.length, 1, '未知人物会被报告');
+  assert.match(skipped[0]!, /不存在的人/);
+  const next = applyCommands(project, commands);
+  const ordered = [...next.chapters].sort((a, b) => a.order - b.order);
+  assert.deepEqual(ordered.map(chapter => chapter.title), ['第一章', '第二章 雨夜', '丙'], '新章按提出顺序排在锚点章之后');
+  const titles = (chapterId: string) => next.scenes.filter(scene => scene.chapterId === chapterId).sort((a, b) => a.order - b.order).map(scene => scene.title);
+  assert.deepEqual(titles(ordered[1]!.id), ['甲', '乙']);
+  assert.deepEqual(titles(ordered[2]!.id), ['丙']);
+  assert.ok(titles(first.id).includes('丁'));
+  assert.equal(refs['p1:第二章 雨夜'], ordered[1]!.id, '后续部分采纳沿用同一章');
+});
+
+test('环境是一等公民：addSetting 同名沿用，updateScene 只追加三要素，设定点子可以设为环境', () => {
+  const project = applyCommands(sample(), [{ type: 'putObject', value: { id: 'tower', typeId: 'setting', name: '钟楼', fields: { description: '旧钟楼' } } }]);
+  const plan = response({ proposals: [{ id: 'p1', title: '环境', summary: '', ops: [
+    op({ id: 'o1', op: 'addSetting', ref: 's1', title: '潮汐市场', content: '嘈杂', purpose: '交易必须当面完成' }),
+    op({ id: 'o2', op: 'addSetting', title: '钟楼' }),
+    op({ id: 'o3', op: 'updateScene', targetId: 's2', people: ['林舟'], places: ['s1'], events: ['开门'] }),
+    op({ id: 'o4', op: 'updateScene', targetId: 's2', places: ['钟楼'] }),
+    op({ id: 'o5', op: 'updateSetting', targetId: 'tower', content: '海雾里的旧钟楼', purpose: '最多敲十二下' }),
+  ] }], ideas: [{ id: 'i1', kind: 'setting', title: '旧档案馆：被遗忘的记录', content: '没人来', hook: '' }] });
+  const { commands, skipped } = companionCommands(project, selectCompanionItems(plan, ['p1', 'i1']), { mode: 'develop', anchor: { surface: 'panel', references: [] }, ideasAs: 'setting', newId });
+  assert.deepEqual(skipped, ['钟楼：同名环境已存在，沿用原环境']);
+  const next = applyCommands(project, commands);
+  const market = next.objects.find(object => object.name === '潮汐市场')!;
+  assert.equal(market.typeId, 'setting');
+  assert.deepEqual(market.fields, { description: '嘈杂', rules: '交易必须当面完成' });
+  assert.equal(next.objects.filter(object => object.name === '钟楼').length, 1);
+  assert.equal(next.objects.find(object => object.id === 'tower')!.fields.rules, '最多敲十二下');
+  assert.equal(next.objects.find(object => object.name === '旧档案馆')?.typeId, 'setting');
+  const scene = next.scenes.find(item => item.id === 's2')!;
+  assert.deepEqual(scene.castIds, ['lin']);
+  assert.deepEqual(scene.settingIds, [market.id, 'tower'], '第二次更新只追加，不覆盖');
+  assert.deepEqual(scene.eventIds, ['e2']);
+  assert.equal(scene.povId, 'shen');
+});
+
 test('因果推演：后果晚于原因，前因插入到结果之前并接入因果链', () => {
   const project = sample();
   const plan = response({ proposals: [{ id: 'p1', title: '推演', summary: '', ops: [

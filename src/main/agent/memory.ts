@@ -313,7 +313,7 @@ export function collectContext(workspace: Workspace, request: RunRequest, memori
   const active = refreshMemories(workspace, memories).filter(memory => memory.projectId === workspace.id && memory.status === 'active');
   const take = <T>(items: T[], limit: number) => items.slice(0, limit);
   const briefScene = (scene: Workspace['scenes'][number]) => ({ id: scene.id, chapterId: scene.chapterId, title: scene.title,
-    order: scene.order, povId: scene.povId, eventIds: scene.eventIds, outline: scene.outline.slice(0, 1000), text: scene.text.slice(0, 1800),
+    order: scene.order, povId: scene.povId, castIds: scene.castIds ?? [], settingIds: scene.settingIds ?? [], eventIds: scene.eventIds, outline: scene.outline.slice(0, 1000), text: scene.text.slice(0, 1800),
     omitted: { outlineChars: Math.max(0, scene.outline.length - 1000), textChars: Math.max(0, scene.text.length - 1800) } });
   const selectedScene = request.sceneId ? workspace.scenes.find(scene => scene.id === request.sceneId) : undefined;
   const scoped = selectedScene ? [selectedScene] : request.chapterId ? workspace.scenes.filter(scene => scene.chapterId === request.chapterId) : [];
@@ -326,7 +326,7 @@ export function collectContext(workspace: Workspace, request: RunRequest, memori
   const counts = view.mentionCounts(), focusIds = new Set<string>();
   for (const scene of [...scoped, ...materials.scenes]) {
     if (scene.povId) focusIds.add(scene.povId);
-    for (const id of scene.eventIds) focusIds.add(id);
+    for (const id of [...scene.eventIds, ...(scene.castIds ?? []), ...(scene.settingIds ?? [])]) focusIds.add(id);
     for (const id of sceneMentions(view.index, scene.id).keys()) focusIds.add(id);
   }
   for (const object of materials.objects) focusIds.add(object.id);
@@ -345,7 +345,7 @@ export function collectContext(workspace: Workspace, request: RunRequest, memori
       objects: take(materials.objects, 12), scenes: take(materials.scenes, 12).map(briefScene) },
     catalog: { objectTypes: take(workspace.objectTypes, 12), objects: take(objects, 60).map(object => ({ id: object.id, typeId: object.typeId, name: object.name, worldOrder: object.event?.worldOrder, mentions: counts.get(object.id) ?? 0 })),
       chapters: focus.near.map(chapterBrief), chapterSkeleton: focus.skeleton.map(chapter => ({ id: chapter.id, title: chapter.title, order: chapter.order })),
-      scenes: take(nearScenes, 60).map(scene => ({ id: scene.id, chapterId: scene.chapterId, title: scene.title, order: scene.order, eventIds: scene.eventIds, writtenChars: scene.text.length })),
+      scenes: take(nearScenes, 60).map(scene => ({ id: scene.id, chapterId: scene.chapterId, title: scene.title, order: scene.order, povId: scene.povId, castIds: scene.castIds ?? [], settingIds: scene.settingIds ?? [], eventIds: scene.eventIds, writtenChars: scene.text.length })),
       cards: take(workspace.cards, 40).map(card => ({ id: card.id, kind: card.kind, refId: card.refId, title: card.title })) },
     advisoryMemories: take(active.filter(memory => memory.kind === 'summary' || memory.kind === 'experience'), 6).map(memory => ({
       id: memory.id, kind: memory.kind, content: memory.content.slice(0, 700), formalTruth: false, notice: '摘要/经验仅是辅助，正式事实以仍有效的原始正文与领域记录为准。' })),

@@ -157,6 +157,8 @@ export function validateWorkspace(workspace: Workspace): void {
     number(scene.order, '场景顺序'); text(scene.title, '场景标题', true);
     check(scene.povId === null || isCharacter(scene.povId), '场景视角必须是人物或全知视角');
     strings(scene.eventIds, '场景事件'); for (const id of scene.eventIds) check(isEvent(id), '场景引用的事件不存在');
+    if (scene.castIds !== undefined) { strings(scene.castIds, '出场人物'); for (const id of scene.castIds) check(isCharacter(id), '出场人物必须是人物'); }
+    if (scene.settingIds !== undefined) { strings(scene.settingIds, '场景环境'); for (const id of scene.settingIds) check(objects.has(id) && !isCharacter(id) && !isEvent(id), '场景环境必须是环境或设定对象'); }
     text(scene.outline, '场景大纲'); text(scene.text, '场景正文');
     const key = `${scene.chapterId}:${scene.order}`; check(!sceneOrders.has(key), '同一章节的场景顺序不能重复'); sceneOrders.add(key);
   }
@@ -312,7 +314,11 @@ function deleteObject(workspace: Workspace, id: string): void {
       delete object.event.observations[id];
     }
   }
-  for (const scene of workspace.scenes) { scene.eventIds = scene.eventIds.filter(ref => ref !== id); if (scene.povId === id) scene.povId = null; }
+  for (const scene of workspace.scenes) {
+    scene.eventIds = scene.eventIds.filter(ref => ref !== id); if (scene.povId === id) scene.povId = null;
+    if (scene.castIds) scene.castIds = scene.castIds.filter(ref => ref !== id);
+    if (scene.settingIds) scene.settingIds = scene.settingIds.filter(ref => ref !== id);
+  }
   cleanFacts(workspace, new Set(workspace.facts.filter(fact => fact.subjectId === id || fact.fromEventId === id).map(fact => fact.id)));
   workspace.knowledge = workspace.knowledge.filter(item => item.characterId !== id && item.learnedAt !== id);
   workspace.characterStates = (workspace.characterStates ?? []).filter(state => state.characterId !== id && state.eventId !== id);

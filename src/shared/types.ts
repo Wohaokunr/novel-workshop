@@ -17,6 +17,10 @@ export interface Act { id: string; title: string; order: number; purpose: string
 export interface NarrativeScene {
   id: string; chapterId: string; order: number; title: string; povId: string | null;
   eventIds: string[]; outline: string; text: string;
+  /** Characters on stage besides the POV; optional on older workspaces. */
+  castIds?: string[];
+  /** Where the scene happens: setting-like objects (neither characters nor events). */
+  settingIds?: string[];
 }
 export interface WorldFact { id: string; subjectId: string; key: string; value: string; fromEventId: string | null; replacesId?: string }
 export interface CharacterKnowledge {

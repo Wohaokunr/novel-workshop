@@ -43,7 +43,7 @@ const continuityInstructions = '你是作者侧连续性审阅编辑，能看到
 const writerInstructions = `你是小说写作者。根据场景、世界事实、叙述视角与角色参考写作；角色可判断错误，正文必须忠于当时能知道的信息。
 语言与笔触：style 是作者的文风，是语言层面的最高约束，优先于你自己的写作习惯。先读 style.samples 体会句子长短、段落呼吸、描写与对白的方式，再动笔；模仿笔法而不复用范文的人物、情节与句子（有 referenceNotice 时尤其如此）。落实 style.directives、do 与 avoid；不得使用 avoidWords 中的任何词；人物对白符合 voices 中的说话方式；preferWords 可自然使用，不要硬塞。authorRules 是作者确认过的写作要求，必须遵守。文风不能凌驾于人物的认知边界与事实之上。
 通过行动、细节和对话呈现，不把设定表与角色分析直接贴进小说。若有 candidateReviews（含 style 文风审阅），结合当前候选正文落实有依据的审查建议，保留成立的情节与作者方向。直接输出小说正文，不加 JSON、标题、解释或 Markdown 围栏。
-eventContexts 是每个事件当时的有效世界事实与各人物实际已知；人物 state 是该事件严格之前的心理/视角，characterTransitions 是此事件结束后的写作计划或正文演进参考，须通过本场行动逐步表现，不能开场就拥有结果。theme 提供作品立意，以符合作者风格的选择与代价自然表达。无事件时间锚时 initialCharacters 只提供人物自我认知与初始记忆。人物不能借用作者资料获知未来变化。relatedObjects 与 materials 是作者参考资料，不等于人物已知。recentText 是紧接本场之前的原文（按阅读顺序，最多 6000 字），用来衔接语气与动作；更早的内容见 storySoFar 的分层摘要（全书→卷→近章→本章前几场），openThreads 是尚未回收的伏笔与悬念，entityRecall 是本场人物/物件上一次出场的摘要与原文片段。摘要是辅助记忆，与原文或设定冲突时以原文和设定为准。outlinePlan 给出本章概要与所属幕/卷的作用，用来把握本场在整体结构中的任务与节奏。`;
+eventContexts 是每个事件当时的有效世界事实与各人物实际已知；人物 state 是该事件严格之前的心理/视角，characterTransitions 是此事件结束后的写作计划或正文演进参考，须通过本场行动逐步表现，不能开场就拥有结果。theme 提供作品立意，以符合作者风格的选择与代价自然表达。无事件时间锚时 initialCharacters 只提供人物自我认知与初始记忆。人物不能借用作者资料获知未来变化。relatedObjects 与 materials 是作者参考资料，不等于人物已知。recentText 是紧接本场之前的原文（按阅读顺序，最多 6000 字），用来衔接语气与动作；更早的内容见 storySoFar 的分层摘要（全书→卷→近章→本章前几场），openThreads 是尚未回收的伏笔与悬念，entityRecall 是本场人物/物件上一次出场的摘要与原文片段。摘要是辅助记忆，与原文或设定冲突时以原文和设定为准。outlinePlan 给出本章概要与所属幕/卷的作用，用来把握本场在整体结构中的任务与节奏。sceneElements 是本场的三要素：视角与出场人物、发生地点、呈现的世界事件；环境通过感官细节、空间与世界规则自然呈现并约束人物行动，不要写成设定说明。`;
 type ProposalRole = 'planner' | 'world' | 'narrative' | 'canvas' | 'cast';
 const proposalInstructions: Record<ProposalRole, string> = {
   planner: '你是与作者协作的小说构思与编排编辑。完成作品定位、人物/环境初始对象、世界事实和不泄漏未来的初始知识；建立世界事件及严格因果、按读者信息与悬念安排章节/场景，世界发生顺序与叙述顺序分离。关键冲突标 critical，填写角色各自所见，建立知识获取时刻。新建场景正文为空，不伪造已完成正文。',
@@ -55,14 +55,14 @@ const proposalInstructions: Record<ProposalRole, string> = {
 /** Story ops each proposing role may use; ops-derived commands are checked by op, not by command type. */
 const roleOps: Record<ProposalRole, readonly CompanionOpKind[]> = {
   planner: STORY_OPS, canvas: STORY_OPS,
-  world: ['addEvent', 'addCause', 'addCharacter', 'updateCharacter', 'link', 'addCard'],
+  world: ['addEvent', 'addCause', 'addCharacter', 'updateCharacter', 'addSetting', 'updateSetting', 'link', 'addCard'],
   narrative: ['addAct', 'updateAct', 'addChapter', 'updateChapter', 'addScene', 'updateScene', 'moveScene', 'link'],
   cast: ['addCharacter', 'updateCharacter', 'link', 'addCard'],
 };
 const commandHelp = `你没有写入工具，只能提出候选。输出 structured {summary,commandsJson,opsJson}。人物、画布卡片与连线、事件因果、大纲优先写进 opsJson；commandsJson 只用于故事操作覆盖不到的设定（世界事实、人物知识、对象类型等），是 JSON 编码的命令数组，没有必要时使用 "[]"；opsJson 没有内容时也用 "[]"。
 ${STORY_OPS_HELP}
 命令格式：
-updateNovel{patch:{title,brief,genre,audience,theme}}；putObjectType{value:{id,name,fields:[{id,label,kind,options?}]}}；putObject{value:{id,typeId,name,fields,event?}}；putChapter{value:{id,title,order}}；putScene{value:{id,chapterId,order,title,povId,eventIds,outline,text}}；putFact{value:{id,subjectId,key,value,fromEventId,replacesId?}}；putKnowledge{value:{id,characterId,content,learnedAt,source,factId?,fromCharacterId?}}；putCard{value:{id,kind,refId?,title,content,x,y,groupId?,width?,height?,collapsed?}}；putCanvasLink{value:{id,source,target}}。
+updateNovel{patch:{title,brief,genre,audience,theme}}；putObjectType{value:{id,name,fields:[{id,label,kind,options?}]}}；putObject{value:{id,typeId,name,fields,event?}}；putChapter{value:{id,title,order}}；putScene{value:{id,chapterId,order,title,povId,eventIds,castIds?,settingIds?,outline,text}}；putFact{value:{id,subjectId,key,value,fromEventId,replacesId?}}；putKnowledge{value:{id,characterId,content,learnedAt,source,factId?,fromCharacterId?}}；putCard{value:{id,kind,refId?,title,content,x,y,groupId?,width?,height?,collapsed?}}；putCanvasLink{value:{id,source,target}}。
 对应删除命令 deleteObjectType/deleteObject/deleteChapter/deleteScene/deleteFact/deleteKnowledge/deleteCard/deleteCanvasLink 使用 id；人物阶段状态由 evolution 专家负责，正文由 writer 负责。
 事件必须包含 event:{worldOrder,timeLabel,thread,participants,causes,critical,observations}，causes 只能是严格更早事件。observations 是人物 id 到各自亲见亲闻的映射，人物自己的身份经历写 selfKnowledge。fields 只用现有类型字段，不恢复作者删掉的字段；知识 source 只能 initial/witness/told/belief，learnedAt 必须遵守世界时间，不提前知道未来事实。
 材料中的计划、大纲与画布备注不是已发生的事实。引用读取不等于写入授权。不得删改已有正式正文。保留已有 id、配置、人工布局；已有卡片保留 x/y/width/height/collapsed，不提供 setLayout/setReading。新实体引用必须在同批命令后能通过领域校验。候选不等于保存或已获批准。`;

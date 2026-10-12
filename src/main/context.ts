@@ -1,12 +1,15 @@
 import type { Workspace, CharacterContext, ReaderContext, SourceReference, CanvasCard, NovelObject, NarrativeScene } from '../shared/types.js';
 import { entityRecall, openThreads, storySoFar, StoryView } from './agent/story-view.js';
 import { writerStyle } from './agent/style.js';
+import { isSettingLike, sceneElements } from '../shared/story-elements.js';
 
 /** Raw prose immediately before the target scene; everything earlier reaches the writer as layered digests. */
 export const RECENT_TEXT_CHARS = 6000;
 /** Writer budget: big enough for the target scene plus memory, small enough to stay cheap on a million-word book. */
 export const WRITER_CONTEXT_CHARS = 28_000;
-export const WRITER_PRIORITY = ['scene', 'selectedText', 'style', 'authorRules', 'recentText', 'eventContexts', 'outlinePlan', 'novel', 'storySoFar', 'entityRecall', 'openThreads', 'initialCharacters'];
+/** Books with this few settings still hand all of them to a scene that names none. */
+export const ALL_SETTINGS_UP_TO = 6;
+export const WRITER_PRIORITY = ['scene', 'sceneElements', 'selectedText', 'style', 'authorRules', 'recentText', 'eventContexts', 'outlinePlan', 'novel', 'storySoFar', 'entityRecall', 'openThreads', 'initialCharacters'];
 
 export function resolveReferences(workspace: Workspace, references: SourceReference[] = []) {
   if (!Array.isArray(references)) throw new Error('参考资料必须是列表');
@@ -39,11 +42,27 @@ export function buildWriterContext(workspace: Workspace, sceneId: string, refere
   const chapter = workspace.chapters.find(chapter => chapter.id === scene.chapterId)!;
   const materials = resolveReferences(workspace, references);
   const act = chapter.actId ? (workspace.acts ?? []).find(item => item.id === chapter.actId) : undefined;
+  const view = story ?? new StoryView(workspace);
+  const recentText: Array<{ sceneId: string; title: string; text: string }> = [];
+  let remaining = RECENT_TEXT_CHARS;
+  for (const previous of view.order.slice(0, Math.max(0, view.positionOf(scene.id))).reverse()) {
+    if (remaining <= 0) break;
+    if (!previous.text.trim()) continue;
+    const text = previous.text.slice(-remaining);
+    recentText.unshift({ sceneId: previous.id, title: previous.title, text });
+    remaining -= text.length;
+  }
+  // Only the places this scene happens in: bound by the author, or named in its outline, chapter plan or the prose just before.
+  const settings = workspace.objects.filter(isSettingLike);
+  const nearby = [scene.title, scene.outline, chapter.summary ?? '', recentText.map(item => item.text).join('\n').slice(-1500)].join('\n');
+  const named = settings.filter(object => Array.from(object.name.trim()).length >= 2 && nearby.includes(object.name.trim())).map(object => object.id);
+  const sceneSettings = (scene.settingIds?.length || named.length) ? [...(scene.settingIds ?? []), ...named]
+    : settings.length <= ALL_SETTINGS_UP_TO ? settings.map(object => object.id) : [];
   const objectIds = new Set<string>([
-    ...scene.eventIds, ...(scene.povId ? [scene.povId] : []), ...materials.objects.map(object => object.id),
+    ...scene.eventIds, ...(scene.povId ? [scene.povId] : []), ...(scene.castIds ?? []), ...materials.objects.map(object => object.id),
     ...(workspace.characterStates ?? []).filter(state => scene.eventIds.includes(state.eventId)).map(state => state.characterId),
-    ...materials.scenes.flatMap(scene => [...scene.eventIds, ...(scene.povId ? [scene.povId] : [])]),
-    ...workspace.objects.filter(object => object.typeId === 'setting').map(object => object.id),
+    ...materials.scenes.flatMap(scene => [...scene.eventIds, ...(scene.povId ? [scene.povId] : []), ...(scene.castIds ?? []), ...(scene.settingIds ?? [])]),
+    ...sceneSettings,
   ]);
   for (const id of objectIds) {
     const object = workspace.objects.find(object => object.id === id)!;
@@ -66,23 +85,13 @@ export function buildWriterContext(workspace: Workspace, sceneId: string, refere
     const activeFacts = relatedFacts.filter(fact => fact.fromEventId === null || workspace.objects.find(object => object.id === fact.fromEventId)!.event!.worldOrder <= event.event!.worldOrder);
     const replaced = new Set(activeFacts.flatMap(fact => fact.replacesId ? [fact.replacesId] : []));
     const characterTransitions = (workspace.characterStates ?? []).filter(state => state.eventId === event.id);
-    const characterIds = new Set([...event.event!.participants, ...characterTransitions.map(state => state.characterId), ...(scene.povId ? [scene.povId] : [])]);
+    const characterIds = new Set([...event.event!.participants, ...characterTransitions.map(state => state.characterId), ...(scene.povId ? [scene.povId] : []), ...(scene.castIds ?? [])]);
     return {
       eventId: event.id, facts: activeFacts.filter(fact => !replaced.has(fact.id)),
       characters: [...characterIds].filter(id => workspace.objects.find(object => object.id === id)?.typeId === 'character').map(id => buildCharacterContext(workspace, id, event.id)),
       characterTransitions,
     };
   });
-  const view = story ?? new StoryView(workspace);
-  const recentText: Array<{ sceneId: string; title: string; text: string }> = [];
-  let remaining = RECENT_TEXT_CHARS;
-  for (const previous of view.order.slice(0, Math.max(0, view.positionOf(scene.id))).reverse()) {
-    if (remaining <= 0) break;
-    if (!previous.text.trim()) continue;
-    const text = previous.text.slice(-remaining);
-    recentText.unshift({ sceneId: previous.id, title: previous.title, text });
-    remaining -= text.length;
-  }
   const shown = new Set(recentText.map(item => item.sceneId));
   const people = [...new Set([...(scene.povId ? [scene.povId] : []), ...sceneEvents.flatMap(event => event.event!.participants),
     ...relatedObjects.filter(object => !object.event).map(object => object.id)])];
@@ -103,6 +112,7 @@ export function buildWriterContext(workspace: Workspace, sceneId: string, refere
     novel: { title: workspace.title, brief: workspace.brief, genre: workspace.genre, audience: workspace.audience, theme: workspace.theme ?? '', logline: workspace.logline ?? '' },
     outlinePlan: { chapter: { title: chapter.title, summary: chapter.summary ?? '' }, act: act ? { title: act.title, purpose: act.purpose, summary: act.summary } : null,
       notice: '作者大纲中本章/本幕要完成的任务；是计划而非已发生事实，通过本场行动逐步落实。' },
+    sceneElements: (({ missing: _missing, ...names }) => ({ ...names, notice: '本场的人物、环境与世界事件；环境的样貌与规则见 relatedObjects。' }))(sceneElements(workspace, scene)),
     style: writerStyle(workspace, scene),
     storySoFar: storySoFar(view, scene.id, { exclude: shown }), openThreads: threads.map(thread => thread.title), entityRecall: recall,
     scene, materials, relatedObjects, initialFacts, initialCharacters, eventContexts, recentText, sources,

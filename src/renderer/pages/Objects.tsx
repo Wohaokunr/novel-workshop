@@ -6,24 +6,56 @@ import type { Workspace, Command, ProjectSummary, NovelObject, ObjectType, Narra
 import { canvasAction, type View, type AskAction, type RegisterFlush, type AssistAction, type OpenCanvas, type AskDelete } from '../types';
 import { ObjectForm } from '../forms';
 import { useCompanion } from '../Companion';
+import { elementOf, isSettingLike, objectHealth, type StoryElement } from '../../shared/story-elements';
+import { storyFlow } from '../../shared/story-flow';
+
+/** The three elements of a novel, each with its own column, gaps and AI entry. */
+const elementColumns: Array<{ id: StoryElement; title: string; tagline: string; empty: string }> = [
+  { id: 'people', title: '人物', tagline: '谁在推动故事，想要什么', empty: '还没有人物。先建主角，或让 AI 设计一组人物。' },
+  { id: 'plot', title: '情节', tagline: '世界里真实发生的事件与因果', empty: '还没有世界事件。写下第一件改变局面的事。' },
+  { id: 'place', title: '环境与设定', tagline: '人物在哪里行动，世界有什么规则', empty: '还没有环境。故事发生在哪里？那里有什么规矩？' },
+];
 
 export function Objects({workspace:w,commit,selected,select,patchObject,addObject,askDelete,askAction,onAssist,onOpenCanvas,onOpenReference,inspectorHost,beforeChange}:{beforeChange:()=>Promise<void>;onAssist:AssistAction;onOpenCanvas:OpenCanvas;onOpenReference:(kind:SourceReference['kind'],id:string)=>void;askAction:AskAction;workspace:Workspace;commit:Commit;selected:string;select:(id:string)=>void;patchObject:(id:string,p:Partial<NovelObject>)=>Promise<unknown>;addObject:(typeId?:string)=>Promise<unknown>;askDelete:AskDelete;inspectorHost:HTMLElement|null}) {
-  const [filter,setFilter]=useState('');const [manage,setManage]=useState(false);const [search,setSearch]=useState('');
+  const [manage,setManage]=useState(false);const [search,setSearch]=useState('');
+  const placeTypes=w.objectTypes.filter(t=>t.id!=='character'&&t.id!=='event');const [placeType,setPlaceType]=useState('setting');
   const object=w.objects.find(o=>o.id===selected);const type=w.objectTypes.find(t=>t.id===object?.typeId);
   const companion=useCompanion();
+  const below=(event:React.MouseEvent<HTMLElement>)=>{const rect=event.currentTarget.getBoundingClientRect();return {x:rect.left,y:rect.bottom};};
   /** Character design is ideation: the partner proposes, one click adopts, undo is in the dialog. */
-  const designCast=(event:React.MouseEvent<HTMLElement>,target?:NovelObject)=>{const rect=event.currentTarget.getBoundingClientRect();companion.summon({mode:'develop',label:target?target.name:'人物阵容',screen:{x:rect.left,y:rect.bottom},
+  const designCast=(event:React.MouseEvent<HTMLElement>,target?:NovelObject)=>companion.summon({mode:'develop',label:target?target.name:'人物阵容',screen:below(event),
     anchor:{surface:'panel',references:target?[{kind:'object',id:target.id}]:[],focus:'cast'},
-    message:target?`丰富「${target.name}」：补全身份、欲望、秘密与目标，并补充和他关系最紧密的人物。`:characters(w).length?'在现有人物之外补充几个能制造冲突的人物，并理清他们之间的关系。':'根据作品信息和立意，设计一组主要人物和他们之间的关系。'});};
-  const query=search.trim().toLowerCase();const visible=w.objects.filter(o=>(!filter||o.typeId===filter)&&o.name.toLowerCase().includes(query));
+    message:target?`丰富「${target.name}」：补全身份、欲望、秘密与目标，并补充和他关系最紧密的人物。`:characters(w).length?'在现有人物之外补充几个能制造冲突的人物，并理清他们之间的关系。':'根据作品信息和立意，设计一组主要人物和他们之间的关系。'});
+  const designWorld=(event:React.MouseEvent<HTMLElement>,target?:NovelObject)=>{const assist=storyFlow(w).find(stage=>stage.id==='setting')!.assist!;companion.summon({mode:'develop',label:target?target.name:'故事环境',screen:below(event),
+    anchor:{surface:'panel',references:target?[{kind:'object',id:target.id}]:[],focus:'setting'},
+    message:target?`丰富「${target.name}」：补全它的样貌、氛围、谁在这里活动，以及这里的世界规则与代价。`:assist.message});};
+  const designPlot=(event:React.MouseEvent<HTMLElement>)=>companion.summon({mode:'causality',label:'世界事件',screen:below(event),anchor:{surface:'panel',references:[]},
+    message:events(w).length?'看看现有的世界事件，还缺哪些关键的前因或后果？':'根据人物和灵感，推演故事里真实发生的几件关键事件及其因果。'});
+  const query=search.trim().toLowerCase();const visible=w.objects.filter(o=>o.name.toLowerCase().includes(query));
+  const subtitle=(o:NovelObject)=>o.event?`#${o.event.worldOrder} · ${o.event.thread||'主线'}`:o.typeId==='character'?(typeof o.fields.goal==='string'&&o.fields.goal.trim()?o.fields.goal:'人物'):w.objectTypes.find(t=>t.id===o.typeId)?.name||'设定';
   return <div className="objects-page">
-    <div className="toolbar"><div className="segmented"><button className={!filter?'active':''} onClick={()=>setFilter('')}>全部</button>{w.objectTypes.map(t=><button key={t.id} className={filter===t.id?'active':''} onClick={()=>setFilter(t.id)}>{t.name}</button>)}</div><button onClick={()=>fire(beforeChange().then(()=>setManage(!manage)))}><Settings2 size={16}/>管理类型与字段</button></div>
+    <div className="toolbar"><div className="search-wrap"><input className="search" aria-label="搜索人物与设定" value={search} onChange={e=>setSearch(e.target.value)} placeholder="搜索人物、事件、地点…"/></div><button onClick={()=>fire(beforeChange().then(()=>setManage(!manage)))}><Settings2 size={16}/>管理类型与字段</button></div>
     {manage&&<TypeManager workspace={w} commit={commit} askDelete={askDelete} askAction={askAction} beforeChange={beforeChange}/>}
-    <div className="object-list panel"><div className="section-heading"><h2>人物与设定 <small>{visible.length} 项</small></h2><div className="button-row"><button className="secondary" data-testid="objects-design-cast" onClick={event=>designCast(event)}><Sparkles size={16}/>AI 设计人物</button><button className="primary" onClick={()=>fire(addObject(filter||w.objectTypes[0]?.id))}><Plus size={16}/>新建{w.objectTypes.find(t=>t.id===filter)?.name||'对象'}</button></div></div><input className="search" aria-label="搜索人物与设定" value={search} onChange={e=>setSearch(e.target.value)} placeholder="搜索人物、地点、事件…"/>
-      <div className="object-grid">{visible.map((o,index)=><button className={`object-row ${selected===o.id?'selected':''}`} key={o.id} onClick={()=>select(o.id)}><span className="object-avatar" style={{background:colors[index%colors.length]+'20',color:colors[index%colors.length]}}>{o.name.slice(0,1)}</span><span><strong>{o.name}</strong><small>{w.objectTypes.find(t=>t.id===o.typeId)?.name||'对象'}</small></span><ChevronRight size={16}/></button>)}</div>
-      {!visible.length&&<Empty title={search?'没有匹配内容':'还没有人物与设定'} description={search?'尝试其他名称，或切换类型筛选。':'新建人物、地点或事件，为你的故事建立素材。'}/>}
-    </div>
-    {inspectorHost&&createPortal(<div className="object-inspector">{object?<><div className="section-heading"><div><span className="eyebrow">{type?.name}</span><h2>{object.name}</h2></div><button className="icon-button text-danger" title="删除对象" onClick={()=>fire(askDelete({type:'deleteObject',id:object.id},`删除「${object.name}」`))}><Trash2 size={16}/></button></div><div className="reference-actions">{object.typeId==='character'&&<button data-testid="object-enrich-character" onClick={event=>designCast(event,object)}><Sparkles size={16}/>丰富这个人物</button>}<button onClick={()=>onAssist(object.typeId==='character'?'character':object.event?'world':'continuity',[{kind:'object',id:object.id}])}><Sparkles size={16}/>{object.typeId==='character'?'演进人物':object.event?'完善因果':'完善设定'}</button><button onClick={()=>onOpenCanvas('object',object.id)}>{canvasAction(w,'object',object.id)}</button></div><ObjectForm key={object.id} workspace={w} object={object} commit={commit} patch={patch=>patchObject(object.id,patch)} onOpenReference={onOpenReference} askDelete={askDelete}/></>:<Empty title="选择一个人物或设定" description="在这里编辑基础资料、世界事实与人物认知。"/>}</div>,inspectorHost)}
+    <div className="elements-board" data-testid="elements-board">{elementColumns.map(column=>{
+      const items=visible.filter(o=>elementOf(o)===column.id).sort((a,b)=>column.id==='plot'?a.event!.worldOrder-b.event!.worldOrder:0);
+      const all=w.objects.filter(o=>elementOf(o)===column.id);
+      // Most common gaps first: a column-level nudge instead of a wall of warnings.
+      const counts=new Map<string,number>();for(const o of all)for(const hint of objectHealth(w,o))counts.set(hint,(counts.get(hint)??0)+1);
+      const gaps=[...counts].sort((a,b)=>b[1]-a[1]).slice(0,2);
+      return <section key={column.id} className="element-column panel" data-element={column.id} aria-label={column.title}>
+        <div className="section-heading"><div><h2>{column.title} <small>{all.length}</small></h2><p className="muted">{column.tagline}</p></div></div>
+        <div className="element-actions">
+          {column.id==='people'?<button className="small secondary" data-testid="objects-design-cast" onClick={event=>designCast(event)}><Sparkles size={16}/>AI 设计人物</button>
+            :column.id==='plot'?<button className="small secondary" data-testid="objects-design-plot" onClick={designPlot}><Sparkles size={16}/>AI 推演事件</button>
+            :<button className="small secondary" data-testid="objects-design-setting" onClick={event=>designWorld(event)}><Sparkles size={16}/>AI 设计环境</button>}
+          {column.id==='place'&&placeTypes.length>1&&<select className="small" aria-label="新建的设定类型" value={placeTypes.some(t=>t.id===placeType)?placeType:placeTypes[0]!.id} onChange={e=>setPlaceType(e.target.value)}>{placeTypes.map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select>}
+          <button className="small" data-testid={`objects-add-${column.id}`} onClick={()=>fire(addObject(column.id==='people'?'character':column.id==='plot'?'event':placeTypes.some(t=>t.id===placeType)?placeType:placeTypes[0]?.id))}><Plus size={16}/>新建</button>
+        </div>
+        {gaps.length>0&&<p className="element-gaps"><CircleAlert size={14} aria-hidden="true"/>{gaps.map(([hint,count])=>`${count} 个${hint}`).join(' · ')}</p>}
+        <div className="element-list">{items.map((o,index)=>{const hints=objectHealth(w,o);return <button className={`object-row ${selected===o.id?'selected':''}`} key={o.id} onClick={()=>select(o.id)}><span className="object-avatar" style={{background:colors[index%colors.length]+'20',color:colors[index%colors.length]}}>{o.name.slice(0,1)}</span><span><strong>{o.name}</strong><small>{subtitle(o)}</small></span>{hints.length>0&&<span className="health-dot" title={hints.join('、')} aria-label={`待补：${hints.join('、')}`}/>}<ChevronRight size={16}/></button>;})}</div>
+        {!items.length&&<p className="muted element-empty">{search?'没有匹配内容。':column.empty}</p>}
+      </section>;})}</div>
+    {inspectorHost&&createPortal(<div className="object-inspector">{object?<><div className="section-heading"><div><span className="eyebrow">{type?.name}</span><h2>{object.name}</h2></div><button className="icon-button text-danger" title="删除对象" onClick={()=>fire(askDelete({type:'deleteObject',id:object.id},`删除「${object.name}」`))}><Trash2 size={16}/></button></div><div className="reference-actions">{object.typeId==='character'&&<button data-testid="object-enrich-character" onClick={event=>designCast(event,object)}><Sparkles size={16}/>丰富这个人物</button>}{isSettingLike(object)&&<button data-testid="object-enrich-setting" onClick={event=>designWorld(event,object)}><Sparkles size={16}/>丰富这个环境</button>}<button onClick={()=>onAssist(object.typeId==='character'?'character':object.event?'world':'continuity',[{kind:'object',id:object.id}])}><Sparkles size={16}/>{object.typeId==='character'?'演进人物':object.event?'完善因果':'完善设定'}</button><button onClick={()=>onOpenCanvas('object',object.id)}>{canvasAction(w,'object',object.id)}</button></div><ObjectForm key={object.id} workspace={w} object={object} commit={commit} patch={patch=>patchObject(object.id,patch)} onOpenReference={onOpenReference} askDelete={askDelete}/></>:<Empty title="选择一个人物或设定" description="在这里编辑基础资料、世界事实与人物认知。"/>}</div>,inspectorHost)}
   </div>;
 }
 

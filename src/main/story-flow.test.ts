@@ -17,7 +17,24 @@ test('创作流程：空作品从简述开始且信息稀少，逐步推进下�
     { type: 'putObject', value: { id: 'lin', typeId: 'character', name: '林舟', fields: {} } },
     { type: 'putCard', value: { id: 'n1', kind: 'note', title: '第十三声', content: '', x: 0, y: 0 } },
   ]);
-  assert.equal(storyGaps(cast).unlinkedNotes, 1);
-  assert.equal(nextStage(cast)?.id, 'ideas', '便笺都没有连线时灵感步骤未完成');
-  assert.equal(storyFlow(cast).length, 8);
+  assert.equal(nextStage(cast)?.id, 'setting', '有人物还没有环境时先搭建环境');
+  assert.equal(nextStage(cast)?.assist?.focus, 'setting');
+  const placed = applyCommands(cast, [{ type: 'putObject', value: { id: 'tower', typeId: 'setting', name: '钟楼', fields: {} } }]);
+  assert.equal(storyGaps(placed).unlinkedNotes, 1);
+  assert.equal(nextStage(placed)?.id, 'ideas', '便笺都没有连线时灵感步骤未完成');
+  assert.equal(storyFlow(placed).length, 9);
+});
+
+test('三要素缺口：场景缺人物、情节或环境都会被统计，并出现在叙述顺序一步的提示里', () => {
+  const base = createWorkspace('三要素');
+  const chapterId = base.chapters[0]!.id;
+  const workspace = applyCommands(base, [
+    { type: 'putObject', value: { id: 'lin', typeId: 'character', name: '林舟', fields: {} } },
+    { type: 'putObject', value: { id: 'tower', typeId: 'setting', name: '钟楼', fields: {} } },
+    { type: 'putScene', value: { id: 'full', chapterId, order: 1, title: '齐全', povId: 'lin', eventIds: [], outline: '捡到铜片', text: '', settingIds: ['tower'] } },
+    { type: 'putScene', value: { id: 'empty', chapterId, order: 2, title: '空白', povId: null, eventIds: [], outline: '', text: '' } },
+    { type: 'putScene', value: { id: 'cast', chapterId, order: 3, title: '只有出场人物', povId: null, castIds: ['lin'], eventIds: [], outline: '对峙', text: '' } },
+  ]);
+  assert.deepEqual(storyGaps(workspace).sceneElementGaps, { noPeople: 1, noPlace: 2, noPlot: 1 });
+  assert.match(storyFlow(workspace).find(stage => stage.id === 'order')!.hint, /2 个场景/);
 });
