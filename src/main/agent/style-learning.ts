@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { ResponseOutputItem, ResponseStreamEvent } from 'openai/resources/responses/responses';
 import type { AgentEvent, ProviderSecret } from '../../shared/types.js';
-import type { AgentState } from '../../shared/agent-types.js';
+import type { StoredAgentState } from '../../shared/agent-types.js';
 import { STYLE_LIMITS, styleProfile, type StyleLearningStatus, type StyleRejection, type StyleSuggestion } from '../../shared/style-types.js';
 import { deletedWords, editPairs } from '../../shared/style-provenance.js';
 import { NovelStore } from '../store.js';
@@ -33,7 +33,7 @@ const key = (...parts: string[]) => createHash('sha256').update(parts.join('\u00
 function stamp() { return new Date().toISOString(); }
 
 /** Reasons the author wrote when declining prose candidates. */
-export function rejectionReasons(states: AgentState[], receipt: (key: string) => { result?: unknown; at: string } | undefined): StyleRejection[] {
+export function rejectionReasons(states: StoredAgentState[], receipt: (key: string) => { result?: unknown; at: string } | undefined): StyleRejection[] {
   const result: StyleRejection[] = [];
   for (const state of states) for (const candidate of state.candidates) {
     if (candidate.status !== 'rejected' || !candidate.commitCallKey || !touchesProse(candidate)) continue;

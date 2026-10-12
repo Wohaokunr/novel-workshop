@@ -1,6 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 
-export const STORE_SCHEMA_VERSION = 5;
+export const STORE_SCHEMA_VERSION = 6;
 
 /** Version zero includes databases created before versioned migrations existed. */
 const migrations = [
@@ -79,6 +79,16 @@ const migrations = [
       at TEXT NOT NULL,
       PRIMARY KEY (project_id, key)
     );
+  `,
+  `
+    CREATE TABLE IF NOT EXISTS agent_snapshots (
+      run_id TEXT PRIMARY KEY REFERENCES runs(id),
+      project_id TEXT NOT NULL REFERENCES projects(id),
+      updated_at TEXT NOT NULL,
+      data TEXT NOT NULL,
+      FOREIGN KEY (run_id, project_id) REFERENCES runs(id, project_id)
+    );
+    CREATE INDEX IF NOT EXISTS agent_snapshots_project ON agent_snapshots(project_id);
   `,
 ];
 

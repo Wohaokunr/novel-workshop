@@ -7,7 +7,8 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { randomUUID } from 'node:crypto';
 import type { ResponseOutputItem } from 'openai/resources/responses/responses';
 import type { AgentEvent, AgentRun, Command, ProviderSecret, RunRequest, Workspace } from '../shared/types.js';
-import { NovelStore } from './store.js';
+import { KEEP_FINISHED_SNAPSHOTS, NovelStore } from './store.js';
+import { DatabaseSync } from 'node:sqlite';
 import { NovelAgentScheduler } from './agents.js';
 import { DemoAgentTransport } from './agent/demo.js';
 import { checkCancelled, type ModelRequest, type ModelResponse, type ResponseTransport } from './responses.js';
@@ -679,4 +680,79 @@ test('作者保存的约束进入编排专长的上下文，而不只给协调�
     const { context } = JSON.parse(String((planner[0]!.input[0] as { content: string }).content));
     assert.deepEqual(context.authorRules, [{ kind: 'constraint', content: '全书不出现穿越元素' }]);
   } finally { store.close(); }
+});
+
+test('任务日志每轮只增量写入新内容，可还原完整请求；完成的专长检查点只保留完成标记', { timeout: 20000 }, async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'novel-turns-')), filename = join(directory, 'novel.sqlite');
+  const store = new NovelStore(filename);
+  try {
+    const project = scenes(store), h = harness(store);
+    const run = h.start({ projectId: project.id, stage: 'chapter', chapterId: project.chapters[0]!.id, objective: '写完本章空白场景' });
+    assert.equal((await wait(store, run)).status, 'awaitingApproval');
+    const state = store.getAgentState(run.id)!, coordinator = state.checkpoints.coordinator as AgentCheckpoint;
+    const db = new DatabaseSync(filename, { readOnly: true });
+    const turns = db.prepare('SELECT turn, request FROM agent_turns WHERE run_id=? AND step_id=? ORDER BY turn').all(run.id, coordinator.step.id) as Array<{ turn: number; request: string }>;
+    db.close();
+    assert.ok(turns.length > 3);
+    let input: unknown[] = [];
+    for (const { turn, request } of turns) {
+      const value = JSON.parse(request) as { instructions?: string; from?: number; input: unknown[] };
+      if (turn === 0) { assert.ok(value.instructions); assert.equal(value.from, undefined); input = value.input; continue; }
+      assert.equal(value.instructions, undefined); assert.equal(value.from, input.length, `第 ${turn} 轮从上一轮请求末尾接续`);
+      input = [...input, ...value.input];
+    }
+    assert.deepEqual(input, JSON.parse(JSON.stringify(coordinator.input.slice(0, input.length))));
+    const specialists = Object.entries(state.checkpoints).filter(([slot]) => slot !== 'coordinator') as Array<[string, AgentCheckpoint]>;
+    assert.ok(specialists.length >= 2);
+    for (const [slot, checkpoint] of specialists) {
+      assert.equal(checkpoint.phase, 'completed', slot); assert.deepEqual(checkpoint.input, [], slot);
+      assert.ok(state.artifacts.some(artifact => artifact.stepId === checkpoint.step.id), `${slot} 的结果保存在产物中`);
+    }
+  } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('已结束任务的快照按保留数清理；对已结束任务暂停、恢复、回答给出原有提示，取消无副作用', { timeout: 30000 }, async () => {
+  const store = new NovelStore(':memory:');
+  try {
+    const project = scenes(store, ['人工正文']), h = harness(store), runs: AgentRun[] = [];
+    for (let index = 0; index <= KEEP_FINISHED_SNAPSHOTS; index++) {
+      const run = h.start({ projectId: project.id, stage: 'agent', objective: '仅分析现有作品的问题，不要改动作品' });
+      assert.equal((await wait(store, run)).status, 'completed'); runs.push(run);
+    }
+    assert.throws(() => store.getAgentState(runs[0]!.id), /已清理/);
+    assert.ok(store.getAgentState(runs.at(-1)!.id));
+    const oldest = runs[0]!.id;
+    await assert.rejects(h.scheduler.pause(oldest), /已经结束/);
+    await assert.rejects(h.scheduler.resume(oldest), /不在可恢复状态/);
+    await assert.rejects(h.scheduler.answer(oldest, '回答'), /没有等待回答/);
+    await h.scheduler.cancel(oldest);
+    assert.equal(store.getRun(oldest)!.status, 'completed');
+  } finally { store.close(); }
+});
+
+test('重开数据库后重发中断的后续轮请求，任务日志写入相同的增量而不冲突', { timeout: 15000 }, async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'novel-replay-')), filename = join(directory, 'novel.sqlite');
+  let store = new NovelStore(filename), block = true;
+  try {
+    const project = store.createProject('重放'), request: RunRequest = { projectId: project.id, stage: 'agent', objective: '只分析作品' };
+    const intercept = (input: ModelRequest, signal: AbortSignal, demo: DemoAgentTransport) => {
+      const later = input.agentId === 'coordinator' && input.input.some(item => item.type === 'function_call_output');
+      if (!later || !block) return demo.stream(input, signal);
+      return { events: (async function* () { await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true })); checkCancelled(signal); })(), finalResponse: async () => reply('不应使用') };
+    };
+    const h = harness(store, intercept), run = h.start(request);
+    await until(store, run.id, value => !!value.runtime?.uncertain); await h.scheduler.pause(run.id); await h.scheduler.shutdown();
+    store.close(); store = new NovelStore(filename); block = false;
+    const demo = new DemoAgentTransport(request, project);
+    const second = new NovelAgentScheduler(store, () => provider, () => {}, () => ({ stream: (input, signal) => intercept(input, signal, demo) }));
+    second.recover(); await second.resume(run.id, true);
+    const completed = await until(store, run.id, value => !!value.finishedAt);
+    assert.equal(completed.status, 'completed', completed.error ?? completed.runtime?.pauseReason ?? '');
+    const db = new DatabaseSync(filename, { readOnly: true });
+    const stepId = (store.getStoredAgentState(run.id)!.checkpoints.coordinator as AgentCheckpoint).step.id;
+    const requests = (db.prepare('SELECT request FROM agent_turns WHERE run_id=? AND step_id=? ORDER BY turn').all(run.id, stepId) as Array<{ request: string }>)
+      .map(row => JSON.parse(row.request) as { from?: number });
+    db.close();
+    assert.ok(requests.length > 2); assert.ok(requests.slice(1).every(value => typeof value.from === 'number' && value.from > 0));
+  } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
 });

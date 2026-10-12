@@ -54,7 +54,7 @@ try {
     provider => provider.mode === 'mock' ? new DemoCompanionTransport() : new OpenAIResponseTransport(provider));
   scheduler.recover();
   for (const project of store.listProjects()) for (const run of store.getRuns(project.id)) {
-    if (store.getAgentState(run.id)) continue;
+    if (store.getStoredAgentState(run.id)) continue;
     if (run.status === 'running' || run.status === 'queued' || (run.status === 'cancelled' && !run.finishedAt)) {
       store.saveRun({ ...run, status: run.status === 'cancelled' ? 'cancelled' : 'failed', finishedAt: new Date().toISOString(),
         ...(run.status !== 'cancelled' ? { error: '应用关闭时任务中断，可以重新运行。' } : {}) });

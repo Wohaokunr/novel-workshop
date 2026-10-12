@@ -31,6 +31,8 @@ export interface AgentCheckpoint {
   pendingCalls: ResponseOutputItem[];
   cursor: number;
   uncertain?: boolean;
+  /** Input items already written to the turn log; the next turn's record starts at `end` (see the runtime's turnRecord). */
+  logged?: { turn: number; from: number; end: number };
 }
 export interface AgentTool {
   name: string;

@@ -15,7 +15,7 @@ export class NovelAgentScheduler {
   }
   start(request: RunRequest): AgentRun { return this.runtime.start(request); }
   async cancel(id: string) {
-    if (this.store.getAgentState(id)) return this.runtime.cancel(id);
+    if (this.store.getStoredAgentState(id)) return this.runtime.cancel(id);
     const run = this.store.getRun(id);
     if (run && !run.finishedAt) { run.status = 'cancelled'; run.finishedAt = new Date().toISOString(); this.store.saveRun(run); this.onEvent({ type: 'run', projectId: run.projectId, runId: id, run }); }
   }
@@ -29,7 +29,7 @@ export class NovelAgentScheduler {
   saveMemory(projectId: string, content: string, kind: AgentMemory['kind']) { return this.runtime.saveMemory(projectId, content, kind); }
   confirmMemory(projectId: string, id: string) { return this.runtime.confirmMemory(projectId, id); }
   retry(id: string, revision: number): AgentRun {
-    if (this.store.getAgentState(id)) return this.runtime.retry(id, revision);
+    if (this.store.getStoredAgentState(id)) return this.runtime.retry(id, revision);
     const previous = this.store.getRun(id);
     if (!previous || !['failed', 'cancelled'].includes(previous.status) || !previous.finishedAt) throw new Error('只有已结束的失败/停止任务可以重试');
     if (this.store.getRuns(previous.projectId).some(run => !['failed', 'cancelled', 'completed'].includes(run.status) || !run.finishedAt)) throw new Error('作品还有未结束任务');

@@ -6,7 +6,7 @@ import { buildWriterContext, resolveReferences, WRITER_CONTEXT_CHARS, WRITER_PRI
 import { DomainValidationError, hasSemanticChanges } from '../domain.js';
 import type { ResponseInputItem } from 'openai/resources/responses/responses';
 import { addUsage, AgentSuspended, emptyUsage, runAgent, settleCheckpointTool, ToolValidationError, type AgentCheckpoint, type AgentDefinition, type ResponseTransport, type ToolCallContext } from '../responses.js';
-import { boundedContext, collectContext, compactChanges, fingerprint, refreshMemories, searchContext, selectAuthorRules, sourcesForWorkspace } from './memory.js';
+import { bookSources, boundedContext, changeSources, collectContext, compactChanges, fingerprint, refreshMemories, searchContext, selectAuthorRules } from './memory.js';
 import { assertWriteScope, canProposeCommands, canReadAuthor, chainWriterNodes, createBudget, touchesProse, validatePlan } from './policy.js';
 import { specialistDefinition, type SpecialistDefinition } from './specialists.js';
 import { createCoordinatorTools, type ToolName } from './tools.js';
@@ -57,6 +57,20 @@ function safe<T>(value: T, key?: string): T {
   if (Array.isArray(value)) return value.map(item => safe(item, key)) as T;
   if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([name, item]) => [name, safe(item, key)])) as T;
   return value;
+}
+/** The API key is redacted from model-derived state. The base snapshot is the author's own book and keeps its identity,
+ * so the store writes it once per run instead of on every save; candidate workspaces are not stored at all. */
+function persistable(state: AgentState, key?: string): AgentState {
+  if (!key) return state;
+  const { baseWorkspace, candidates, ...rest } = state;
+  return { ...safe(rest, key), baseWorkspace, candidates: candidates.map(({ workspace, ...candidate }) => ({ ...safe(candidate, key), workspace })) };
+}
+/** The turn log keeps each request once: the first turn in full, later turns only the input items added since the previous request.
+ * Marks the checkpoint so a replayed request (resume after an uncertain one) records the identical slice. */
+function turnRecord(cp: AgentCheckpoint, instructions: string): unknown {
+  const from = cp.logged?.turn === cp.turn ? cp.logged.from : cp.logged?.end ?? 0;
+  cp.logged = { turn: cp.turn, from, end: cp.input.length };
+  return from ? { from, input: cp.input.slice(from) } : { instructions, input: cp.input };
 }
 export function runtimeSummary(state: AgentState): AgentRuntimeSummary {
   return structuredClone({ sessionId: state.sessionId, plan: state.plan, artifacts: state.artifacts,
@@ -120,37 +134,44 @@ export class PersistentAgentRuntime {
     entry.run.runtime = runtimeSummary(entry.state);
     entry.run.eventVersion = (entry.run.eventVersion ?? 0) + 1;
     const snapshot = safe(structuredClone(entry.run), entry.provider?.apiKey);
-    this.store.saveAgentState(safe(entry.state, entry.provider?.apiKey), snapshot, receipt);
+    this.store.saveAgentState(persistable(entry.state, entry.provider?.apiKey), snapshot, receipt);
     this.emit({ type: 'run', projectId: snapshot.projectId, runId: snapshot.id, version: snapshot.eventVersion, run: snapshot });
   }
   private emit(event: AgentEvent) { try { this.onEvent(event); } catch { /* Persisted snapshots remain authoritative when a window disappears. */ } }
   private changed(run: AgentRun) { this.emit({ type: 'projectChanged', projectId: run.projectId, runId: run.id, version: run.eventVersion }); }
-  private loadEntry(id: string): Entry {
-    const run = this.store.getRun(id), state = this.store.getAgentState(id);
-    if (!run || !state) throw new Error('这条旧任务没有可恢复的智能体检查点');
-    return { run, state, controller: new AbortController() };
+  /** The run of a task with an agent checkpoint. Check its status before loadEntry: a finished run's base snapshot may be pruned. */
+  private storedRun(id: string): AgentRun {
+    const run = this.store.getRun(id);
+    if (!run || !this.store.getStoredAgentState(id)) throw new Error('这条旧任务没有可恢复的智能体检查点');
+    return run;
   }
+  private loadEntry(id: string): Entry {
+    return { run: this.storedRun(id), state: this.store.getAgentState(id)!, controller: new AbortController() };
+  }
+  /** Finished runs no longer need their base snapshots; a failure here must not affect the run. */
+  private prune(projectId: string) { try { this.store.pruneAgentSnapshots(projectId); } catch { /* Retried after the next finished run or at startup. */ } }
 
   async pause(id: string): Promise<void> {
     const live = this.active.get(id);
     if (live) { live.stop = 'paused'; live.state.pauseReason = '作者暂停'; live.run.status = 'pausing'; this.publish(live); live.controller.abort(); await live.done; return; }
+    if (terminal.has(this.storedRun(id).status)) throw new Error('任务已经结束');
     const entry = this.loadEntry(id);
-    if (terminal.has(entry.run.status)) throw new Error('任务已经结束');
     entry.run.status = 'paused'; entry.state.pauseReason = '作者暂停'; this.publish(entry);
   }
   async cancel(id: string): Promise<void> {
     const live = this.active.get(id);
     if (live) { live.stop = 'cancelled'; live.run.status = 'cancelled'; live.controller.abort(); this.publish(live); await live.done; return; }
+    if (terminal.has(this.storedRun(id).status)) return;
     const entry = this.loadEntry(id);
-    if (terminal.has(entry.run.status)) return;
     entry.run.status = 'cancelled'; entry.run.finishedAt = stamp(); entry.state.waiting = undefined;
     for (const candidate of entry.state.candidates) if (candidate.status === 'awaitingApproval') candidate.status = 'rejected';
     this.publish(entry);
+    this.prune(entry.run.projectId);
   }
   async resume(id: string, confirmUncertain = false): Promise<void> {
     if (this.active.has(id)) throw new Error('任务仍在执行或收尾');
+    if (!['paused', 'awaitingInput', 'awaitingApproval'].includes(this.storedRun(id).status)) throw new Error('这条任务不在可恢复状态');
     const entry = this.loadEntry(id);
-    if (!['paused', 'awaitingInput', 'awaitingApproval'].includes(entry.run.status)) throw new Error('这条任务不在可恢复状态');
     this.validate(this.store.getProject(entry.run.projectId), entry.run, entry.state.candidates.some(candidate => candidate.status === 'applied'));
     if (entry.state.toolVersion !== TOOL_VERSION) throw new Error('任务工具版本已变化，请结束此任务并用当前版本重新规划');
     const provider = await this.getProvider();
@@ -176,7 +197,7 @@ export class PersistentAgentRuntime {
   async decide(decision: AgentDecision): Promise<void> {
     const live = this.active.get(decision.runId);
     if (live) await live.done;
-    const prior = this.store.getAgentState(decision.runId)?.candidates.find(candidate => candidate.id === decision.candidateId);
+    const prior = this.store.getStoredAgentState(decision.runId)?.candidates.find(candidate => candidate.id === decision.candidateId);
     if (prior && ['applied', 'rejected'].includes(prior.status)) {
       const receipt = prior.commitCallKey ? this.store.getAgentReceipt(prior.commitCallKey) : undefined;
       if (prior.hash !== decision.candidateHash || receipt?.status !== (prior.status === 'applied' ? 'completed' : 'denied')) throw new Error('候选审批回执不匹配或审批已取消');
@@ -197,8 +218,9 @@ export class PersistentAgentRuntime {
   async answer(id: string, answer: string): Promise<void> {
     if (this.active.has(id)) throw new Error('任务还在收尾');
     if (typeof answer !== 'string' || !answer.trim() || answer.length > 20000) throw new Error('请输入有效回答');
+    if (this.storedRun(id).status !== 'awaitingInput') throw new Error('这条任务没有等待回答的问题');
     const entry = this.loadEntry(id), waiting = entry.state.waiting;
-    if (entry.run.status !== 'awaitingInput' || waiting?.kind !== 'input') throw new Error('这条任务没有等待回答的问题');
+    if (waiting?.kind !== 'input') throw new Error('这条任务没有等待回答的问题');
     const slot = Object.entries(entry.state.checkpoints).find(([, value]) => (value as AgentCheckpoint).step.id === waiting.stepId);
     if (!slot) throw new Error('回答检查点不存在');
     const result = { ok: true, answer };
@@ -210,9 +232,17 @@ export class PersistentAgentRuntime {
     this.launch(entry);
   }
   recover() {
-    for (const state of this.store.listAgentStates()) {
-      const run = this.store.getRun(state.runId);
+    this.store.compactLegacyAgentStates();
+    const projects = new Set<string>();
+    for (const stored of this.store.listAgentStates()) {
+      projects.add(stored.projectId);
+      const run = this.store.getRun(stored.runId);
       if (!run || terminal.has(run.status)) continue;
+      let state: AgentState;
+      try { state = this.store.getAgentState(stored.runId)!; } catch (error) {
+        this.store.saveRun({ ...run, status: 'failed', finishedAt: stamp(), error: `任务检查点无法载入：${error instanceof Error ? error.message : String(error)}` });
+        continue;
+      }
       const entry: Entry = { run, state, controller: new AbortController() };
       if (run.status === 'running' || run.status === 'queued' || run.status === 'pausing') {
         run.status = 'paused'; state.pauseReason = '应用中断，尚未自动续跑'; state.interrupted = true;
@@ -220,6 +250,7 @@ export class PersistentAgentRuntime {
       }
       this.publish(entry);
     }
+    for (const projectId of projects) this.prune(projectId);
   }
   async shutdown() {
     await Promise.allSettled([...this.active.values()].map(async entry => {
@@ -256,7 +287,7 @@ export class PersistentAgentRuntime {
 所有正式修改都要 commit_candidate 等待作者一键批准。只有修改正文的候选需要先 review_candidate；只改设定、画布、人物、大纲的候选按 propose_changes 返回的 nextAction 直接 commit_candidate。审查意见是建议，不代替作者决定；修订额度耗尽或仍有分歧时，将候选及意见提交作者审阅，不要反复 finish_run 或停止在普通文字总结。不能把“已生成”说成“已保存”。作者拒绝时尊重拒绝，不再次提交同一候选。
 人工修改导致revision冲突时必须 refresh_context 后重新规划和审查，不重放旧命令。缺少作者必须决定的信息才 ask_author，并给出 2–4 个可点选的 options。
 完成时用 finish_run 提交证据明确的简短总结，区分实际产物、已应用修改和未解决问题。纯分析无需更改作品。不要在最终文字里伪造工具执行。` };
-      await this.model(entry, 'coordinator', definition, collectContext(entry.state.baseWorkspace, entry.run, this.memories(entry.run.projectId), this.story(entry.state.baseWorkspace)), entry.run.objective, sourcesForWorkspace(entry.state.baseWorkspace));
+      await this.model(entry, 'coordinator', definition, collectContext(entry.state.baseWorkspace, entry.run, this.memories(entry.run.projectId), this.story(entry.state.baseWorkspace)), entry.run.objective, this.sources(entry));
       // A text answer in the middle of a plan used to pause the run; remind the coordinator of what is left and carry on.
       for (let nudge = 0; nudge < MAX_CONTINUATIONS && !entry.state.finalSummary && !entry.state.waiting; nudge++) {
         const reminder = this.pendingWork(entry);
@@ -307,6 +338,7 @@ export class PersistentAgentRuntime {
       entry.state.budget.activeMs += Date.now() - started;
       delete entry.activeSince;
       try { this.publish(entry); } finally { this.active.delete(entry.run.id); }
+      if (terminal.has(entry.run.status)) this.prune(entry.run.projectId);
     }
   }
 
@@ -323,16 +355,18 @@ export class PersistentAgentRuntime {
       },
       onCheckpoint: cp => {
         const previous = entry.state.checkpoints[slot] as AgentCheckpoint | undefined;
+        // Marks cp.logged before the clone, so the saved checkpoint knows where the next turn's record starts.
+        const request = cp.phase === 'requesting' ? turnRecord(cp, definition.instructions) : undefined;
         entry.state.checkpoints[slot] = structuredClone(cp);
         const turns = (cp.step.input as { turns?: Array<{ output?: { usage?: unknown } }> })?.turns;
         if (turns?.some(turn => turn.output && !turn.output.usage)) entry.state.budget.usageUnknown = true;
         this.publish(entry);
         if (cp.phase === 'requesting') {
           if (JSON.stringify(cp.input).length > 200000) throw new AgentSuspended('当前协议上下文过大；已保留完整记录，请缩小目标后建立新任务');
-          this.store.recordAgentTurn(entry.run.id, cp.step.id, cp.turn, { instructions: definition.instructions, input: cp.input });
+          this.store.recordAgentTurn(entry.run.id, cp.step.id, cp.turn, request);
         } else if (previous?.phase === 'requesting' && cp.phase === 'tools') {
           const response = turns?.at(-1)?.output;
-          this.store.recordAgentTurn(entry.run.id, cp.step.id, cp.turn, { instructions: definition.instructions, input: previous.input }, response);
+          this.store.recordAgentTurn(entry.run.id, cp.step.id, cp.turn, turnRecord(previous, definition.instructions), response);
         }
       },
       onStep: step => { const index = entry.run.steps.findIndex(value => value.id === step.id); const published = publicStep(step); if (index < 0) entry.run.steps.push(published); else entry.run.steps[index] = published; this.publish(entry); },
@@ -399,7 +433,8 @@ export class PersistentAgentRuntime {
       objective: clipText(item.objective, 200), result: upstreamResult(artifact, included.has(artifact.id)) })) };
   }
   private candidate(entry: Entry, id: string): AgentCandidate { return entry.state.candidates.find(candidate => candidate.id === id) ?? fail('候选不存在或不属于此任务'); }
-  private sources(entry: Entry) { return sourcesForWorkspace(entry.state.baseWorkspace); }
+  /** The coordinator's provenance: it sees a bounded overview of the whole book, so the book fingerprint rather than a hash per entity. */
+  private sources(entry: Entry) { return bookSources(entry.state.baseWorkspace); }
   /** Stored digests over the given (base or candidate) workspace; scenes whose text differs fall back to extracts. */
   private story(workspace: Workspace) { return new StoryView(workspace, this.store.getStoryDigests(workspace.id)); }
 
@@ -529,7 +564,7 @@ export class PersistentAgentRuntime {
         const version = (state.candidates.at(-1)?.version ?? 0) + 1;
         const candidate: AgentCandidate = { id: `candidate-${fingerprint(call.key).slice(0, 24)}`, runId: entry.run.id, projectId, label: String(args.label), baseRevision: state.baseWorkspace.revision,
           version, hash: fingerprint({ baseRevision: state.baseWorkspace.revision, commands: preview.commands, changes: preview.changes }), commands: preview.commands, workspace: preview.workspace,
-          changes: preview.changes, sources: this.sources(entry), reviews: [], status: 'draft', createdAt: stamp(),
+          changes: preview.changes, sources: changeSources(state.baseWorkspace, preview.changes), reviews: [], status: 'draft', createdAt: stamp(),
           artifactIds: [...new Set([...(latest?.artifactIds ?? []), ...args.artifactIds as string[]])] };
         if (latest) latest.status = 'stale';
         state.candidates.push(candidate);
@@ -695,7 +730,11 @@ export class PersistentAgentRuntime {
     const structured = commands ? { ...(step.structured && typeof step.structured === 'object' ? step.structured : {}), commands } : step.structured;
     const artifact: AgentArtifact = { id: `artifact-${fingerprint(`${entry.run.id}:${slot}`).slice(0, 24)}`, nodeId: node.id, role: node.role, label: specification.definition.label,
       text: step.output, structured, stepId: step.id, sources: specification.sources, createdAt: stamp() };
-    this.check(entry); entry.state.artifacts.push(artifact); this.publish(entry); return artifact;
+    this.check(entry); entry.state.artifacts.push(artifact);
+    // The artifact now holds the result and the turn log holds the exchange: keep only what marks this slot as done.
+    const done = entry.state.checkpoints[slot] as AgentCheckpoint | undefined;
+    if (done?.phase === 'completed') entry.state.checkpoints[slot] = { ...done, input: [], pendingCalls: [], step: { ...done.step, input: { compacted: true }, output: '' } };
+    this.publish(entry); return artifact;
   }
 
   /** Run a specialist and convert its output. A schema or domain rejection goes back to the same specialist as feedback a bounded

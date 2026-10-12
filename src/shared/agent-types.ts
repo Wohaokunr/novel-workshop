@@ -49,6 +49,10 @@ export interface AgentState {
   waiting?: AgentWaiting; pauseReason?: string; interrupted?: boolean;
   currentStepId?: string; finalSummary?: string; updatedAt: string;
 }
+/** Persisted form of a run's state. The base snapshot is stored once in its own table and candidate workspaces are
+ * rebuilt from base + commands when a run is loaded, so a save writes neither copy of the book. */
+export type StoredAgentCandidate = Omit<AgentCandidate, 'workspace'>;
+export type StoredAgentState = Omit<AgentState, 'baseWorkspace' | 'candidates'> & { candidates: StoredAgentCandidate[] };
 export interface AgentReceipt {
   key: string; runId: string; projectId: string; argumentsHash: string;
   status: 'pending' | 'completed' | 'denied'; result?: unknown; at: string;

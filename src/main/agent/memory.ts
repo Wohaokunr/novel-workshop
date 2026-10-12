@@ -96,6 +96,24 @@ export function sourcesForWorkspace(workspace: Workspace): EvidenceSource[] {
   return [sourceFor(workspace, 'project', workspace.id)!, sourceFor(workspace, 'novel', workspace.id)!,
     ...Object.entries(entities).flatMap(([kind, collection]) => (workspace[collection] ?? []).map(item => sourceFor(workspace, kind, item.id)!))];
 }
+const bookSourceCache = new WeakMap<Workspace, EvidenceSource[]>();
+/** Whole-book provenance in two fingerprints (the semantic project and the novel fields): any edit to the book invalidates it.
+ * Memoized per snapshot object, since hashing the project reads every scene. */
+export function bookSources(workspace: Workspace): EvidenceSource[] {
+  let sources = bookSourceCache.get(workspace);
+  if (!sources) bookSourceCache.set(workspace, sources = [sourceFor(workspace, 'project', workspace.id)!, sourceFor(workspace, 'novel', workspace.id)!]);
+  return sources;
+}
+const kindOfCollection = new Map<string, string>(Object.entries(entities).map(([kind, collection]) => [collection, kind]));
+/** Evidence for a candidate: the book fingerprint plus the base version of every existing entity it changes. */
+export function changeSources(workspace: Workspace, changes: Change[]): EvidenceSource[] {
+  const touched = changes.flatMap(change => {
+    const kind = change.collection === 'metadata' ? 'novel' : change.collection === 'style' ? 'style' : kindOfCollection.get(change.collection);
+    const source = kind ? sourceFor(workspace, kind, kind === 'novel' || kind === 'style' ? workspace.id : change.key) : undefined;
+    return source ? [source] : [];
+  });
+  return [...new Map([...bookSources(workspace), ...touched].map(source => [`${source.kind}\u0000${source.id}`, source])).values()];
+}
 export function sourceValid(workspace: Workspace, source: EvidenceSource): boolean {
   if (!source || source.projectId !== workspace.id || typeof source.kind !== 'string' || typeof source.id !== 'string') return false;
   const current = sourceFor(workspace, source.kind, source.id);
