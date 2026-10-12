@@ -1,0 +1,105 @@
+import type { SourceReference } from './types.js';
+
+/** Lightweight creative partner modes; each surface of the app summons one of them. */
+export type CompanionMode = 'diverge' | 'causality' | 'structure' | 'outline' | 'beat' | 'develop' | 'style';
+export type CompanionSurface = 'canvas' | 'world' | 'story' | 'outline' | 'writer' | 'panel' | 'style';
+/** How far the partner may depart from what the author already has. */
+export type CompanionIntensity = 'steady' | 'bold' | 'wild';
+export type OutlineNodeKind = 'book' | 'act' | 'chapter' | 'scene';
+/** What the develop mode should infer and fill in. */
+export type CompanionFocus = 'profile' | 'theme' | 'logline' | 'brief' | 'cast' | 'distill' | 'blindtest';
+/** Work fields the partner may propose values for. */
+export const companionNovelFields = ['theme', 'logline', 'brief', 'genre', 'audience'] as const;
+export type CompanionNovelField = typeof companionNovelFields[number];
+
+export interface CompanionAnchor {
+  surface: CompanionSurface;
+  references: SourceReference[];
+  /** Absolute canvas / graph position used to place adopted cards. */
+  point?: { x: number; y: number };
+  outlineNode?: { kind: OutlineNodeKind; id?: string };
+  sceneId?: string;
+  focus?: CompanionFocus;
+}
+
+/** options: 0–4 concrete answers the author can pick instead of typing. */
+export interface CompanionQuestion { id: string; question: string; why: string; options?: string[] }
+export type CompanionIdeaKind = 'whatif' | 'twist' | 'conflict' | 'character' | 'setting' | 'theme' | 'beat';
+export interface CompanionIdea { id: string; kind: CompanionIdeaKind; title: string; content: string; hook: string }
+export type CompanionOpKind = 'addAct' | 'updateAct' | 'addChapter' | 'updateChapter' | 'addScene' | 'updateScene' | 'moveScene' | 'addEvent' | 'addCard'
+  | 'updateNovel' | 'addCharacter' | 'updateCharacter' | 'link' | 'addCause' | 'updateStyle';
+/** Flat, strict-schema friendly operation. Empty / null fields mean "not provided" or "unchanged". */
+export interface CompanionOp {
+  id: string; op: CompanionOpKind;
+  /** Temporary handle for new items so later ops can reference them. */
+  ref: string | null;
+  /** Existing entity id for update / move ops, or the effect event for a new cause. */
+  targetId: string | null;
+  parentRef: string | null; parentId: string | null;
+  title: string | null; content: string | null; purpose: string | null;
+  /** 1-based position among siblings; null appends. */
+  order: number | null;
+  povName: string | null;
+  causes: string[]; people: string[];
+  /** updateNovel: which work field content replaces; updateStyle: summary, dial:<id>, rule:do, rule:avoid, preferWords, avoidWords or voice. */
+  field?: string | null;
+}
+export interface CompanionProposal { id: string; title: string; summary: string; ops: CompanionOp[] }
+export interface CompanionResponse {
+  reply: string; questions: CompanionQuestion[]; ideas: CompanionIdea[]; proposals: CompanionProposal[]; followUps: string[];
+}
+
+export interface CompanionTurn {
+  id: string; role: 'author' | 'companion'; text: string; at: string;
+  intensity?: CompanionIntensity;
+  response?: CompanionResponse;
+  /** Adopted item id (idea id or `${proposalId}#${opId}`) → operation batch id, so the author can undo it. */
+  adopted?: Record<string, string>;
+  /** `${proposalId}:${ref}` → created entity, so later partial adoptions attach to parents adopted earlier. */
+  created?: Record<string, { id: string; batchId: string }>;
+}
+export interface CompanionThread {
+  id: string; projectId: string; mode: CompanionMode; anchor: CompanionAnchor; title: string;
+  turns: CompanionTurn[]; status: 'idle' | 'streaming' | 'failed'; error?: string;
+  /** Raw streamed text of the reply in progress; cleared when the turn is saved. */
+  streaming?: string;
+  createdAt: string; updatedAt: string;
+}
+
+export interface CompanionAskRequest {
+  projectId: string; threadId?: string; mode: CompanionMode; anchor: CompanionAnchor;
+  message: string; intensity: CompanionIntensity;
+  /** Re-send the last unanswered author message after a failure. */
+  retry?: boolean;
+}
+/** Item ids: an idea id, a proposal id, or `${proposalId}#${opId}` for part of a proposal. */
+export interface CompanionAdoptRequest {
+  projectId: string; threadId: string; turnId: string; itemIds: string[];
+  /** Where adopted ideas land: canvas notes (default) or appended to the anchor scene outline. */
+  target?: 'canvas' | 'sceneOutline';
+  placement?: { x: number; y: number };
+  /** Wrap adopted canvas ideas in a new group. */
+  group?: boolean;
+  /** Adopt character ideas as real characters instead of canvas notes. */
+  as?: 'character';
+}
+export interface CompanionAdoptResult { batchId?: string; skipped: string[]; thread: CompanionThread }
+
+export interface CompanionAPI {
+  askCompanion(request: CompanionAskRequest): Promise<CompanionThread>;
+  cancelCompanion(projectId: string, threadId: string): Promise<void>;
+  getCompanionThreads(projectId: string): Promise<CompanionThread[]>;
+  adoptCompanion(request: CompanionAdoptRequest): Promise<CompanionAdoptResult>;
+  undoCompanion(projectId: string, threadId: string, batchId: string): Promise<CompanionThread>;
+  deleteCompanionThread(projectId: string, threadId: string): Promise<void>;
+}
+
+export const companionModeNames: Record<CompanionMode, string> = {
+  diverge: '发散灵感', causality: '推演因果', structure: '结构诊断', outline: '大纲展开', beat: '下一拍', develop: '补全构想', style: '文风',
+};
+export const intensityNames: Record<CompanionIntensity, string> = { steady: '稳妥', bold: '大胆', wild: '天马行空' };
+export const ideaKindNames: Record<CompanionIdeaKind, string> = {
+  whatif: 'What-if', twist: '反转', conflict: '冲突升级', character: '人物', setting: '设定', theme: '立意', beat: '情节点',
+};
+export const focusNames: Record<CompanionFocus, string> = { profile: '作品信息', theme: '立意', logline: '一句话梗概', brief: '创作简述', cast: '人物阵容', distill: '提炼文风', blindtest: '文风盲测' };
+export const novelFieldNames: Record<CompanionNovelField, string> = { theme: '立意', logline: '一句话梗概', brief: '创作简述', genre: '题材', audience: '目标读者' };

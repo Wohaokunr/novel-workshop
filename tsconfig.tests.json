@@ -1,0 +1,1 @@
+{"extends":"./tsconfig.electron.json","compilerOptions":{"outDir":"dist-tests"},"exclude":["src/main/main.ts","src/main/preload.cts","src/main/providers.ts","src/main/smoke.ts"]}
