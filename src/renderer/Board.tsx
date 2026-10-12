@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
-import { ArrowRight, Bot, ChevronDown, MessageCircleQuestion, ChevronUp, CircleHelp, Compass, Film, Layers, Link2, Map as MapIcon, Milestone, MousePointer2, Network, Plus, Scan, Sparkles, StickyNote, Trash2, Unlink, UserRound, X } from 'lucide-react';
-import { ReactFlow, Background, BackgroundVariant, Controls, Handle, MarkerType, MiniMap, NodeResizer, Position, applyNodeChanges, type Node, type Edge, type NodeProps, type Connection, type ReactFlowInstance, type NodeChange } from '@xyflow/react';
+import { AlignCenterHorizontal, AlignCenterVertical, AlignEndHorizontal, AlignEndVertical, AlignHorizontalDistributeCenter, AlignStartHorizontal, AlignStartVertical, AlignVerticalDistributeCenter, ArrowRight, Bot, ChevronDown, MessageCircleQuestion, ChevronUp, CircleHelp, Columns3, Compass, Film, GitFork, Layers, LayoutGrid, Link2, ListOrdered, Magnet, Map as MapIcon, Milestone, MousePointer2, Network, Plus, Rows3, Scan, Sparkles, StickyNote, Trash2, Unlink, UserRound, X, type LucideIcon } from 'lucide-react';
+import { ReactFlow, Background, BackgroundVariant, Controls, Handle, MarkerType, MiniMap, NodeResizer, Position, ViewportPortal, applyNodeChanges, type Node, type Edge, type NodeProps, type Connection, type ReactFlowInstance, type NodeChange, type NodePositionChange } from '@xyflow/react';
 import type { Workspace, Command, NovelObject, NarrativeScene, CanvasCard, SourceReference, RunRequest } from '../shared/types';
-import { assignedCards, canResizeGroup, cardRect, cardSize, collapsedGroupSize, containingGroup, createdGroup, dissolvedGroup, fitGroups, groupSize, isDescendant, movedCards, orderedCards, rootCards, visibleCardId, visibleLinks, type Point, type Rect, type CardSizes, type Size } from '../shared/canvas';
+import { alignPositions, assignedCards, canResizeGroup, cardRect, cardSize, collapsedGroupSize, containingGroup, createdGroup, distributePositions, dissolvedGroup, fitGroups, groupSize, isDescendant, layeredLayout, movedCards, orderedCards, rootCards, snapPosition, tidyCards, visibleCardId, visibleLinks, type AlignGuide, type AlignMode, type IdRect, type Placement, type Point, type Rect, type CardSizes, type Size } from '../shared/canvas';
 import { Combobox, Field, Kbd, Popover, Select, type ComboItem, type Commit, uid, fire, characters, orderedChapters, orderedScenes, events, colors } from './ui';
-import { motionDuration } from './interaction';
+import { motionDuration, usePresence } from './interaction';
 import { useCompanion, type SummonRequest } from './Companion';
 import type { CompanionFocus } from '../shared/companion-types';
 
@@ -66,6 +66,16 @@ function absolutePosition(nodes: readonly BoardNode[], id: string): Point {
   return point;
 }
 
+function ancestorIds(nodes: readonly BoardNode[], id: string): string[] {
+  const result: string[] = [];
+  let parent = nodes.find(item => item.id === id)?.parentId;
+  while (parent) { result.push(parent); parent = nodes.find(item => item.id === parent)?.parentId; }
+  return result;
+}
+
+const snapStorageKey = 'novel.board.snap';
+const gridStep = 10;
+
 function cardCommands(before: readonly CanvasCard[], after: readonly CanvasCard[]): Command[] {
   return after.filter(card => JSON.stringify(card) !== JSON.stringify(before.find(item => item.id === card.id))).map(value => ({ type: 'putCard', value }));
 }
@@ -85,6 +95,14 @@ export default function Board({ mode, workspace: w, commit, selectedObject, sele
   const workspaceRef = useRef(w); workspaceRef.current = w;
   const [menu, setMenu] = useState<{ point: Point; left: number; top: number; screen: Point; nodeId?: string } | null>(null);
   const companion = useCompanion();
+  const [snap, setSnap] = useState(() => { try { return localStorage.getItem(snapStorageKey) !== 'off'; } catch { return true; } });
+  const [guides, setGuides] = useState<AlignGuide[]>([]);
+  /** Positions adjusted by alignment snapping; React Flow reports its own unsnapped positions when the drag ends. */
+  const snapped = useRef(new Map<string, Point>());
+  const [arranging, setArranging] = useState(false);
+  const lastMenu = useRef(menu); if (menu) lastMenu.current = menu;
+  const menuPresence = usePresence(!!menu, 120);
+  const shownMenu = menu ?? (menuPresence.mounted ? lastMenu.current : null);
   const chars = characters(w), es = events(w), scenes = orderedScenes(w);
   const threads = [...new Set(es.map(object => object.event!.thread || '主线'))];
   const times = [...new Set(es.map(object => object.event!.worldOrder))].sort((a, b) => a - b);
@@ -126,6 +144,14 @@ export default function Board({ mode, workspace: w, commit, selectedObject, sele
     return { x: parent?.x ?? 0, y: parent?.y ?? 0 };
   };
 
+  const worldDefault = (value: NovelObject): Point => {
+    const lane = threads.indexOf(value.event!.thread || '主线');
+    const parallel = es.filter(item => (item.event!.thread || '主线') === (value.event!.thread || '主线') && item.event!.worldOrder === value.event!.worldOrder).findIndex(item => item.id === value.id);
+    return { x: widths.slice(0, lane).reduce((sum, width) => sum + width, 40) + parallel * 255, y: times.indexOf(value.event!.worldOrder) * 250 + 65 };
+  };
+  const povLane = (value: NarrativeScene) => { const found = chars.findIndex(character => character.id === value.povId); return found < 0 ? chars.length : found; };
+  const storyDefault = (value: NarrativeScene, index: number): Point => ({ x: povLane(value) * 275 + 40, y: index * 250 + 65 });
+
   const generated = useMemo(() => {
     let graphNodes: BoardNode[] = [], edges: Edge[] = [];
     if (mode === 'canvas') {
@@ -158,14 +184,13 @@ export default function Board({ mode, workspace: w, commit, selectedObject, sele
     } else if (mode === 'world') {
       graphNodes = es.map(value => {
         const lane = threads.indexOf(value.event!.thread || '主线');
-        const parallel = es.filter(item => (item.event!.thread || '主线') === (value.event!.thread || '主线') && item.event!.worldOrder === value.event!.worldOrder).findIndex(item => item.id === value.id);
-        return { id: value.id, type: 'story', position: w.layouts[`world:${value.id}`] || { x: widths.slice(0, lane).reduce((sum, width) => sum + width, 40) + parallel * 255, y: times.indexOf(value.event!.worldOrder) * 250 + 65 }, data: { label: value.name, content: objectDescription(value) || value.event!.thread, state: stateSummary(value), kind: 'event', connectable: true, tag: value.event!.timeLabel || '世界事件', badge: `#${value.event!.worldOrder}${value.event!.critical ? ' · 关键' : ''}`, tint: colors[lane % colors.length], people: value.event!.participants.map(id => chars.find(character => character.id === id)?.name || '未命名人物') } };
+        return { id: value.id, type: 'story', position: w.layouts[`world:${value.id}`] || worldDefault(value), data: { label: value.name, content: objectDescription(value) || value.event!.thread, state: stateSummary(value), kind: 'event', connectable: true, tag: value.event!.timeLabel || '世界事件', badge: `#${value.event!.worldOrder}${value.event!.critical ? ' · 关键' : ''}`, tint: colors[lane % colors.length], people: value.event!.participants.map(id => chars.find(character => character.id === id)?.name || '未命名人物') } };
       });
       edges = es.flatMap(value => value.event!.causes.map(cause => ({ id: `cause:${cause}:${value.id}`, source: cause, target: value.id, type: 'smoothstep', style: { stroke: colors[threads.indexOf(value.event!.thread || '主线') % colors.length], strokeWidth: 2 }, markerEnd: { type: MarkerType.ArrowClosed } })));
     } else {
       graphNodes = scenes.map((value, index) => {
-        const found = chars.findIndex(character => character.id === value.povId), lane = found < 0 ? chars.length : found;
-        return { id: value.id, type: 'story', position: w.layouts[`story:${value.id}`] || { x: lane * 275 + 40, y: index * 250 + 65 }, data: { label: value.title, content: value.outline, kind: 'scene', connectable: false, tag: w.chapters.find(chapter => chapter.id === value.chapterId)?.title || '叙述场景', badge: `阅读 ${index + 1}`, tint: colors[lane % colors.length], people: [chars.find(character => character.id === value.povId)?.name || '全知 / 外部视角', `${value.eventIds.length} 个世界事件`] } };
+        const lane = povLane(value);
+        return { id: value.id, type: 'story', position: w.layouts[`story:${value.id}`] || storyDefault(value, index), data: { label: value.title, content: value.outline, kind: 'scene', connectable: false, tag: w.chapters.find(chapter => chapter.id === value.chapterId)?.title || '叙述场景', badge: `阅读 ${index + 1}`, tint: colors[lane % colors.length], people: [chars.find(character => character.id === value.povId)?.name || '全知 / 外部视角', `${value.eventIds.length} 个世界事件`] } };
       });
       edges = scenes.slice(1).map((value, index) => ({ id: `next:${scenes[index].id}:${value.id}`, source: scenes[index].id, target: value.id, type: 'smoothstep', markerEnd: { type: MarkerType.ArrowClosed }, style: { stroke: colors[(value.povId ? chars.findIndex(character => character.id === value.povId) : chars.length) % colors.length], strokeWidth: 2 } }));
     }
@@ -291,6 +316,75 @@ export default function Board({ mode, workspace: w, commit, selectedObject, sele
   const noun = mode === 'canvas' ? '卡片' : mode === 'world' ? '事件' : '场景';
   const fit = () => { void flow.current?.fitView({ padding: 0.2, maxZoom: 1.2, duration: motionDuration(200) }); };
   const clearSelection = () => { setNodes(previous => previous.map(node => node.selected ? { ...node, selected: false } : node)); select(''); };
+
+  /* ---------- alignment, snapping, automatic layout ---------- */
+  const nodeRect = (node: BoardNode): IdRect => ({ id: node.id, ...absolutePosition(nodesRef.current, node.id), width: node.measured?.width ?? cardSize.width, height: node.measured?.height ?? cardSize.height });
+  const toggleSnap = () => setSnap(value => { try { localStorage.setItem(snapStorageKey, value ? 'off' : 'on'); } catch { /* preference only */ } return !value; });
+  /** While one node is dragged, pull it onto the edges and centers of nearby nodes and show guides. */
+  const nodesChange = (changes: NodeChange<BoardNode>[]) => {
+    const moves = changes.filter((change): change is NodePositionChange => change.type === 'position' && !!change.dragging && !!change.position);
+    if (snap && moves.length === 1 && flow.current) {
+      const move = moves[0]!, current = nodesRef.current, node = current.find(item => item.id === move.id);
+      if (node) {
+        const offset = node.parentId ? absolutePosition(current, node.parentId) : { x: 0, y: 0 };
+        const related = new Set(ancestorIds(current, node.id));
+        const others = current.filter(other => other.id !== node.id && !other.hidden && !related.has(other.id) && !ancestorIds(current, other.id).includes(node.id)).map(nodeRect);
+        const result = snapPosition({ ...nodeRect(node), x: move.position!.x + offset.x, y: move.position!.y + offset.y }, others, 6 / flow.current.getZoom());
+        // Without a nearby edge, fall back to the grid; multi-node drags stay free so relative positions never drift.
+        const grid = (value: number) => Math.round(value / gridStep) * gridStep;
+        const x = result.guides.some(guide => guide.orientation === 'vertical') ? result.x : grid(result.x);
+        const y = result.guides.some(guide => guide.orientation === 'horizontal') ? result.y : grid(result.y);
+        move.position = { x: x - offset.x, y: y - offset.y };
+        snapped.current.set(node.id, move.position);
+        setGuides(result.guides);
+      }
+    } else if (moves.length > 1 && guides.length) setGuides([]);
+    setNodes(previous => applyNodeChanges(changes, previous));
+  };
+  /** Commit a layout change and let nodes glide to their new places. */
+  const arrange = (label: string, build: (current: Workspace) => Command[], fitAfter = true) => {
+    setMenu(null); setArranging(true);
+    fire(commit(build, label).finally(() => window.setTimeout(() => { setArranging(false); if (fitAfter) fit(); }, motionDuration(340))));
+  };
+  const layoutCommands = (points: readonly Placement[]): Command[] => points.map(point => ({ type: 'setLayout', key: `${mode}:${point.id}`, value: { x: Math.round(point.x), y: Math.round(point.y) } }));
+  const nodeSize = (id: string): Size => { const node = nodesRef.current.find(item => item.id === id); return { width: node?.measured?.width ?? 220, height: node?.measured?.height ?? cardSize.height }; };
+  const tidyCanvas = (ids?: string[], cluster = false) => arrange(ids ? '整理选中卡片' : cluster ? '按关联整理画布' : '自动整理画布',
+    current => cardCommands(current.cards, tidyCards(current.cards, { sizes: sizes(), links: current.canvasLinks, ids, cluster })), !ids);
+  const arrangeActions: Array<{ icon: LucideIcon; label: string; hint: string; run: () => void; disabled?: boolean }> = mode === 'canvas' ? [
+    { icon: LayoutGrid, label: '自动整理全部', hint: '分组内收紧排列，整体按阅读顺序排成网格', run: () => tidyCanvas(), disabled: !w.cards.length },
+    { icon: Network, label: '按关联聚类', hint: '有连线的卡片排在一起，各簇再整体排布', run: () => tidyCanvas(undefined, true), disabled: !w.cards.length },
+    { icon: Rows3, label: '整理选中卡片', hint: '只排列已选卡片与其分组内容', run: () => tidyCanvas([...selectedIds]), disabled: !selectedIds.length },
+  ] : mode === 'world' ? [
+    { icon: GitFork, label: '按因果分层', hint: '前因在上、后果在下，尽量减少连线交叉', disabled: !es.length,
+      run: () => arrange('按因果分层整理', current => layoutCommands(layeredLayout(events(current).map(value => value.id), events(current).flatMap(value => value.event!.causes.map(cause => [cause, value.id] as const)), nodeSize))) },
+    { icon: Columns3, label: '按支线泳道', hint: '每条支线一列，按世界顺序自上而下', disabled: !es.length, run: () => arrange('按支线泳道整理', () => layoutCommands(es.map(value => ({ id: value.id, ...worldDefault(value) })))) },
+  ] : [
+    { icon: ListOrdered, label: '按视角泳道', hint: '每个视角人物一列，按阅读顺序自上而下', disabled: !scenes.length, run: () => arrange('按视角泳道整理', () => layoutCommands(scenes.map((value, index) => ({ id: value.id, ...storyDefault(value, index) })))) },
+    { icon: Rows3, label: '按章节分行', hint: '每章一行，场景按阅读顺序从左到右', disabled: !scenes.length, run: () => arrange('按章节整理叙述顺序', current => {
+      let y = 65;
+      return layoutCommands(orderedChapters(current).flatMap(chapter => {
+        const row = orderedScenes(current).filter(value => value.chapterId === chapter.id);
+        if (!row.length) return [];
+        const top = y; y += Math.max(...row.map(value => nodeSize(value.id).height)) + 80;
+        return row.map((value, column) => ({ id: value.id, x: 40 + column * 270, y: top }));
+      }));
+    }) },
+  ];
+  const alignSelection = (how: AlignMode | 'x' | 'y') => {
+    const ids = [...selectedIds];
+    const place = (rects: IdRect[]) => how === 'x' || how === 'y' ? distributePositions(rects, how) : alignPositions(rects, how);
+    const label = how === 'x' ? '水平等距分布' : how === 'y' ? '垂直等距分布' : `对齐选中${noun}`;
+    if (mode === 'canvas') arrange(label, current => {
+      const moved = movedCards(current.cards, place(rootCards(current.cards, ids).map(card => ({ id: card.id, ...cardRect(card, sizes()) }))));
+      return cardCommands(current.cards, fitGroups(current.cards.map(value => moved.find(item => item.id === value.id) ?? value), sizes()));
+    }, false);
+    else arrange(label, () => layoutCommands(place(nodesRef.current.filter(node => ids.includes(node.id)).map(nodeRect))), false);
+  };
+  const alignActions: Array<{ how: AlignMode | 'x' | 'y'; icon: LucideIcon; label: string; min: number }> = [
+    { how: 'left', icon: AlignStartVertical, label: '左对齐', min: 2 }, { how: 'hcenter', icon: AlignCenterVertical, label: '水平居中', min: 2 }, { how: 'right', icon: AlignEndVertical, label: '右对齐', min: 2 },
+    { how: 'top', icon: AlignStartHorizontal, label: '顶部对齐', min: 2 }, { how: 'vcenter', icon: AlignCenterHorizontal, label: '垂直居中', min: 2 }, { how: 'bottom', icon: AlignEndHorizontal, label: '底部对齐', min: 2 },
+    { how: 'x', icon: AlignHorizontalDistributeCenter, label: '水平等距分布', min: 3 }, { how: 'y', icon: AlignVerticalDistributeCenter, label: '垂直等距分布', min: 3 },
+  ];
   const referenceItems: ComboItem[] = [
     ...w.objects.map(value => ({ id: `object:${value.id}`, label: value.name, group: value.event ? '世界事件' : w.objectTypes.find(type => type.id === value.typeId)?.name ?? '小说素材', hint: w.cards.some(item => item.kind === 'object' && item.refId === value.id) ? '已在画布' : undefined })),
     ...scenes.map(value => ({ id: `scene:${value.id}`, label: value.title, group: '叙述场景', hint: w.cards.some(item => item.kind === 'scene' && item.refId === value.id) ? '已在画布' : w.chapters.find(chapter => chapter.id === value.chapterId)?.title })),
@@ -351,7 +445,7 @@ export default function Board({ mode, workspace: w, commit, selectedObject, sele
   };
   const legend = mode === 'canvas' ? [] : (mode === 'world' ? threads : [...chars.map(value => value.name), '全知 / 外部视角']);
   const shortcuts: Array<[string, string]> = [
-    ['N', mode === 'canvas' ? '在视口中心添加便笺' : `添加${mode === 'world' ? '世界事件' : '场景'}`], ['F', '适应视图'], ['Ctrl A', '全选'], ['Ctrl 点击', '多选'], ['Shift 拖曳', '框选'],
+    ['N', mode === 'canvas' ? '在视口中心添加便笺' : `添加${mode === 'world' ? '世界事件' : '场景'}`], ['F', '适应视图'], ['L', '自动整理布局'], ['拖动', '吸附到其他卡片的边与中线'], ['Ctrl A', '全选'], ['Ctrl 点击', '多选'], ['Shift 拖曳', '框选'],
     ['空格 拖曳', '平移画布'], ['I', '围绕选中内容唤出创作伙伴'], ['右键', '在指针处唤出创作伙伴'], ['方向键', '微调位置（Shift 加大步长）'], ['Delete', '删除选中'], ['Esc', '取消选择'],
     ...(mode === 'canvas' ? [['Ctrl G', '将选中卡片成组'], ['双击空白', '添加便笺'], ['右键空白', '在指针处添加']] as Array<[string, string]> : []),
   ];
@@ -372,15 +466,18 @@ export default function Board({ mode, workspace: w, commit, selectedObject, sele
     else if ((event.ctrlKey || event.metaKey) && key === 'a') { event.preventDefault(); fire(requestSelection(nodes.filter(node => !node.hidden).map(node => node.id))); }
     else if (plain && key === 'n') { event.preventDefault(); if (mode === 'canvas') createCard('note'); else createSceneOrEvent(); }
     else if (plain && key === 'f') { event.preventDefault(); fit(); }
+    else if (plain && key === 'l' && !event.shiftKey) { event.preventDefault(); arrangeActions.find(action => !action.disabled)?.run(); }
     else if (plain && key === 'i' && selectedIds.length) { event.preventDefault(); summonForSelection(); }
     else if (event.key === 'Escape' && (menu || selectedIds.length)) { event.preventDefault(); if (menu) setMenu(null); else clearSelection(); }
   }}>
-    <div className="board-body"><div className="flow-container" ref={container}>
-      <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onInit={instance => { flow.current = instance; }} onNodesChange={(changes: NodeChange<BoardNode>[]) => setNodes(previous => applyNodeChanges(changes, previous))} onNodeClick={(_, node) => { select(node.id); setMenu(null); }} onPaneClick={event => { setMenu(null); if (event.detail === 2 && mode === 'canvas') createCard('note', undefined, flow.current?.screenToFlowPosition({ x: event.clientX, y: event.clientY })); }} onPaneContextMenu={event => { event.preventDefault(); const rect = container.current?.getBoundingClientRect(); if (rect && flow.current) setMenu({ point: flow.current.screenToFlowPosition({ x: event.clientX, y: event.clientY }), screen: { x: event.clientX, y: event.clientY }, left: Math.max(8, Math.min(event.clientX - rect.left, rect.width - 260)), top: Math.max(8, Math.min(event.clientY - rect.top, rect.height - 360)) }); }} onNodeContextMenu={(event, node) => { event.preventDefault(); const rect = container.current?.getBoundingClientRect(); if (!rect || !flow.current) return; if (!selectedIds.includes(node.id)) select(node.id); setMenu({ nodeId: node.id, point: flow.current.screenToFlowPosition({ x: event.clientX, y: event.clientY }), screen: { x: event.clientX, y: event.clientY }, left: Math.max(8, Math.min(event.clientX - rect.left, rect.width - 260)), top: Math.max(8, Math.min(event.clientY - rect.top, rect.height - 260)) }); }} onNodeDragStart={(_, node) => { select(node.id); beginGesture(); }} onNodeDrag={(_, _node, items) => dragMove(items)} onNodeDragStop={(_, _node, items) => dragStop(items)} nodesConnectable={mode !== 'story'} onConnect={mode === 'story' ? undefined : connect} onEdgesDelete={items => {
+    <div className="board-body"><div className={`flow-container ${arranging ? 'board-arranging' : ''}`} ref={container}>
+      <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onInit={instance => { flow.current = instance; }} onNodesChange={nodesChange} onNodeClick={(_, node) => { select(node.id); setMenu(null); }} onPaneClick={event => { setMenu(null); if (event.detail === 2 && mode === 'canvas') createCard('note', undefined, flow.current?.screenToFlowPosition({ x: event.clientX, y: event.clientY })); }} onPaneContextMenu={event => { event.preventDefault(); const rect = container.current?.getBoundingClientRect(); if (rect && flow.current) setMenu({ point: flow.current.screenToFlowPosition({ x: event.clientX, y: event.clientY }), screen: { x: event.clientX, y: event.clientY }, left: Math.max(8, Math.min(event.clientX - rect.left, rect.width - 260)), top: Math.max(8, Math.min(event.clientY - rect.top, rect.height - 360)) }); }} onNodeContextMenu={(event, node) => { event.preventDefault(); const rect = container.current?.getBoundingClientRect(); if (!rect || !flow.current) return; if (!selectedIds.includes(node.id)) select(node.id); setMenu({ nodeId: node.id, point: flow.current.screenToFlowPosition({ x: event.clientX, y: event.clientY }), screen: { x: event.clientX, y: event.clientY }, left: Math.max(8, Math.min(event.clientX - rect.left, rect.width - 260)), top: Math.max(8, Math.min(event.clientY - rect.top, rect.height - 260)) }); }} onNodeDragStart={(_, node) => { select(node.id); beginGesture(); }} onNodeDrag={(_, _node, items) => dragMove(items)} onNodeDragStop={(_, _node, items) => { const adjusted = items.map(item => snapped.current.has(item.id) ? { ...item, position: snapped.current.get(item.id)! } : item); snapped.current.clear(); setGuides([]); dragStop(adjusted); }} nodesConnectable={mode !== 'story'} onConnect={mode === 'story' ? undefined : connect} onEdgesDelete={items => {
         if (mode === 'canvas') fire(commit(items.flatMap(edge => ((edge.data?.linkIds as string[] | undefined) ?? [edge.id]).map(id => ({ type: 'deleteCanvasLink' as const, id })))));
         else if (mode === 'world') fire(commit(current => items.flatMap(edge => { const value = current.objects.find(value => value.id === edge.target); return value?.event ? [{ type: 'putObject' as const, value: { ...value, event: { ...value.event, causes: value.event.causes.filter(id => id !== edge.source) } } }] : []; })));
       }} deleteKeyCode={null} selectionKeyCode="Shift" multiSelectionKeyCode="Control" zoomOnDoubleClick={mode !== 'canvas'} fitView fitViewOptions={{ padding: 0.2, maxZoom: 1.1 }} minZoom={0.2} maxZoom={1.5} proOptions={{ hideAttribution: true }}>
         <Background variant={BackgroundVariant.Dots} gap={20} size={1.2} color="var(--canvas-dot)" /><Controls showInteractive={false} position="bottom-right" fitViewOptions={{ padding: 0.2, maxZoom: 1.1, duration: motionDuration(200) }} />
+        <ViewportPortal>{guides.map(guide => <div key={`${guide.orientation}:${guide.position}`} className={`align-guide ${guide.orientation}`} aria-hidden="true"
+          style={guide.orientation === 'vertical' ? { transform: `translate(${guide.position}px, ${guide.from - 12}px)`, height: guide.to - guide.from + 24 } : { transform: `translate(${guide.from - 12}px, ${guide.position}px)`, width: guide.to - guide.from + 24 }}/>)}</ViewportPortal>
         {minimap && <MiniMap pannable zoomable position="bottom-right" className="board-minimap" nodeColor={node => (node.data as BoardData).kind === 'group' ? 'var(--canvas-group)' : (node.data as BoardData).tint || 'var(--accent-soft-strong)'} nodeStrokeWidth={0} maskColor="var(--minimap-mask)" />}
       </ReactFlow>
 
@@ -393,6 +490,11 @@ export default function Board({ mode, workspace: w, commit, selectedObject, sele
         <span className="toolbar-sep" aria-hidden="true" />
         <button className="icon-button small ghost" title="适应视图（F）" aria-label="适应视图" onClick={fit}><Scan aria-hidden="true" /></button>
         <button className={`icon-button small ghost ${minimap ? 'selected' : ''}`} title={minimap ? '隐藏小地图' : '显示小地图'} aria-label="小地图" aria-pressed={minimap} onClick={() => setMinimap(!minimap)}><MapIcon aria-hidden="true" /></button>
+        <button className={`icon-button small ghost ${snap ? 'selected' : ''}`} title={snap ? '关闭吸附对齐' : '开启吸附对齐（网格与参考线）'} aria-label="吸附对齐" aria-pressed={snap} onClick={toggleSnap}><Magnet aria-hidden="true" /></button>
+        <Popover label="自动整理" triggerClassName="small ghost" testId="board-arrange" trigger={<><LayoutGrid aria-hidden="true" />整理</>}>{close => <div className="menu-list arrange-menu" role="menu">
+          <p className="menu-caption">自动整理{mode === 'canvas' ? '画布' : mode === 'world' ? '世界因果图' : '叙述顺序'}布局（L）。只调整位置，可在修改历史中撤销。</p>
+          {arrangeActions.map(action => <button key={action.label} role="menuitem" className="rich" disabled={action.disabled} onClick={() => { close(); action.run(); }}><action.icon aria-hidden="true" /><span><strong>{action.label}</strong><small>{action.hint}</small></span></button>)}
+        </div>}</Popover>
       </div>
 
       <div className="board-float top-right">
@@ -413,6 +515,10 @@ export default function Board({ mode, workspace: w, commit, selectedObject, sele
         <span className="selection-count"><MousePointer2 aria-hidden="true" />已选 {selectedIds.length} 个{noun}</span>
         {mode === 'canvas' && <button className="small ghost" title="将选中卡片成组（Ctrl+G）" onClick={groupSelection}><Layers aria-hidden="true" />成组</button>}
         {mode === 'canvas' && availableGroups.length + w.cards.filter(value => selectedIds.includes(value.id) && value.groupId).length > 0 && <Popover label="将选中卡片移入分组" side="top" triggerClassName="small ghost" trigger={<>移入分组…</>}>{close => <Combobox label="选择目标分组" placeholder="搜索分组…" items={[{ id: '_none', label: '移出分组', group: '操作' }, ...availableGroups.map(value => ({ id: value.id, label: value.title, group: '分组' }))]} onPick={item => { if (item.id === '_none') assign([...selectedIds]); else assign([...selectedIds], item.id); close(); }} />}</Popover>}
+        {selectedIds.length > 1 && <Popover label="对齐与分布" side="top" triggerClassName="small ghost" trigger={<><AlignStartVertical aria-hidden="true" />对齐</>}>{close => <div className="align-panel">
+          <div className="align-grid" role="group" aria-label="对齐与分布">{alignActions.map(action => <button key={action.how} className="icon-button ghost" title={action.label} aria-label={action.label} disabled={selectedIds.length < action.min} onClick={() => { close(); alignSelection(action.how); }}><action.icon aria-hidden="true" /></button>)}</div>
+          {mode === 'canvas' && <button className="small ghost align-tidy" onClick={() => { close(); tidyCanvas([...selectedIds]); }}><LayoutGrid aria-hidden="true" />整理所选</button>}
+        </div>}</Popover>}
         <span className="toolbar-sep" aria-hidden="true" />
         <button className="small ai-trigger" data-testid="summon-companion" title="唤出创作伙伴（I）" onClick={event => { const rect = event.currentTarget.getBoundingClientRect(); summon({ x: rect.left, y: rect.top - 8 }, sourceReferences(selectedIds), undefined, selectedIds.length > 1 ? `已选 ${selectedIds.length} 个${noun}` : nodeTitle(selectedIds[0]!)); }}><Sparkles aria-hidden="true" />{mode === 'canvas' ? '发散' : mode === 'world' ? '推演因果' : '诊断结构'}</button>
         {mode === 'canvas' && <button className="small ghost ai-action" data-testid="selection-develop-cast" onClick={event => summon(above(event), sourceReferences(selectedIds), '这些灵感牵涉到哪些人物？补充需要的人物，并和相关卡片连起来。', '补人物', 'develop', undefined, 'cast')}><UserRound aria-hidden="true" />补人物</button>}
@@ -432,26 +538,26 @@ export default function Board({ mode, workspace: w, commit, selectedObject, sele
         <div className="shortcut-list"><strong>{mode === 'canvas' ? '灵感画布' : mode === 'world' ? '世界因果' : '叙述顺序'}</strong><p className="muted">{mode === 'canvas' ? '连线表示素材关联；把卡片中心拖入分组即可归组。' : mode === 'world' ? '从原因连向结果建立真实因果；拖动只调整布局。' : '连线展示阅读顺序；拖动只调整布局，章节与顺序在写作目录中修改。'}</p><dl>{shortcuts.map(([key, text]) => <div key={key}><dt><Kbd>{key}</Kbd></dt><dd>{text}</dd></div>)}</dl></div>
       </Popover>
 
-      {menu && <div className="board-create-menu" style={{ left: menu.left, top: menu.top }} role="menu" aria-label={menu.nodeId ? '创作伙伴' : '在此处添加'} data-testid="board-context-menu" onKeyDown={event => {
+      {shownMenu && <div className="board-create-menu" data-state={menu ? 'open' : 'closed'} inert={!menu} style={{ left: shownMenu.left, top: shownMenu.top }} role="menu" aria-label={shownMenu.nodeId ? '创作伙伴' : '在此处添加'} data-testid="board-context-menu" onKeyDown={event => {
         if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); setMenu(null); return; }
         if (!['ArrowDown', 'ArrowUp'].includes(event.key) || (event.target as HTMLElement).closest('input')) return;
         event.preventDefault();
         const items = [...event.currentTarget.querySelectorAll<HTMLButtonElement>(':scope > button')], index = items.indexOf(document.activeElement as HTMLButtonElement);
         items[(index + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length]?.focus();
       }}>
-        {menu.nodeId ? <>
-          <span className="menu-caption"><Sparkles aria-hidden="true" />创作伙伴 · {nodeTitle(menu.nodeId)}</span>
-          {nodePrompts(menu.nodeId).map((prompt, index) => <button key={prompt.label} role="menuitem" autoFocus={index === 0} data-testid="companion-menu-item" onClick={() => summon(menu.screen, sourceReferences(selectedIds.includes(menu.nodeId!) ? selectedIds : [menu.nodeId!]), prompt.message, `${prompt.label} · ${nodeTitle(menu.nodeId!)}`, prompt.kind, undefined, prompt.focus)}>
+        {shownMenu.nodeId ? <>
+          <span className="menu-caption"><Sparkles aria-hidden="true" />创作伙伴 · {nodeTitle(shownMenu.nodeId)}</span>
+          {nodePrompts(shownMenu.nodeId).map((prompt, index) => <button key={prompt.label} role="menuitem" autoFocus={index === 0} data-testid="companion-menu-item" onClick={() => summon(shownMenu.screen, sourceReferences(selectedIds.includes(shownMenu.nodeId!) ? selectedIds : [shownMenu.nodeId!]), prompt.message, `${prompt.label} · ${nodeTitle(shownMenu.nodeId!)}`, prompt.kind, undefined, prompt.focus)}>
             {prompt.label.includes('追问') ? <MessageCircleQuestion aria-hidden="true" /> : <Sparkles aria-hidden="true" />}{prompt.label}</button>)}
-          <button role="menuitem" onClick={() => summon(menu.screen, sourceReferences([menu.nodeId!]), undefined, nodeTitle(menu.nodeId!))}>自己说…</button>
+          <button role="menuitem" onClick={() => summon(shownMenu.screen, sourceReferences([shownMenu.nodeId!]), undefined, nodeTitle(shownMenu.nodeId!))}>自己说…</button>
         </> : <>
-        {panePrompts.map(prompt => <button key={prompt.label} role="menuitem" data-testid="companion-menu-item" onClick={() => summon(menu.screen, [], prompt.message, prompt.label, companionMode, mode === 'canvas' ? menu.point : undefined)}>{prompt.label.includes('追问') ? <MessageCircleQuestion aria-hidden="true" /> : <Sparkles aria-hidden="true" />}{prompt.label}</button>)}
+        {panePrompts.map(prompt => <button key={prompt.label} role="menuitem" data-testid="companion-menu-item" onClick={() => summon(shownMenu.screen, [], prompt.message, prompt.label, companionMode, mode === 'canvas' ? shownMenu.point : undefined)}>{prompt.label.includes('追问') ? <MessageCircleQuestion aria-hidden="true" /> : <Sparkles aria-hidden="true" />}{prompt.label}</button>)}
         <span className="menu-sep" aria-hidden="true" />
         {mode === 'canvas' ? <>
-          <button role="menuitem" autoFocus onClick={() => createCard('note', undefined, menu.point)}><StickyNote aria-hidden="true" />添加便笺</button>
-          <button role="menuitem" onClick={() => createCard('group', undefined, menu.point)}><Layers aria-hidden="true" />添加分组</button>
-          <div className="menu-combobox"><span className="menu-caption">在此引用素材或场景</span><Combobox label="在此添加素材引用" placeholder="搜索…" items={referenceItems} onPick={item => addReference(item, menu.point)} /></div>
-        </> : <button role="menuitem" autoFocus onClick={() => createSceneOrEvent(menu.point)}><Plus aria-hidden="true" />添加{mode === 'world' ? '世界事件' : '场景'}</button>}
+          <button role="menuitem" autoFocus onClick={() => createCard('note', undefined, shownMenu.point)}><StickyNote aria-hidden="true" />添加便笺</button>
+          <button role="menuitem" onClick={() => createCard('group', undefined, shownMenu.point)}><Layers aria-hidden="true" />添加分组</button>
+          <div className="menu-combobox"><span className="menu-caption">在此引用素材或场景</span><Combobox label="在此添加素材引用" placeholder="搜索…" items={referenceItems} onPick={item => addReference(item, shownMenu.point)} /></div>
+        </> : <button role="menuitem" autoFocus onClick={() => createSceneOrEvent(shownMenu.point)}><Plus aria-hidden="true" />添加{mode === 'world' ? '世界事件' : '场景'}</button>}
         </>}
       </div>}
     </div>

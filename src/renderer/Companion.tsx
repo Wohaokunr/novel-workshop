@@ -1,13 +1,15 @@
 import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
-import { ArrowRight, ArrowUpRight, Check, CornerDownLeft, GripHorizontal, Layers, LoaderCircle, MessageCircleQuestion, PanelRight, RefreshCw, Sparkles, Square, StickyNote, Trash2, Undo2, UserPlus, X } from 'lucide-react';
+import { ArrowDown, ArrowRight, ArrowUp, Check, ChevronRight, CornerDownRight, GitBranch, GripHorizontal, Layers, Lightbulb, ListTree, LoaderCircle, MessageCircleQuestion, MessagesSquare, PanelRight, PenLine, RefreshCw, Sparkles, Square, StickyNote, Trash2, Undo2, UserPlus, Workflow, X, type LucideIcon } from 'lucide-react';
 import type { Workspace } from '../shared/types';
 import type { CompanionAnchor, CompanionIntensity, CompanionMode, CompanionNovelField, CompanionOp, CompanionProposal, CompanionThread, CompanionTurn } from '../shared/companion-types';
 import { companionModeNames, focusNames, ideaKindNames, intensityNames, novelFieldNames } from '../shared/companion-types';
 import { nextStage } from '../shared/story-flow';
 import { companionCommands, selectCompanionItems } from '../shared/companion';
 import { personNames, scaleNames } from '../shared/style-types';
-import { fire, orderedScenes, uid } from './ui';
+import { fire, orderedScenes, relativeTime, uid } from './ui';
+import { usePresence } from './interaction';
+import Markdown from './Markdown';
 
 export interface SummonRequest {
   mode: CompanionMode; anchor: CompanionAnchor;
@@ -104,14 +106,18 @@ export function CompanionProvider({ workspace, children, beforeChange, onError, 
     panelThread, setPanelThread,
     openInPanel: threadId => { setPopover(null); setPanelThread(threadId); showPanel(); },
   };
+  // Keep the last dialog for a moment after closing so it can play its exit animation.
+  const lastPopover = useRef(popover); if (popover) lastPopover.current = popover;
+  const presence = usePresence(!!popover, 140);
+  const shown = popover ?? (presence.mounted ? lastPopover.current : null);
   return <CompanionContext.Provider value={api}>
     {children}
-    {popover && workspace && <CompanionPopover key={`${popover.x}:${popover.y}`} state={popover} workspace={workspace}
-      onThread={threadId => setPopover(old => old ? { ...old, threadId } : old)} onClose={() => { const opener = popover.opener; setPopover(null); opener?.focus?.(); }}/>}
+    {shown && workspace && <CompanionPopover key={`${shown.x}:${shown.y}`} state={shown} workspace={workspace} closing={!popover}
+      onThread={threadId => setPopover(old => old ? { ...old, threadId } : old)} onClose={() => { const opener = shown.opener; setPopover(null); opener?.focus?.(); }}/>}
   </CompanionContext.Provider>;
 }
 
-function CompanionPopover({ state, workspace, onThread, onClose }: { state: PopoverState; workspace: Workspace; onThread: (id: string) => void; onClose: () => void }) {
+function CompanionPopover({ state, workspace, closing, onThread, onClose }: { state: PopoverState; workspace: Workspace; closing: boolean; onThread: (id: string) => void; onClose: () => void }) {
   const companion = useCompanion();
   const ref = useRef<HTMLDivElement>(null);
   const [position, setPosition] = useState({ left: state.x + 12, top: state.y + 8 });
@@ -139,11 +145,12 @@ function CompanionPopover({ state, workspace, onThread, onClose }: { state: Popo
     return () => { observer.disconnect(); removeEventListener('resize', clamp); };
   }, []);
   useEffect(() => {
+    if (closing) return;
     const key = (event: KeyboardEvent) => { if (event.key === 'Escape' && !event.isComposing) { event.preventDefault(); event.stopPropagation(); onClose(); } };
     addEventListener('keydown', key, true);
     return () => removeEventListener('keydown', key, true);
-  }, [onClose]);
-  return createPortal(<div ref={ref} className="companion-popover" role="dialog" aria-label={`创作伙伴 · ${companionModeNames[thread?.mode ?? state.mode]}`} style={position} data-testid="companion-popover"
+  }, [onClose, closing]);
+  return createPortal(<div ref={ref} className="companion-popover" data-state={closing ? 'closed' : 'open'} inert={closing} role="dialog" aria-label={`创作伙伴 · ${companionModeNames[thread?.mode ?? state.mode]}`} style={position} data-testid="companion-popover"
     onPointerMove={event => { if (drag.current) setPosition({ left: Math.max(0, event.clientX - drag.current.dx), top: Math.max(0, event.clientY - drag.current.dy) }); }}
     onPointerUp={() => { drag.current = null; }}>
     <header className="companion-head" onPointerDown={event => {
@@ -168,35 +175,68 @@ export function CompanionThreadView({ workspace, thread, mode, anchor, onThread,
   const [message, setMessage] = useState('');
   const [sending, setSending] = useState(false);
   const scroller = useRef<HTMLDivElement>(null);
+  const input = useRef<HTMLTextAreaElement>(null);
+  /** Follow new replies only while the author is reading the end of the conversation. */
+  const pinned = useRef(true);
+  const [behind, setBehind] = useState(false);
   const streaming = thread?.status === 'streaming';
   const turns = thread?.turns ?? [];
-  useEffect(() => { const element = scroller.current; if (element) element.scrollTop = element.scrollHeight; }, [turns.length, thread?.streaming, streaming]);
+  const toEnd = (smooth = false) => { const element = scroller.current; if (element) element.scrollTo({ top: element.scrollHeight, behavior: smooth ? 'smooth' : 'auto' }); };
+  useEffect(() => { if (pinned.current) toEnd(); else setBehind(true); }, [turns.length, thread?.streaming, streaming]);
+  useLayoutEffect(() => {
+    const element = input.current; if (!element) return;
+    element.style.height = 'auto';
+    element.style.height = `${Math.min(element.scrollHeight, compact ? 120 : 160)}px`;
+  }, [message, compact]);
   const submit = (text: string, retry = false) => {
     if ((!text.trim() && !retry) || sending || streaming) return;
-    setSending(true);
+    setSending(true); pinned.current = true; setBehind(false);
     fire(companion.send({ thread, mode, anchor }, text.trim(), retry).then(next => { if (next) { if (!retry) setMessage(''); onThread?.(next.id); } }).finally(() => setSending(false)));
   };
   const lastCompanion = [...turns].reverse().find(turn => turn.role === 'companion');
+  const followUps = !streaming && lastCompanion === turns.at(-1) ? lastCompanion?.response?.followUps ?? [] : [];
   return <div className={`companion-thread ${compact ? 'compact' : ''}`} data-testid="companion-thread" data-thread-id={thread?.id ?? ''} data-status={thread?.status ?? 'new'}>
-    <div className="companion-scroll" ref={scroller}>
-      {!turns.length && <CompanionIntro mode={mode}/>}
+    <div className="companion-scroll" ref={scroller} onScroll={event => {
+      const element = event.currentTarget, near = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
+      pinned.current = near; if (near) setBehind(false);
+    }}>
+      {!turns.length && <CompanionIntro mode={mode} disabled={sending || streaming} onPick={text => submit(text)}/>}
       {turns.map(turn => turn.role === 'author'
-        ? <p key={turn.id} className="companion-author">{turn.text}</p>
-        : <CompanionReply key={turn.id} workspace={workspace} thread={thread!} turn={turn} latest={turn === lastCompanion} onAnswer={text => submit(text)}/>)}
-      {streaming && <div className="companion-reply streaming" aria-live="polite"><p>{thread?.streaming || <span className="companion-typing"><i/><i/><i/></span>}</p></div>}
+        ? <div key={turn.id} className="companion-msg author"><p className="companion-author">{turn.text}</p><time dateTime={turn.at}>{relativeTime(turn.at)}</time></div>
+        : <PartnerMessage key={turn.id} at={turn.at}><CompanionReply workspace={workspace} thread={thread!} turn={turn} latest={turn === lastCompanion} onAnswer={text => submit(text)}/></PartnerMessage>)}
+      {streaming && <PartnerMessage live><div className="companion-reply streaming" aria-live="polite">
+        {thread?.streaming ? <Markdown text={thread.streaming} streaming/> : <div className="companion-thinking"><span><Sparkles aria-hidden="true"/>正在构思…</span><i/><i/><i/></div>}
+      </div></PartnerMessage>}
       {thread?.status === 'failed' && <div className="companion-error" role="alert"><span>{thread.error || '回复失败'}</span>{turns.at(-1)?.role === 'author' && <button className="small" onClick={() => submit('', true)}><RefreshCw aria-hidden="true"/>重试</button>}</div>}
+      {!streaming && Object.keys(lastCompanion?.adopted ?? {}).length > 0 && <NextStep workspace={workspace} thread={thread!}/>}
+      {followUps.length > 0 && <div className="companion-followups" aria-label="接着问">{followUps.map((text, index) => <button key={text} className="chip" style={stagger(index)} onClick={() => submit(text)}><CornerDownRight aria-hidden="true"/>{text}</button>)}</div>}
     </div>
-    {!streaming && Object.keys(lastCompanion?.adopted ?? {}).length > 0 && <NextStep workspace={workspace} thread={thread!}/>}
-    {lastCompanion?.response?.followUps.length && !streaming ? <div className="companion-followups">{lastCompanion.response.followUps.map(text => <button key={text} className="chip" onClick={() => submit(text)}>{text}</button>)}</div> : null}
+    {behind && <button type="button" className="small companion-jump" onClick={() => { pinned.current = true; setBehind(false); toEnd(true); }}><ArrowDown aria-hidden="true"/>最新回复</button>}
     <form className="companion-composer" onSubmit={event => { event.preventDefault(); submit(message); }}>
-      <textarea data-testid="companion-input" value={message} rows={compact ? 2 : 3} placeholder={placeholders[thread?.mode ?? mode]} onChange={event => setMessage(event.target.value)}
-        onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); submit(message); } }}/>
+      <div className={`composer-box ${streaming ? 'busy' : ''}`}>
+        <textarea ref={input} data-testid="companion-input" value={message} rows={1} placeholder={placeholders[thread?.mode ?? mode]} onChange={event => setMessage(event.target.value)}
+          onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); submit(message); } }}/>
+        {streaming ? <button type="button" className="icon-button composer-send stop" title="停止回复" aria-label="停止回复" onClick={() => thread && fire(companion.cancel(thread))}><Square aria-hidden="true"/></button>
+          : <button className="icon-button composer-send primary" data-testid="companion-send" title="发送（Enter）" aria-label="发送" disabled={!message.trim() || sending}>{sending ? <LoaderCircle className="spin" aria-hidden="true"/> : <ArrowUp aria-hidden="true"/>}</button>}
+      </div>
       <div className="companion-composer-bar">
         <div className="segmented" role="radiogroup" aria-label="发散强度">{(Object.keys(intensityNames) as CompanionIntensity[]).map(value => <button type="button" key={value} role="radio" aria-checked={companion.intensity === value} className={companion.intensity === value ? 'active' : ''} onClick={() => companion.setIntensity(value)}>{intensityNames[value]}</button>)}</div>
-        {streaming ? <button type="button" className="small ghost-danger" onClick={() => thread && fire(companion.cancel(thread))}><Square aria-hidden="true"/>停止</button>
-          : <button className="small primary" data-testid="companion-send" disabled={!message.trim() || sending}>{sending ? <LoaderCircle className="spin" aria-hidden="true"/> : <CornerDownLeft aria-hidden="true"/>}发送</button>}
+        <span className="composer-hint">Enter 发送 · Shift+Enter 换行</span>
       </div>
     </form>
+  </div>;
+}
+
+/** Staggered entrance for lists; capped so long lists don't wait. */
+const stagger = (index: number) => ({ '--i': Math.min(index, 6) } as React.CSSProperties);
+
+function PartnerMessage({ at, live = false, children }: { at?: string; live?: boolean; children: ReactNode }) {
+  return <div className={`companion-msg partner ${live ? 'live' : ''}`}>
+    <span className="ai-mark companion-avatar" aria-hidden="true"><Sparkles/></span>
+    <div className="companion-msg-body">
+      <div className="companion-msg-meta"><strong>创作伙伴</strong>{live ? <span className="live-dot" aria-hidden="true"/> : at && <time dateTime={at}>{relativeTime(at)}</time>}</div>
+      {children}
+    </div>
   </div>;
 }
 
@@ -211,7 +251,19 @@ function NextStep({ workspace, thread }: { workspace: Workspace; thread: Compani
     <Sparkles aria-hidden="true"/><span><strong>下一步：{next.label}</strong>{assist.label}</span><ArrowRight aria-hidden="true"/></button>;
 }
 
-function CompanionIntro({ mode }: { mode: CompanionMode }) {
+const modeIcons: Record<CompanionMode, LucideIcon> = { diverge: Lightbulb, causality: GitBranch, structure: Workflow, outline: ListTree, beat: PenLine, develop: Sparkles, style: PenLine };
+/** Openers shown on an empty conversation; one click sends them. */
+const starters: Record<CompanionMode, string[]> = {
+  diverge: ['往几个截然不同的方向发散', '给我一个出人意料的反转', '先问我几个问题'],
+  causality: ['往后推演两三步后果', '补一个关键前因', '如果这件事没发生呢？'],
+  structure: ['诊断整体节奏', '换一个更抓人的开篇', '哪里的揭露太早了？'],
+  outline: ['先定故事骨架', '给我 3 个版本比较', '展开下一层'],
+  beat: ['给我几个下一拍', '让冲突升级一点', '这一场怎么收尾？'],
+  develop: ['根据已有信息推断', '先问我几个选择题', '直接给我几个版本'],
+  style: ['描述一下我的笔触', '给我几段盲测', '列出该避免的写法'],
+};
+
+function CompanionIntro({ mode, disabled, onPick }: { mode: CompanionMode; disabled: boolean; onPick: (text: string) => void }) {
   const text: Record<CompanionMode, string> = {
     diverge: '我会给你几个方向截然不同的点子，也会追问一些你可能还没想清楚的问题。喜欢的点子一键放到画布。',
     causality: '告诉我想往前追溯原因，还是往后推演后果。采纳的事件会接进世界因果图。',
@@ -221,7 +273,17 @@ function CompanionIntro({ mode }: { mode: CompanionMode }) {
     develop: '我会从你已经写下的一切推断你想写什么。信息太少时先问你几个选择题，够了就直接给几个版本，选中即可采纳，随时可撤销。',
     style: '我会读你的范文，把笔触说成写作者能照着写的画像、旋钮和规则；盲测时只给你几段不同写法，挑最像你的那一段。采纳随时可撤销。',
   };
-  return <p className="companion-intro">{text[mode]}</p>;
+  const Icon = modeIcons[mode];
+  return <div className="companion-intro-card">
+    <span className="companion-intro-icon" aria-hidden="true"><Icon/></span>
+    <strong>{companionModeNames[mode]}</strong>
+    <p className="companion-intro">{text[mode]}</p>
+    <div className="companion-starters">{starters[mode].map((starter, index) => <button key={starter} type="button" className="chip" style={stagger(index)} disabled={disabled} onClick={() => onPick(starter)}>{starter}<ChevronRight aria-hidden="true"/></button>)}</div>
+  </div>;
+}
+
+function SectionTitle({ icon: Icon, label, count }: { icon: LucideIcon; label: string; count?: number }) {
+  return <div className="companion-section-title"><Icon aria-hidden="true"/>{label}{!!count && <span>{count}</span>}</div>;
 }
 
 function CompanionReply({ workspace, thread, turn, latest, onAnswer }: { workspace: Workspace; thread: CompanionThread; turn: CompanionTurn; latest: boolean; onAnswer: (text: string) => void }) {
@@ -231,42 +293,48 @@ function CompanionReply({ workspace, thread, turn, latest, onAnswer }: { workspa
   const adopted = turn.adopted ?? {};
   const busy = useRef(false);
   const act = (work: () => Promise<void>) => { if (busy.current) return; busy.current = true; fire(work().finally(() => { busy.current = false; })); };
-  if (!response) return <div className="companion-reply"><p>{turn.text}</p></div>;
+  if (!response) return <div className="companion-reply"><Markdown text={turn.text}/></div>;
   const freshIdeas = response.ideas.filter(idea => !adopted[idea.id]);
   const answered = response.questions.filter(question => answers[question.id]?.trim());
   const canvas = thread.mode !== 'beat';
+  const answer = () => onAnswer(answered.map(item => `关于「${item.question}」：${answers[item.id]!.trim()}`).join('\n'));
   return <div className="companion-reply" data-testid="companion-reply">
-    {response.reply && <p>{response.reply}</p>}
+    {response.reply && <Markdown text={response.reply}/>}
     {!!response.questions.length && <div className="companion-questions">
-      {response.questions.map(question => <div key={question.id} className="companion-question" data-testid="companion-question">
-        <span><MessageCircleQuestion aria-hidden="true"/><strong>{question.question}</strong></span>
+      <SectionTitle icon={MessageCircleQuestion} label="追问" count={response.questions.length}/>
+      {response.questions.map((question, index) => <div key={question.id} className={`companion-question ${answers[question.id]?.trim() ? 'answered' : ''}`} data-testid="companion-question" style={stagger(index)}>
+        <span><b className="q-index">{answers[question.id]?.trim() ? <Check aria-hidden="true"/> : index + 1}</b><strong>{question.question}</strong></span>
         {question.why && <small>{question.why}</small>}
         {latest && !!question.options?.length && <div className="question-options" role="radiogroup" aria-label={question.question}>{question.options.map(option =>
           <button key={option} type="button" role="radio" aria-checked={answers[question.id] === option} className={`chip ${answers[question.id] === option ? 'selected' : ''}`} data-testid="question-option"
-            onClick={() => setAnswers(old => ({ ...old, [question.id]: old[question.id] === option ? '' : option }))}>{option}</button>)}</div>}
+            onClick={() => setAnswers(old => ({ ...old, [question.id]: old[question.id] === option ? '' : option }))}>{answers[question.id] === option && <Check aria-hidden="true"/>}{option}</button>)}</div>}
         {latest && <input aria-label={`回答：${question.question}`} value={answers[question.id] ?? ''} placeholder={question.options?.length ? '其他想法…（可跳过）' : '你的想法…（可跳过）'} onChange={event => setAnswers(old => ({ ...old, [question.id]: event.target.value }))}
-          onKeyDown={event => { if (event.key === 'Enter' && !event.nativeEvent.isComposing && answered.length) { event.preventDefault(); onAnswer(answered.map(item => `关于「${item.question}」：${answers[item.id]!.trim()}`).join('\n')); } }}/>}
+          onKeyDown={event => { if (event.key === 'Enter' && !event.nativeEvent.isComposing && answered.length) { event.preventDefault(); answer(); } }}/>}
       </div>)}
-      {latest && <button className="small" data-testid="answer-questions" disabled={!answered.length} onClick={() => onAnswer(answered.map(item => `关于「${item.question}」：${answers[item.id]!.trim()}`).join('\n'))}>回答并继续</button>}
+      {latest && <button className="small primary" data-testid="answer-questions" disabled={!answered.length} onClick={answer}>回答并继续{answered.length ? `（${answered.length}/${response.questions.length}）` : ''}<ArrowRight aria-hidden="true"/></button>}
     </div>}
     {!!response.ideas.length && <div className="companion-ideas">
-      {response.ideas.map(idea => {
+      <SectionTitle icon={Lightbulb} label="点子" count={response.ideas.length}/>
+      {response.ideas.map((idea, index) => {
         const batch = adopted[idea.id];
-        return <article key={idea.id} className={`companion-idea ${batch ? 'adopted' : ''}`} data-testid="companion-idea">
-          <header><span className={`idea-kind kind-${idea.kind}`}>{ideaKindNames[idea.kind]}</span><strong>{idea.title}</strong></header>
-          <p>{idea.content}</p>
+        return <article key={idea.id} className={`companion-idea kind-${idea.kind} ${batch ? 'adopted' : ''}`} data-testid="companion-idea" style={stagger(index)}>
+          <header><span className={`idea-kind kind-${idea.kind}`}>{ideaKindNames[idea.kind]}</span><strong>{idea.title}</strong>{batch && <span className="adopted-mark"><Check aria-hidden="true"/>已采纳</span>}</header>
+          <Markdown text={idea.content}/>
           {idea.hook && <p className="idea-hook">{idea.hook}</p>}
           <div className="button-row">
-            {batch ? <><span className="adopted-mark"><Check aria-hidden="true"/>已采纳</span><button className="small ghost" onClick={() => act(() => companion.undo(thread, batch))}><Undo2 aria-hidden="true"/>撤销</button></>
+            {batch ? <button className="small ghost" onClick={() => act(() => companion.undo(thread, batch))}><Undo2 aria-hidden="true"/>撤销</button>
               : <>{thread.mode === 'beat' && <button className="small" data-testid="adopt-idea-outline" onClick={() => act(() => companion.adopt(thread, turn, [idea.id], { target: 'sceneOutline' }))}>补进场景大纲</button>}
                 {idea.kind === 'character' && <button className="small" data-testid="adopt-idea-character" onClick={() => act(() => companion.adopt(thread, turn, [idea.id], { as: 'character' }))}><UserPlus aria-hidden="true"/>设为人物</button>}
                 {canvas || thread.anchor.surface === 'writer' ? <button className="small" data-testid="adopt-idea" onClick={() => act(() => companion.adopt(thread, turn, [idea.id], { target: 'canvas' }))}><StickyNote aria-hidden="true"/>放到画布</button> : null}</>}
           </div>
         </article>;
       })}
-      {freshIdeas.length > 1 && canvas && <button className="small" data-testid="adopt-ideas-group" onClick={() => act(() => companion.adopt(thread, turn, freshIdeas.map(idea => idea.id), { group: true, target: 'canvas' }))}><Layers aria-hidden="true"/>剩余 {freshIdeas.length} 条放进新分组</button>}
+      {freshIdeas.length > 1 && canvas && <button className="small adopt-all" data-testid="adopt-ideas-group" onClick={() => act(() => companion.adopt(thread, turn, freshIdeas.map(idea => idea.id), { group: true, target: 'canvas' }))}><Layers aria-hidden="true"/>剩余 {freshIdeas.length} 条放进新分组</button>}
     </div>}
-    {response.proposals.map(proposal => <ProposalCard key={proposal.id} workspace={workspace} thread={thread} turn={turn} proposal={proposal} onAct={act}/>)}
+    {!!response.proposals.length && <div className="companion-proposals">
+      <SectionTitle icon={ListTree} label={thread.mode === 'style' && thread.anchor.focus === 'blindtest' ? '盲测' : '方案'} count={response.proposals.length > 1 ? response.proposals.length : undefined}/>
+      {response.proposals.map((proposal, index) => <ProposalCard key={proposal.id} index={index} workspace={workspace} thread={thread} turn={turn} proposal={proposal} onAct={act}/>)}
+    </div>}
   </div>;
 }
 
@@ -282,7 +350,7 @@ function opTree(proposal: CompanionProposal): OpNode[] {
 }
 function descendants(node: OpNode): string[] { return [node.op.id, ...node.children.flatMap(descendants)]; }
 
-function ProposalCard({ workspace, thread, turn, proposal, onAct }: { workspace: Workspace; thread: CompanionThread; turn: CompanionTurn; proposal: CompanionProposal; onAct: (work: () => Promise<void>) => void }) {
+function ProposalCard({ index, workspace, thread, turn, proposal, onAct }: { index: number; workspace: Workspace; thread: CompanionThread; turn: CompanionTurn; proposal: CompanionProposal; onAct: (work: () => Promise<void>) => void }) {
   const companion = useCompanion();
   const adopted = turn.adopted ?? {};
   const isAdopted = (op: CompanionOp) => !!adopted[`${proposal.id}#${op.id}`];
@@ -339,12 +407,17 @@ function ProposalCard({ workspace, thread, turn, proposal, onAct }: { workspace:
   };
   // Blind test: the passage alone, so the author chooses by ear; its dials show once chosen.
   const blind = thread.mode === 'style' && thread.anchor.focus === 'blindtest';
-  return <section className={`companion-proposal ${blind ? 'blind-test' : ''}`} data-testid="companion-proposal">
-    <header><strong>{proposal.title}</strong>{proposal.summary && <p className={blind ? 'style-passage' : undefined}>{proposal.summary}</p>}</header>
+  const done = proposal.ops.length - pending.length;
+  return <section className={`companion-proposal ${blind ? 'blind-test' : ''} ${!pending.length ? 'adopted' : ''}`} data-testid="companion-proposal" style={stagger(index)}>
+    <header>
+      <div className="proposal-title"><b className="proposal-index">{blind ? String.fromCharCode(65 + index) : index + 1}</b><strong>{proposal.title}</strong>
+        {!(blind && !batches.length) && <span className="proposal-count">{done ? `${done}/${proposal.ops.length} 已采纳` : `${proposal.ops.length} 项`}</span>}</div>
+      {proposal.summary && (blind ? <p className="style-passage">{proposal.summary}</p> : <Markdown text={proposal.summary} className="proposal-summary"/>)}
+    </header>
     {!!preview.length && <div className="structure-preview">{preview.map(row => <div key={row.chapter}><span className="eyebrow">{row.chapter}</span>
       <ol className="before">{row.before.map(title => <li key={title}>{title}</li>)}</ol><span aria-hidden="true">→</span><ol className="after">{row.after.map(title => <li key={title}>{title}</li>)}</ol></div>)}</div>}
     {blind && !batches.length ? <p className="muted blind-note">选中后揭晓这一版对应的笔调。</p> : <ul className="op-tree">{tree.map(node => renderNode(node, 0))}</ul>}
-    <div className="button-row">
+    <div className="button-row proposal-actions">
       {!!pending.length && <button className="small primary" data-testid="adopt-proposal" disabled={!chosen.length} onClick={() => onAct(() => companion.adopt(thread, turn, itemIds))}>
         <Check aria-hidden="true"/>{blind && !batches.length ? '这段最像我' : chosen.length === pending.length ? (batches.length ? '采纳其余部分' : '采纳这个方案') : `采纳所选 ${chosen.length} 项`}</button>}
       {batches.map(batch => <button key={batch} className="small ghost" onClick={() => onAct(() => companion.undo(thread, batch))}><Undo2 aria-hidden="true"/>撤销{batches.length > 1 ? '一次' : ''}采纳</button>)}
@@ -392,24 +465,30 @@ export function CompanionPanel({ workspace, defaultAnchor }: { workspace: Worksp
   const selected = companion.panelThread;
   const draft = selected.startsWith('new:') ? (() => { const [, value, ...rest] = selected.split(':'); try { return { mode: value as CompanionMode, anchor: JSON.parse(rest.join(':')) as CompanionAnchor }; } catch { return undefined; } })() : undefined;
   const thread = companion.threads.find(item => item.id === selected);
-  if (thread || draft) return <div className="companion-panel" data-testid="companion-panel">
-    <div className="companion-panel-head">
-      <button className="small ghost" onClick={() => companion.setPanelThread('')}>← 全部对话</button>
-      <span className="eyebrow">{companionModeNames[thread?.mode ?? draft!.mode]} · {surfaceNames[(thread?.anchor ?? draft!.anchor).surface]}</span>
-      {thread && <button className="icon-button small ghost text-danger" title="删除对话" aria-label="删除对话" onClick={() => fire(companion.remove(thread).then(() => companion.setPanelThread('')))}><Trash2/></button>}
-    </div>
-    <CompanionThreadView workspace={workspace} thread={thread} mode={thread?.mode ?? draft!.mode} anchor={thread?.anchor ?? draft!.anchor} onThread={id => companion.setPanelThread(id)}/>
-  </div>;
+  if (thread || draft) {
+    const current = thread?.mode ?? draft!.mode, Icon = modeIcons[current];
+    return <div className="companion-panel in-thread" data-testid="companion-panel">
+      <div className="companion-panel-head">
+        <button className="icon-button small ghost" title="全部对话" aria-label="返回全部对话" onClick={() => companion.setPanelThread('')}><ArrowRight className="flip" aria-hidden="true"/></button>
+        <span className="companion-panel-icon" aria-hidden="true"><Icon/></span>
+        <div><strong>{thread?.title || companionModeNames[current]}</strong><span className="eyebrow">{companionModeNames[current]} · {surfaceNames[(thread?.anchor ?? draft!.anchor).surface]}</span></div>
+        {thread && <button className="icon-button small ghost text-danger" title="删除对话" aria-label="删除对话" onClick={() => fire(companion.remove(thread).then(() => companion.setPanelThread('')))}><Trash2/></button>}
+      </div>
+      <CompanionThreadView workspace={workspace} thread={thread} mode={current} anchor={thread?.anchor ?? draft!.anchor} onThread={id => companion.setPanelThread(id)}/>
+    </div>;
+  }
   return <div className="companion-panel" data-testid="companion-panel">
     <div className="companion-start">
-      <p className="muted">和创作伙伴聊聊还没成形的想法。也可以在画布、因果图、叙述顺序或大纲上右键，在当前位置唤出它。</p>
-      <div className="segmented" role="radiogroup" aria-label="对话类型">{(['develop', 'diverge', 'outline', 'structure', 'causality'] as CompanionMode[]).map(value => <button key={value} role="radio" aria-checked={mode === value} className={mode === value ? 'active' : ''} onClick={() => setMode(value)}>{companionModeNames[value]}</button>)}</div>
+      <div className="companion-start-head"><span className="ai-mark" aria-hidden="true"><MessagesSquare/></span><div><strong>和创作伙伴聊聊</strong><p className="muted">还没成形的想法也可以。也能在画布、因果图、叙述顺序或大纲上右键，就地唤出它。</p></div></div>
+      <div className="mode-picker" role="radiogroup" aria-label="对话类型">{(['develop', 'diverge', 'outline', 'structure', 'causality'] as CompanionMode[]).map(value => { const Icon = modeIcons[value]; return <button key={value} role="radio" aria-checked={mode === value} className={mode === value ? 'active' : ''} onClick={() => setMode(value)}><Icon aria-hidden="true"/>{companionModeNames[value]}</button>; })}</div>
       <button className="primary" data-testid="companion-new" onClick={() => companion.setPanelThread(`new:${mode}:${JSON.stringify({ ...defaultAnchor, surface: 'panel', ...(mode === 'outline' ? { outlineNode: { kind: 'book' } } : {}), ...(mode === 'develop' ? { focus: 'profile' } : {}) })}`)}><Sparkles aria-hidden="true"/>开始新对话</button>
     </div>
-    <ul className="companion-list">{companion.threads.map(item => <li key={item.id}><button onClick={() => companion.setPanelThread(item.id)} data-testid="companion-thread-item">
-      <span className="eyebrow">{companionModeNames[item.mode]} · {surfaceNames[item.anchor.surface]}{item.status === 'streaming' ? ' · 回复中' : ''}</span>
-      <strong>{item.title}</strong><small>{item.turns.filter(turn => turn.role === 'author').length} 轮 · {new Date(item.updatedAt).toLocaleString()}</small><ArrowUpRight aria-hidden="true"/>
-    </button></li>)}</ul>
+    {!!companion.threads.length && <span className="companion-list-title">最近的对话 · {companion.threads.length}</span>}
+    <ul className="companion-list">{companion.threads.map((item, index) => { const Icon = modeIcons[item.mode]; return <li key={item.id} style={stagger(index)}><button onClick={() => companion.setPanelThread(item.id)} data-testid="companion-thread-item">
+      <span className="companion-list-icon" aria-hidden="true"><Icon/></span>
+      <span className="companion-list-text"><strong>{item.title}</strong><small>{companionModeNames[item.mode]} · {surfaceNames[item.anchor.surface]} · {item.turns.filter(turn => turn.role === 'author').length} 轮</small></span>
+      <span className="companion-list-meta">{item.status === 'streaming' ? <span className="live-dot" title="回复中"/> : item.status === 'failed' ? <small className="text-danger">失败</small> : <small>{relativeTime(item.updatedAt)}</small>}<ChevronRight aria-hidden="true"/></span>
+    </button></li>; })}</ul>
     {!companion.threads.length && <p className="muted empty-line">还没有对话。</p>}
   </div>;
 }

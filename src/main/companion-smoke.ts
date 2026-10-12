@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { BrowserWindow } from 'electron';
 import type { NovelStore } from './store.js';
+import { cardRect } from '../shared/canvas.js';
 
 /** Desktop acceptance for the creative partner: every surface summons it, adoption writes undoable AI batches, threads persist. */
 export async function runCompanionSmoke(window: BrowserWindow, store: NovelStore) {
@@ -126,7 +127,7 @@ export async function runCompanionSmoke(window: BrowserWindow, store: NovelStore
   const threadId = await ui<string>(`document.querySelector('.companion-popover [data-testid="companion-thread"]').dataset.threadId`);
   assert.equal(store.getCompanionThread(project.id, threadId)!.turns.filter(turn => turn.role === 'author').length, 2);
   const cardsBefore = store.getProject(project.id).cards.length;
-  await ui(`document.querySelector('.companion-popover [data-testid="companion-reply"]:last-of-type [data-testid="adopt-idea"]').click()`);
+  await ui(`[...document.querySelectorAll('.companion-popover [data-testid="companion-reply"]')].at(-1).querySelector('[data-testid="adopt-idea"]').click()`);
   await until(() => store.getProject(project.id).cards.length === cardsBefore + 1, '单个点子上画布');
   await click('adopt-ideas-group');
   const adopted = await until(() => { const value = store.getProject(project.id); return value.cards.some(card => card.kind === 'group') ? value : null; }, '其余点子进入新分组');
@@ -136,6 +137,14 @@ export async function runCompanionSmoke(window: BrowserWindow, store: NovelStore
   await clickText('.companion-popover [data-testid="companion-idea"].adopted button', '撤销');
   await until(() => store.getProject(project.id).cards.length < adopted.cards.length, '撤销一次采纳');
   await closePopover();
+  // Auto-arrange: one undoable layout batch, and top-level cards no longer overlap.
+  const historyBeforeTidy = store.history(project.id).length;
+  await click('board-arrange');
+  await clickText('.arrange-menu button', '自动整理全部');
+  await until(() => store.history(project.id).length > historyBeforeTidy, '自动整理画布保存');
+  const tidied = store.getProject(project.id).cards.filter(card => !card.groupId).map(card => cardRect(card));
+  for (const a of tidied) for (const b of tidied) if (a !== b) assert.ok(!(a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height), '整理后顶层卡片不重叠');
+  await delay(500); await capture('companion-02b-canvas-tidied.png');
   // Blank canvas: "在这里发散…" opens an empty dialog at the cursor.
   await ui(`(() => { const e=document.querySelector('.react-flow__pane');const r=e.getBoundingClientRect();e.dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true,clientX:r.left+r.width-200,clientY:r.top+120,button:2})); })()`);
   await until(() => ui<boolean>(`!!(${el('board-context-menu')})`), '空白处右键');

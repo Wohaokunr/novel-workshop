@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useSyncExternalStore, type RefObject } from 'react';
+import { useCallback, useEffect, useState, useSyncExternalStore, type RefObject } from 'react';
 
 export function useMediaQuery(query: string) {
   const subscribe = useCallback((notify: () => void) => {
@@ -46,4 +46,20 @@ export function useModalFocus(panel: RefObject<HTMLElement | null>, active: bool
       if (!element.isConnected && opener.current?.isConnected && !document.querySelector('dialog[open]')) opener.current.focus({ preventScroll: true });
     };
   }, [active, panel, opener]);
+}
+
+/**
+ * Keep an element mounted long enough to play its exit animation.
+ * state is 'open' while shown and 'closed' while leaving; reduced motion unmounts at once.
+ */
+export function usePresence(open: boolean, duration = 140) {
+  const [mounted, setMounted] = useState(open);
+  useEffect(() => {
+    if (open) { setMounted(true); return; }
+    const ms = motionDuration(duration);
+    if (!ms) { setMounted(false); return; }
+    const timer = setTimeout(() => setMounted(false), ms);
+    return () => clearTimeout(timer);
+  }, [open, duration]);
+  return { mounted: open || mounted, state: open ? 'open' as const : 'closed' as const };
 }

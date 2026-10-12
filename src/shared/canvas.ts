@@ -191,3 +191,225 @@ export function placeCards(existing: readonly CanvasCard[], newCards: readonly C
   }
   newCards.forEach((card, index) => claim(card, originX + (index % columns) * gapX, originY + Math.floor(index / columns) * gapY));
 }
+
+/* ---------- alignment, snapping and automatic layout ---------- */
+
+export interface IdRect extends Rect { id: string }
+export type Placement = Point & { id: string };
+export type AlignMode = 'left' | 'hcenter' | 'right' | 'top' | 'vcenter' | 'bottom';
+
+/** Line up rects along one edge or center of their common bounds. */
+export function alignPositions(rects: readonly IdRect[], mode: AlignMode): Placement[] {
+  if (!rects.length) return [];
+  const left = Math.min(...rects.map(rect => rect.x)), right = Math.max(...rects.map(rect => rect.x + rect.width));
+  const top = Math.min(...rects.map(rect => rect.y)), bottom = Math.max(...rects.map(rect => rect.y + rect.height));
+  return rects.map(rect => ({
+    id: rect.id,
+    x: mode === 'left' ? left : mode === 'right' ? right - rect.width : mode === 'hcenter' ? (left + right) / 2 - rect.width / 2 : rect.x,
+    y: mode === 'top' ? top : mode === 'bottom' ? bottom - rect.height : mode === 'vcenter' ? (top + bottom) / 2 - rect.height / 2 : rect.y,
+  }));
+}
+
+/** Keep the outermost rects in place and space the rest with equal gaps along an axis. */
+export function distributePositions(rects: readonly IdRect[], axis: 'x' | 'y'): Placement[] {
+  const size = axis === 'x' ? 'width' : 'height';
+  const sorted = [...rects].sort((a, b) => a[axis] - b[axis]);
+  if (sorted.length < 3) return sorted.map(({ id, x, y }) => ({ id, x, y }));
+  const first = sorted[0]!, last = sorted.at(-1)!;
+  const span = last[axis] + last[size] - first[axis];
+  const gap = (span - sorted.reduce((sum, rect) => sum + rect[size], 0)) / (sorted.length - 1);
+  let cursor = first[axis];
+  return sorted.map(rect => {
+    const placed = { id: rect.id, x: rect.x, y: rect.y, [axis]: cursor };
+    cursor += rect[size] + gap;
+    return placed;
+  });
+}
+
+export interface AlignGuide { orientation: 'vertical' | 'horizontal'; position: number; from: number; to: number }
+/** Snap a moving rect to the edges or centers of others within threshold, returning the guides to draw. */
+export function snapPosition(moving: Rect, others: readonly Rect[], threshold = 6): Point & { guides: AlignGuide[] } {
+  const axis = (start: 'x' | 'y', size: 'width' | 'height') => {
+    let best: { delta: number; line: number } | undefined;
+    const own = [moving[start], moving[start] + moving[size] / 2, moving[start] + moving[size]];
+    for (const other of others) {
+      for (const line of [other[start], other[start] + other[size] / 2, other[start] + other[size]]) {
+        for (const edge of own) {
+          const delta = line - edge;
+          if (Math.abs(delta) <= threshold && (!best || Math.abs(delta) < Math.abs(best.delta))) best = { delta, line };
+        }
+      }
+    }
+    return best?.delta ?? 0;
+  };
+  const x = moving.x + axis('x', 'width'), y = moving.y + axis('y', 'height');
+  const placed = { ...moving, x, y };
+  const guides: AlignGuide[] = [];
+  const collect = (orientation: AlignGuide['orientation'], start: 'x' | 'y', size: 'width' | 'height', cross: 'x' | 'y', crossSize: 'width' | 'height') => {
+    const own = [placed[start], placed[start] + placed[size] / 2, placed[start] + placed[size]];
+    const lines = new Map<number, { from: number; to: number }>();
+    for (const other of others) {
+      for (const line of [other[start], other[start] + other[size] / 2, other[start] + other[size]]) {
+        if (!own.some(edge => Math.abs(edge - line) < .5)) continue;
+        const key = Math.round(line * 2) / 2, span = lines.get(key);
+        const from = Math.min(placed[cross], other[cross]), to = Math.max(placed[cross] + placed[crossSize], other[cross] + other[crossSize]);
+        lines.set(key, span ? { from: Math.min(span.from, from), to: Math.max(span.to, to) } : { from, to });
+      }
+    }
+    for (const [position, span] of lines) guides.push({ orientation, position, ...span });
+  };
+  if (x !== moving.x || others.length) collect('vertical', 'x', 'width', 'y', 'height');
+  if (y !== moving.y || others.length) collect('horizontal', 'y', 'height', 'x', 'width');
+  return { x, y, guides };
+}
+
+/** Rects in reading order: rows by vertical overlap, then left to right. */
+function readingOrder<T extends Rect>(rects: readonly T[]): T[] {
+  const rows: T[][] = [];
+  for (const rect of [...rects].sort((a, b) => a.y - b.y || a.x - b.x)) {
+    const row = rows.find(items => items.some(item => rect.y < item.y + item.height * .5 && item.y < rect.y + rect.height * .5));
+    if (row) row.push(rect); else rows.push([rect]);
+  }
+  return rows.flatMap(row => row.sort((a, b) => a.x - b.x));
+}
+
+/** Shelf-pack rects into rows from origin, keeping their rough reading order. */
+export function packGrid(rects: readonly IdRect[], options: { origin: Point; gap?: number; maxRowWidth?: number; ordered?: boolean }): Placement[] {
+  if (!rects.length) return [];
+  const gap = options.gap ?? 32;
+  const items = options.ordered ? [...rects] : readingOrder(rects);
+  const area = items.reduce((sum, rect) => sum + (rect.width + gap) * (rect.height + gap), 0);
+  const limit = options.maxRowWidth ?? Math.max(Math.sqrt(area) * 2, ...items.map(rect => rect.width));
+  const result: Placement[] = [];
+  let x = 0, y = 0, rowHeight = 0;
+  for (const rect of items) {
+    if (x > 0 && x + rect.width > limit) { x = 0; y += rowHeight + gap; rowHeight = 0; }
+    result.push({ id: rect.id, x: options.origin.x + x, y: options.origin.y + y });
+    x += rect.width + gap; rowHeight = Math.max(rowHeight, rect.height);
+  }
+  return result;
+}
+
+function translated(cards: CanvasCard[], id: string, dx: number, dy: number): void {
+  if (!dx && !dy) return;
+  for (const card of cards) if (card.id === id || isDescendant(cards, card.id, id)) { card.x += dx; card.y += dy; }
+}
+
+/** Groups of ids connected by links, in the order their first member appears. */
+function components(ids: readonly string[], edges: ReadonlyArray<readonly [string, string]>): string[][] {
+  const parent = new Map(ids.map(id => [id, id]));
+  const find = (id: string): string => { const up = parent.get(id)!; if (up === id) return id; const root = find(up); parent.set(id, root); return root; };
+  for (const [a, b] of edges) if (parent.has(a) && parent.has(b)) parent.set(find(a), find(b));
+  const result = new Map<string, string[]>();
+  for (const id of ids) { const root = find(id); result.set(root, [...(result.get(root) ?? []), id]); }
+  return [...result.values()];
+}
+
+/**
+ * Tidy the canvas: pack each group's members (deepest first) and shrink the group around them,
+ * then pack the top level. With cluster, linked cards are packed into blocks that stay together.
+ * ids limits the top level to those cards (and their contents).
+ */
+export function tidyCards(cards: readonly CanvasCard[], options: { sizes?: CardSizes; links?: readonly CanvasLink[]; ids?: readonly string[]; cluster?: boolean } = {}): CanvasCard[] {
+  const { sizes, links = [] } = options;
+  const next = cards.map(card => ({ ...card }));
+  const scope = options.ids ? rootCards(next, options.ids) : next.filter(card => !card.groupId);
+  const inScope = (card: CanvasCard) => scope.some(root => root.id === card.id || isDescendant(next, card.id, root.id));
+  const rectOf = (card: CanvasCard, expanded: boolean): IdRect => ({ id: card.id, ...cardRect(card, sizes, expanded) });
+  /** Linked descendants count as links between the cards that contain them. */
+  const owner = (id: string, siblings: ReadonlySet<string>) => {
+    let current: string | undefined = id;
+    while (current && !siblings.has(current)) current = next.find(card => card.id === current)?.groupId;
+    return current;
+  };
+  const pack = (members: CanvasCard[], origin: Point, expanded: boolean) => {
+    const ids = new Set(members.map(card => card.id));
+    const edges = options.cluster ? links.flatMap(link => { const a = owner(link.source, ids), b = owner(link.target, ids); return a && b && a !== b ? [[a, b] as const] : []; }) : [];
+    const ordered = readingOrder(members.map(card => rectOf(card, expanded)));
+    const blocks = options.cluster && edges.length ? components(ordered.map(rect => rect.id), edges) : [ordered.map(rect => rect.id)];
+    if (blocks.length === 1) {
+      for (const point of packGrid(ordered, { origin })) { const card = next.find(item => item.id === point.id)!; translated(next, card.id, point.x - card.x, point.y - card.y); }
+      return;
+    }
+    // Pack each cluster on its own, then pack the clusters as blocks.
+    const local = blocks.map(block => {
+      const placed = packGrid(ordered.filter(rect => block.includes(rect.id)), { origin: { x: 0, y: 0 }, ordered: true, gap: 28 });
+      const width = Math.max(...placed.map(point => point.x + rectOf(next.find(card => card.id === point.id)!, expanded).width));
+      const height = Math.max(...placed.map(point => point.y + rectOf(next.find(card => card.id === point.id)!, expanded).height));
+      return { id: block[0]!, placed, width, height, x: 0, y: 0 };
+    });
+    for (const point of packGrid(local, { origin, gap: 72, ordered: true })) {
+      for (const item of local.find(block => block.id === point.id)!.placed) {
+        const card = next.find(value => value.id === item.id)!;
+        translated(next, card.id, point.x + item.x - card.x, point.y + item.y - card.y);
+      }
+    }
+  };
+  for (const group of orderedCards(next).reverse().filter(card => card.kind === 'group' && inScope(card))) {
+    const members = next.filter(card => card.groupId === group.id);
+    if (!members.length) continue;
+    pack(members, { x: group.x + padding, y: group.y + heading }, true);
+    const bounds = enclosingRect(members, sizes);
+    Object.assign(group, { width: bounds.width, height: bounds.height });
+  }
+  if (scope.length) {
+    const roots = scope.map(card => next.find(item => item.id === card.id)!);
+    const rects = roots.map(card => rectOf(card, false));
+    pack(roots, { x: Math.min(...rects.map(rect => rect.x)), y: Math.min(...rects.map(rect => rect.y)) }, false);
+  }
+  return fitGroups(next, sizes);
+}
+
+/**
+ * Layered top-to-bottom layout of a directed graph: causes above effects.
+ * Longest-path layers, barycentric ordering to reduce crossings; back edges of cycles are ignored.
+ */
+export function layeredLayout(ids: readonly string[], edges: ReadonlyArray<readonly [string, string]>, sizeOf: (id: string) => Size, options: { origin?: Point; gapX?: number; gapY?: number } = {}): Placement[] {
+  const { origin = { x: 40, y: 40 }, gapX = 56, gapY = 96 } = options;
+  const known = new Set(ids);
+  const out = new Map(ids.map(id => [id, [] as string[]]));
+  const state = new Map<string, 'visiting' | 'done'>();
+  const forward: Array<[string, string]> = [];
+  const visit = (id: string) => {
+    state.set(id, 'visiting');
+    for (const [from, to] of edges) {
+      if (from !== id || !known.has(to) || from === to) continue;
+      if (state.get(to) === 'visiting') continue; // back edge: ignore to break the cycle
+      forward.push([from, to]); out.get(from)!.push(to);
+      if (!state.has(to)) visit(to);
+    }
+    state.set(id, 'done');
+  };
+  for (const id of ids) if (!state.has(id)) visit(id);
+  const incoming = new Map(ids.map(id => [id, forward.filter(([, to]) => to === id).map(([from]) => from)]));
+  const layer = new Map<string, number>();
+  const depth = (id: string): number => {
+    if (layer.has(id)) return layer.get(id)!;
+    const value = Math.max(-1, ...incoming.get(id)!.map(depth)) + 1;
+    layer.set(id, value); return value;
+  };
+  ids.forEach(depth);
+  const layers: string[][] = [];
+  for (const id of ids) (layers[layer.get(id)!] ??= []).push(id);
+  const index = new Map<string, number>();
+  const reindex = () => layers.forEach(row => row.forEach((id, i) => index.set(id, i)));
+  reindex();
+  const sweep = (row: string[], neighbors: (id: string) => string[]) => {
+    const weight = new Map(row.map((id, i) => { const near = neighbors(id).filter(item => index.has(item)); return [id, near.length ? near.reduce((sum, item) => sum + index.get(item)!, 0) / near.length : i]; }));
+    row.sort((a, b) => weight.get(a)! - weight.get(b)!);
+  };
+  for (let pass = 0; pass < 3; pass++) {
+    for (let i = 1; i < layers.length; i++) { sweep(layers[i]!, id => incoming.get(id)!.filter(item => layer.get(item) === i - 1)); reindex(); }
+    for (let i = layers.length - 2; i >= 0; i--) { sweep(layers[i]!, id => out.get(id)!.filter(item => layer.get(item) === i + 1)); reindex(); }
+  }
+  const widths = layers.map(row => row.reduce((sum, id) => sum + sizeOf(id).width, 0) + gapX * (row.length - 1));
+  const widest = Math.max(0, ...widths);
+  const result: Placement[] = [];
+  let y = origin.y;
+  layers.forEach((row, i) => {
+    let x = origin.x + (widest - widths[i]!) / 2;
+    for (const id of row) { result.push({ id, x, y }); x += sizeOf(id).width + gapX; }
+    y += Math.max(...row.map(id => sizeOf(id).height)) + gapY;
+  });
+  return result;
+}
