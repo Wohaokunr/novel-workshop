@@ -7,7 +7,7 @@ export type CompanionSurface = 'canvas' | 'world' | 'story' | 'outline' | 'write
 export type CompanionIntensity = 'steady' | 'bold' | 'wild';
 export type OutlineNodeKind = 'book' | 'act' | 'chapter' | 'scene';
 /** What the develop mode should infer and fill in. */
-export type CompanionFocus = 'profile' | 'theme' | 'logline' | 'brief' | 'cast' | 'distill' | 'blindtest';
+export type CompanionFocus = 'profile' | 'theme' | 'logline' | 'brief' | 'cast' | 'setting' | 'distill' | 'blindtest';
 /** Work fields the partner may propose values for. */
 export const companionNovelFields = ['theme', 'logline', 'brief', 'genre', 'audience'] as const;
 export type CompanionNovelField = typeof companionNovelFields[number];
@@ -27,20 +27,26 @@ export interface CompanionQuestion { id: string; question: string; why: string; 
 export type CompanionIdeaKind = 'whatif' | 'twist' | 'conflict' | 'character' | 'setting' | 'theme' | 'beat';
 export interface CompanionIdea { id: string; kind: CompanionIdeaKind; title: string; content: string; hook: string }
 export type CompanionOpKind = 'addAct' | 'updateAct' | 'addChapter' | 'updateChapter' | 'addScene' | 'updateScene' | 'moveScene' | 'addEvent' | 'addCard'
-  | 'updateNovel' | 'addCharacter' | 'updateCharacter' | 'link' | 'addCause' | 'updateStyle';
+  | 'updateNovel' | 'addCharacter' | 'updateCharacter' | 'addSetting' | 'updateSetting' | 'link' | 'addCause' | 'updateStyle';
 /** Flat, strict-schema friendly operation. Empty / null fields mean "not provided" or "unchanged". */
 export interface CompanionOp {
   id: string; op: CompanionOpKind;
   /** Temporary handle for new items so later ops can reference them. */
   ref: string | null;
-  /** Existing entity id for update / move ops, or the effect event for a new cause. */
+  /** Existing entity id for update / move ops, the effect event for a new cause, or the chapter a new chapter follows. */
   targetId: string | null;
   parentRef: string | null; parentId: string | null;
   title: string | null; content: string | null; purpose: string | null;
   /** 1-based position among siblings; null appends. */
   order: number | null;
   povName: string | null;
-  causes: string[]; people: string[];
+  causes: string[];
+  /** Characters: event participants, or a scene's cast. */
+  people: string[];
+  /** Scene ops: settings (names, ids or refs) where the scene happens. Missing on older stored threads. */
+  places?: string[];
+  /** Scene ops: world events (ids, refs or names) the scene presents. */
+  events?: string[];
   /** updateNovel: which work field content replaces; updateStyle: summary, dial:<id>, rule:do, rule:avoid, preferWords, avoidWords or voice. */
   field?: string | null;
 }
@@ -80,8 +86,8 @@ export interface CompanionAdoptRequest {
   placement?: { x: number; y: number };
   /** Wrap adopted canvas ideas in a new group. */
   group?: boolean;
-  /** Adopt character ideas as real characters instead of canvas notes. */
-  as?: 'character';
+  /** Adopt character / setting ideas as real characters or settings instead of canvas notes. */
+  as?: 'character' | 'setting';
 }
 export interface CompanionAdoptResult { batchId?: string; skipped: string[]; thread: CompanionThread }
 
@@ -101,5 +107,5 @@ export const intensityNames: Record<CompanionIntensity, string> = { steady: '稳
 export const ideaKindNames: Record<CompanionIdeaKind, string> = {
   whatif: 'What-if', twist: '反转', conflict: '冲突升级', character: '人物', setting: '设定', theme: '立意', beat: '情节点',
 };
-export const focusNames: Record<CompanionFocus, string> = { profile: '作品信息', theme: '立意', logline: '一句话梗概', brief: '创作简述', cast: '人物阵容', distill: '提炼文风', blindtest: '文风盲测' };
+export const focusNames: Record<CompanionFocus, string> = { profile: '作品信息', theme: '立意', logline: '一句话梗概', brief: '创作简述', cast: '人物阵容', setting: '故事环境', distill: '提炼文风', blindtest: '文风盲测' };
 export const novelFieldNames: Record<CompanionNovelField, string> = { theme: '立意', logline: '一句话梗概', brief: '创作简述', genre: '题材', audience: '目标读者' };

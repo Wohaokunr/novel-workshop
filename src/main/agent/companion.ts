@@ -17,6 +17,7 @@ import { boundedContext, refreshMemories } from './memory.js';
 import { sceneMentions } from './story-index.js';
 import { entityRecall, openThreads, storyOverview, StoryView } from './story-view.js';
 import { personNames, scaleNames, styleProfile } from '../../shared/style-types.js';
+import { elementNames, isSettingLike, sceneElements } from '../../shared/story-elements.js';
 import { styleFingerprint } from '../../shared/style-metrics.js';
 
 const MODES: CompanionMode[] = ['diverge', 'causality', 'structure', 'outline', 'beat', 'develop', 'style'];
@@ -24,7 +25,7 @@ const HISTORY_TURNS = 12;
 const string: JsonSchema = { type: 'string' };
 const nullableString: JsonSchema = { type: ['string', 'null'] };
 const strings: JsonSchema = { type: 'array', items: string };
-const opNames = ['addAct', 'updateAct', 'addChapter', 'updateChapter', 'addScene', 'updateScene', 'moveScene', 'addEvent', 'addCard', 'updateNovel', 'addCharacter', 'updateCharacter', 'link', 'addCause', 'updateStyle'];
+const opNames = ['addAct', 'updateAct', 'addChapter', 'updateChapter', 'addScene', 'updateScene', 'moveScene', 'addEvent', 'addCard', 'updateNovel', 'addCharacter', 'updateCharacter', 'addSetting', 'updateSetting', 'link', 'addCause', 'updateStyle'];
 export const companionSchema: JsonSchema = objectSchema({
   // reply first: the UI streams it while the rest of the JSON is still arriving.
   reply: string,
@@ -33,7 +34,7 @@ export const companionSchema: JsonSchema = objectSchema({
   proposals: { type: 'array', items: objectSchema({ title: string, summary: string, ops: { type: 'array', items: objectSchema({
     op: { type: 'string', enum: opNames }, ref: nullableString, targetId: nullableString, parentRef: nullableString, parentId: nullableString,
     title: nullableString, content: nullableString, purpose: nullableString, order: { type: ['number', 'null'] }, povName: nullableString,
-    causes: strings, people: strings, field: nullableString,
+    causes: strings, people: strings, places: strings, events: strings, field: nullableString,
   }) } }) },
   followUps: strings,
 });
@@ -51,8 +52,11 @@ const common = `你是小说作者的创作伙伴，不是替作者拍板的决�
 - storyMemory 是由正文生成的全书/分卷摘要与未回收伏笔；catalog 以当前位置为中心，较远章节只给骨架。善用伏笔与早先出场的人物，但摘要不是正式事实。
 - 引用已有实体时 targetId/parentId 必须使用 catalog 里的真实 id；新建条目用 ref（如 "a1"、"c1"）并在子条目的 parentRef 中引用。不需要的字段填 null，数组填 []。不要输出删除操作。
 - 人物与连线的操作：addCharacter（title=人物名，content=作者设定：身份、性格、秘密，purpose=他在故事里推动什么，ref 可被 addEvent.people、addScene.povName、link 引用）；updateCharacter（targetId=人物 id，content/purpose 给完整新值）；link（parentId 或 parentRef 与 targetId 是两端，可以是卡片、人物、事件、场景的 id 或 ref，title 写关系，例如“师徒，互相隐瞒”），会在灵感画布上连线；addCause（targetId=结果事件，causes=更早的前因事件）。作品缺人物或点子依赖新人物时就用 addCharacter，已有同名人物直接引用，不要重复创建。
+- 环境（地点、组织、物件与世界规则）与人物同等重要：addSetting（title=环境名，content=环境设定：样貌、氛围、谁在这里，purpose=世界规则或限制，ref 可被 addScene.places、link 引用）；updateSetting（targetId=环境 id，content/purpose 给完整新值）。已有同名环境直接引用，不要重复创建。
+- 场景要有三要素：人物（povName 视角人物 + people 出场人物）、情节（content 写这一场发生什么、冲突与结束时的变化，events 填它呈现的世界事件 id 或名称）、环境（places 填发生地点的环境名、id 或 ref）。addScene/updateScene 尽量补齐；updateScene 的 people/places/events 只会追加，不会删除已有关联。其他操作的 places、events 填 []。
+- 新场景必须归入章节：放进已有章节用 parentId=章节 id；需要新章节时先 addChapter（ref，targetId=插在哪一章之后的章节 id 或 ref），再在 addScene/moveScene 的 parentRef 中引用它的 ref。
 - updateNovel 修改作品信息：field 只能是 theme/logline/brief/genre/audience，content 是完整的新值。其他操作的 field 填 null。
-- character 类 idea 的 title 写成“人物名：一句话”，方便作者一键设为人物。`;
+- character 类 idea 的 title 写成“人物名：一句话”，setting 类 idea 的 title 写成“地点或设定名：一句话”，方便作者一键设为人物或环境。`;
 
 const styleOps = `updateStyle 操作：field=summary（content 写 120–250 字的文风画像：句子与节奏、修辞浓度、对白方式、叙述距离、用词质地、情绪如何表达，具体到可以照着写）；field=dial:person（content 为 first/third-limited/third-omniscient/free）；field=dial:<distance|sentence|ornament|dialogue|interiority|register|pace>（content 为 1–5，两端含义见 style.scales）；field=rule:do 或 rule:avoid（content 是一条具体可执行的写法，每条一个 op）；field=preferWords 或 avoidWords（content 用顿号分隔的词）；field=voice（targetId=人物 id，content 写此人的说话方式、口头禅、用词禁区）。不需要的字段填 null。`;
 const styleInstructions = `模式：文风。帮作者把自己的笔触说清楚，让写作者能照着写。target.focus 决定任务。ideas 在本模式下留空。
@@ -64,13 +68,19 @@ const modeInstructions: Record<CompanionMode, string> = {
   style: styleInstructions,
   diverge: `模式：发散灵感。先在心里发散至少 10 个点子，再挑出 4–6 个类别互不相同的放进 ideas（覆盖 whatif、twist 反转、conflict 冲突升级、character 人物秘密/欲望、setting 设定的代价、theme 中的多种）。
 每个 idea：title 一句话点题，content 2–4 句写清具体发生什么、牵动谁，hook 写它制造的悬念、冲突或读者期待。点子之间要真正不同，而不是同一想法的变体。
-proposals 通常留空；只有当点子需要新人物，或作者要求梳理/连接卡片之间的关系时，给 1 个提案，只用 addCharacter、link、addCard。`,
+proposals 通常留空；只有当点子需要新人物或新环境，或作者要求梳理/连接卡片之间的关系时，给 1 个提案，只用 addCharacter、addSetting、link、addCard。`,
   causality: `模式：推演世界因果。围绕锚点事件推演：它会引发什么后果、背后可能缺什么前因、如果它没发生世界会怎样。
 用 proposals 给 2–3 个可选推演，每个包含 1–3 个 addEvent：后果事件的 causes 填锚点事件 id；前因事件的 targetId 填它引发的事件 id；people 填相关人物名。content 写世界中真实发生的事，purpose 写它对故事的作用。世界顺序必须因在果前。
 已有事件之间缺少的因果用 addCause 补上；事件需要的新人物用 addCharacter（ref）并在 people 中引用。ideas 可补充不适合直接成为事件的想法。`,
-  structure: `模式：叙事结构诊断。先在 reply 中诊断当前叙述顺序：节奏是否拖沓、信息揭露是否过早或过晚、视角分布、高潮位置，引用具体场景标题作证据。
-再用 proposals 给 2–3 个互相排斥的重构方案（例如换个开篇、推迟揭露、拆分视角），只能使用 moveScene（targetId=场景 id，parentId=目标章节 id 或 null，order=在目标章节中的位置，从 1 开始）、updateScene（只改 title/content=场景大纲/povName）和 addScene（新建空白场景，content 为大纲）。summary 说明方案带来的阅读体验变化。绝不改写已有正文。`,
-  outline: `模式：分层大纲。依据 target 展开：book → 按所选结构模板给出幕/卷（addAct）；act → 为该幕给出章节（addChapter，parentId=幕 id）；chapter → 为该章给出场景节拍（addScene，parentId=章节 id，content 写这一场发生什么、谁的视角、结束时的变化）；fullDraft=true 时一次给出完整的幕 → 章 → 场景三层草案。
+  structure: `模式：叙事结构诊断。先在 reply 中诊断当前叙述顺序：节奏是否拖沓、信息揭露是否过早或过晚、视角分布、高潮位置，引用具体场景标题作证据；再点出三要素不全的场景（catalog.scenes 的 missing 列出缺人物/情节/环境，缺冲突要你自己从大纲判断）。
+再用 proposals 给 2–3 个互相排斥的重构方案（例如换个开篇、推迟揭露、拆分视角、插入一章插叙或喘息），只能使用：
+- moveScene：targetId=场景 id，parentId=目标章节 id（或 parentRef=本方案新建章节的 ref，留在原章时都填 null），order=在目标章节中的位置，从 1 开始。
+- updateScene：只改 title、content=场景大纲、povName，并可用 people/places/events 补齐三要素。
+- addScene：新建空白场景，content 为大纲，补齐 povName/people/places/events；放进已有章节用 parentId，放进新章节用 parentRef。
+- addChapter：大纲里还没有合适的章节时新建，ref 必填，targetId=插在哪一章之后（catalog.chapters 或 chapterSkeleton 的 id，index 是阅读位置），content 写这一章的任务，parentId=所属幕 id 或 null。
+- updateChapter：targetId=章节 id，只改 title 与 content=章节概要。
+summary 说明方案带来的阅读体验变化。绝不改写已有正文。`,
+  outline: `模式：分层大纲。依据 target 展开：book → 按所选结构模板给出幕/卷（addAct）；act → 为该幕给出章节（addChapter，parentId=幕 id）；chapter → 为该章给出场景节拍（addScene，parentId=章节 id，content 写这一场发生什么、冲突、结束时的变化，povName/people/places/events 补齐人物、环境与世界事件）；fullDraft=true 时一次给出完整的幕 → 章 → 场景三层草案。
 每层都要有因果推进与情绪起伏，章节 content 写这一章要完成的任务与结尾钩子，幕的 purpose 写它在整体结构中的作用。作者要“几个版本”时给 2–3 个风格明显不同的 proposals，否则给 1 个。已有内容只用 updateAct/updateChapter/updateScene 补充，不重复新建。作品还没有人物时，可在提案开头用 addCharacter 建立主要人物，再在 povName 中引用其 ref。`,
   beat: `模式：写作卡文时的下一拍。基于当前场景大纲与已写正文末尾，给出 3–4 个“接下来可能发生什么”的 ideas（kind=beat 或 twist/conflict），每个都能直接写成下一段；考虑人物此刻知道什么、想要什么。questions 帮作者确定这一场真正要完成的任务。proposals 留空。`,
   develop: `模式：补全构想。作者的信息还不完整。尽可能利用已有的一切（作品名、题材、读者、简述、立意、人物、画布便笺、大纲）推断作者真正想写什么，把 target.focus 指定的部分补全。
@@ -80,6 +90,7 @@ proposals 通常留空；只有当点子需要新人物，或作者要求梳理/
 - focus=logline：updateNovel(field=logline)，一句话包含主角、欲望、阻碍和赌注。
 - focus=brief：updateNovel(field=brief)，3–5 句写清核心冲突与故事方向，保留作者原有的念头。
 - focus=profile：只补 target.emptyFields 中空着的字段，每个字段一个 updateNovel，不覆盖作者已填写的内容。
+- focus=setting：每个 proposal 是一组 3–5 个故事环境（addSetting，ref 用 s1、s2…；content 写样貌、氛围、谁在这里活动，purpose 写这里的世界规则、限制或代价），各版本在世界观或基调上明显不同；再用 link 把环境连到在那里行动的人物（parentRef=环境 ref，targetId=人物 id）。已有环境用 updateSetting 丰富，不重复创建。
 - focus=cast：每个 proposal 是一组 3–5 个人物（addCharacter，ref 用 c1、c2…），再用 link 连接人物表达关系（parentRef 与 targetId 都是人物 ref 或已有人物 id，title 写关系）。已有人物用 id 引用，不重复创建；锚点是某个已有人物时，用 updateCharacter 丰富它，并补充与之相关的人物。`,
 };
 const intensityInstructions = {
@@ -143,19 +154,28 @@ export function companionContext(workspace: Workspace, thread: CompanionThread, 
   const counts = view.mentionCounts();
   const rank = <T extends { id: string }>(items: T[]) => [...items].sort((a, b) => Number(focusIds.has(b.id)) - Number(focusIds.has(a.id)) || (counts.get(b.id) ?? 0) - (counts.get(a.id) ?? 0));
   const shownEvents = new Set(rank(events).slice(0, 60).map(event => event.id));
+  const sceneCounts = new Map<string, number>();
+  for (const scene of scenes) sceneCounts.set(scene.chapterId, (sceneCounts.get(scene.chapterId) ?? 0) + 1);
+  const typeName = (id: string) => workspace.objectTypes.find(type => type.id === id)?.name ?? id;
+  /** Names only, a few each: enough to see which of 人物 / 情节 / 环境 a scene lacks. */
+  const elements = (scene: Workspace['scenes'][number]) => {
+    const value = sceneElements(workspace, scene);
+    return { cast: value.cast.slice(0, 6), places: value.places.slice(0, 4), events: value.events.slice(0, 4), missing: value.missing.map(item => elementNames[item]) };
+  };
   const base: Record<string, unknown> = {
     project: { title: workspace.title, brief: workspace.brief, genre: workspace.genre, audience: workspace.audience, theme: workspace.theme ?? '',
       logline: workspace.logline ?? '', structureTemplate: template ? { name: template.name, stages: template.stages } : null },
     authorRules: memoriesRules,
     catalog: {
       characters: rank(workspace.objects.filter(object => object.typeId === 'character')).slice(0, 30).map(object => ({ id: object.id, name: object.name, description: description(object.fields), goal: excerpt(object.fields.goal, 160) })),
-      settings: rank(workspace.objects.filter(object => !object.event && object.typeId !== 'character')).slice(0, 20).map(object => ({ id: object.id, name: object.name, description: description(object.fields) })),
+      settings: rank(workspace.objects.filter(isSettingLike)).slice(0, 20).map(object => ({ id: object.id, name: object.name, type: typeName(object.typeId), description: description(object.fields), rules: excerpt(object.fields.rules, 160) })),
       events: events.filter(event => shownEvents.has(event.id)).map(object => ({ id: object.id, name: object.name, worldOrder: object.event!.worldOrder, thread: object.event!.thread, causes: object.event!.causes, participants: object.event!.participants.map(name), description: excerpt(object.fields.description, 200) })),
       acts: [...(workspace.acts ?? [])].sort((a, b) => a.order - b.order).map(act => ({ id: act.id, title: act.title, purpose: act.purpose, summary: excerpt(act.summary, 400) })),
-      chapters: focus.near.map(chapter => ({ id: chapter.id, title: chapter.title, actId: chapter.actId ?? null, summary: excerpt(chapter.summary, 300) })),
-      chapterSkeleton: focus.skeleton.map(chapter => ({ id: chapter.id, title: chapter.title, actId: chapter.actId ?? null })),
+      // index is the reading position, so "insert after chapter X" has something to point at.
+      chapters: focus.near.map(chapter => ({ id: chapter.id, index: view.chapterIndex(chapter.id) + 1, title: chapter.title, actId: chapter.actId ?? null, scenes: sceneCounts.get(chapter.id) ?? 0, summary: excerpt(chapter.summary, 300) })),
+      chapterSkeleton: focus.skeleton.map(chapter => ({ id: chapter.id, index: view.chapterIndex(chapter.id) + 1, title: chapter.title, actId: chapter.actId ?? null })),
       omitted: { chapters: focus.omitted, scenes: scenes.length - Math.min(120, nearScenes.length), events: events.length - shownEvents.size },
-      scenes: nearScenes.slice(0, 120).map(scene => ({ id: scene.id, chapterId: scene.chapterId, title: scene.title, pov: name(scene.povId) ?? '全知', outline: excerpt(scene.outline, thread.mode === 'structure' ? 500 : 200), writtenChars: scene.text.length })),
+      scenes: nearScenes.slice(0, 120).map(scene => ({ id: scene.id, chapterId: scene.chapterId, title: scene.title, pov: name(scene.povId) ?? '全知', ...elements(scene), outline: excerpt(scene.outline, thread.mode === 'structure' ? 500 : 200), writtenChars: scene.text.length })),
       canvasNotes: workspace.cards.filter(card => card.kind === 'note' || card.kind === 'group').slice(0, 60).map(card => ({ id: card.id, kind: card.kind, title: card.title })),
     },
     gaps: storyGaps(workspace),
@@ -323,7 +343,7 @@ export class CompanionService {
     const turn = thread.turns.find(item => item.id === request.turnId && item.role === 'companion');
     if (!turn?.response) fail('这条建议不存在');
     if (!Array.isArray(request.itemIds) || !request.itemIds.length) fail('请选择要采纳的内容');
-    if (request.as !== undefined && request.as !== 'character') fail('采纳方式无效');
+    if (request.as !== undefined && request.as !== 'character' && request.as !== 'setting') fail('采纳方式无效');
     const adopted = turn.adopted ??= {}, created = turn.created ??= {};
     const selected = selectCompanionItems(turn.response, request.itemIds);
     if (selected.unknown.length) fail('选择的建议不存在');

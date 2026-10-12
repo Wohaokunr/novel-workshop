@@ -4,10 +4,11 @@ import { checkCancelled, type ModelRequest, type ModelResponse, type ResponseTra
 
 type Op = {
   op: string; ref: string | null; targetId: string | null; parentRef: string | null; parentId: string | null;
-  title: string | null; content: string | null; purpose: string | null; order: number | null; povName: string | null; causes: string[]; people: string[]; field: string | null;
+  title: string | null; content: string | null; purpose: string | null; order: number | null; povName: string | null; causes: string[]; people: string[];
+  places: string[]; events: string[]; field: string | null;
 };
 function op(patch: Partial<Op> & Pick<Op, 'op'>): Op {
-  return { ref: null, targetId: null, parentRef: null, parentId: null, title: null, content: null, purpose: null, order: null, povName: null, causes: [], people: [], field: null, ...patch };
+  return { ref: null, targetId: null, parentRef: null, parentId: null, title: null, content: null, purpose: null, order: null, povName: null, causes: [], people: [], places: [], events: [], field: null, ...patch };
 }
 
 /** Offline fixtures for the creative partner. They exercise the real adoption path but are not model judgments. */
@@ -39,6 +40,7 @@ export class DemoCompanionTransport implements ResponseTransport {
   private respond(mode: string, context: any, objective: string) {
     const people: string[] = (context.catalog?.characters ?? []).map((item: any) => item.name);
     const hero = people[0] ?? '主角', other = people[1] ?? '那个陌生人';
+    const place: string | undefined = context.catalog?.settings?.[0]?.name;
     const anchorTitle: string = context.anchor?.cards?.[0]?.title ?? context.anchor?.objects?.[0]?.name ?? context.anchor?.scenes?.[0]?.title ?? context.project?.title ?? '这个故事';
     const round = (context.conversation ?? []).filter((turn: any) => turn.author).length;
     const base = { questions: [] as any[], ideas: [] as any[], proposals: [] as any[], followUps: [] as string[] };
@@ -85,7 +87,13 @@ export class DemoCompanionTransport implements ResponseTransport {
         proposals.push({ title: '推迟揭露', summary: `把「${first.title}」后移，让读者多等一会儿答案。`, ops: [op({ op: 'moveScene', targetId: first.id, parentId: first.chapterId, order: 99, title: first.title })] });
       }
       const chapterId = scenes[0]?.chapterId ?? context.catalog?.chapters?.[0]?.id ?? null;
-      if (chapterId) proposals.push({ title: '插入一场喘息', summary: '在紧张段落之间加入一场人物关系戏。', ops: [op({ op: 'addScene', parentId: chapterId, order: 2, title: '短暂的停顿', content: `${hero}与${other}在等待中交换了一个不该说出口的秘密。`, povName: hero })] });
+      if (chapterId) proposals.push({ title: '插入一场喘息', summary: '在紧张段落之间加入一场人物关系戏。', ops: [op({ op: 'addScene', parentId: chapterId, order: 2, title: '短暂的停顿', content: `${hero}与${other}在等待中交换了一个不该说出口的秘密。`, povName: hero, people: [other], places: place ? [place] : [] })] });
+      // The outline has no chapter for a flashback yet: open one right after the focused chapter and put the scene there.
+      const after = focus?.chapterId ?? chapterId;
+      if (after) proposals.push({ title: '插入一章插叙', summary: '在这一章之后插入一章旧事，先让读者看见代价，再回到当下。', ops: [
+        op({ op: 'addChapter', ref: 'c1', targetId: after, title: '插叙 · 三十年前', content: '用一场旧事交代代价从何而来，结尾回扣当下的悬念。' }),
+        op({ op: 'addScene', parentRef: 'c1', title: '旧案', content: `${other}年轻时目睹了那件事，却选择了沉默。`, povName: other, people: [hero], places: place ? [place] : [] }),
+      ] });
       return { ...base, reply: `（演示）目前共有 ${scenes.length} 个场景。开篇信息给得偏早，中段缺少节奏变化。下面是几个互斥的调整方向。`,
         questions: [{ question: '你希望读者在哪一章第一次真正担心主角？', why: '这决定了第一个高潮应该放在哪里。' }], proposals, followUps: ['再给一个以视角切换为核心的方案'] };
     }
@@ -99,7 +107,8 @@ export class DemoCompanionTransport implements ResponseTransport {
         if (target.kind === 'act' && target.id) {
           for (let c = 1; c <= 3; c++) ops.push(op({ op: 'addChapter', parentId: target.id, title: `第${c}章${tone}`, content: `${hero}在这一章${['发现异常', '付出代价', '做出选择'][c - 1]}，结尾留下新的疑问。` }));
         } else if (target.kind === 'chapter' && target.id) {
-          for (let s = 1; s <= 3; s++) ops.push(op({ op: 'addScene', parentId: target.id, title: ['引子', '交锋', '余韵'][s - 1]! + tone, content: `${s === 2 ? other : hero}视角：${['察觉不对劲', '正面冲突', '独自面对后果'][s - 1]}。`, povName: s === 2 ? other : hero }));
+          for (let s = 1; s <= 3; s++) ops.push(op({ op: 'addScene', parentId: target.id, title: ['引子', '交锋', '余韵'][s - 1]! + tone, content: `${s === 2 ? other : hero}视角：${['察觉不对劲', '正面冲突', '独自面对后果'][s - 1]}。`, povName: s === 2 ? other : hero,
+            people: s === 2 ? [hero] : [], places: place ? [place] : [] }));
         } else {
           stages.slice(0, 4).forEach((stage, a) => {
             ops.push(op({ op: 'addAct', ref: `a${a + 1}`, title: `${stage.name}${tone}`, purpose: stage.purpose, content: `${hero}在这一部分：${stage.purpose}` }));
@@ -172,7 +181,20 @@ export class DemoCompanionTransport implements ResponseTransport {
       followUps: ['先直接给我几个版本', '你觉得哪个方向最有潜力？'] };
     const field = (name: string, content: string) => op({ op: 'updateNovel', field: name, title: name, content });
     let proposals: any[];
-    if (target.focus === 'cast') {
+    if (target.focus === 'setting') {
+      const lead = (context.catalog?.characters ?? [])[0];
+      const world = (variant: number) => {
+        const [first, second, third] = [['雾港钟楼', '潮汐市场', '旧档案馆'], ['废弃铁路站', '河心岛', '地下剧场']][variant]!;
+        const ops = [
+          op({ op: 'addSetting', ref: 's1', title: first, content: '故事的中心地点，旧而庄重，人人都以为了解它。', purpose: '这里的规矩不能当众打破。' }),
+          op({ op: 'addSetting', ref: 's2', title: second, content: '消息流通的地方，嘈杂、热闹、谁都可能在偷听。', purpose: '交易必须当面完成。' }),
+          op({ op: 'addSetting', ref: 's3', title: third, content: '保存着被人刻意遗忘的记录。', purpose: '每取走一份档案都要留下名字。' }),
+        ];
+        if (lead) ops.push(op({ op: 'link', parentRef: 's1', targetId: lead.id, title: '在这里长大' }));
+        return { title: ['版本 1 · 旧城', '版本 2 · 边缘地带'][variant], summary: '三个地点，各有一条不能打破的规则。', ops };
+      };
+      proposals = [world(0), world(1)];
+    } else if (target.focus === 'cast') {
       const existing = (context.catalog?.characters ?? [])[0];
       const lead = existing ? { id: existing.id, ref: null } : { id: null, ref: 'c1' };
       const cast = (variant: number) => {
@@ -195,7 +217,7 @@ export class DemoCompanionTransport implements ResponseTransport {
       const versions = [`信任需要先承担被欺骗的风险：${hero}一次次选择相信，代价是一次次失去。`, `真正的自由来自承认自己的软弱：${hero}放下伪装，才赢回选择的权利。`, `守住秘密的人最孤独：${hero}保护了所有人，却没有人知道。`];
       proposals = versions.map((content, index) => ({ title: `版本 ${index + 1}`, summary: ['侧重代价', '侧重成长', '侧重孤独'][index], ops: [field(name, content)] }));
     }
-    return { reply: `（演示）结合你给的信息，我推断了几个方向。${target.focus === 'cast' ? '采纳后人物会出现在「人物与设定」和画布上。' : '选一个最接近的直接采纳，或者回答下面的问题让我再收敛。'}`,
+    return { reply: `（演示）结合你给的信息，我推断了几个方向。${target.focus === 'cast' ? '采纳后人物会出现在「人物与设定」和画布上。' : target.focus === 'setting' ? '采纳后环境会出现在「人物与设定」的环境一栏，场景可以绑定它们。' : '选一个最接近的直接采纳，或者回答下面的问题让我再收敛。'}`,
       questions: questions.slice(0, 1), ideas: [], proposals, followUps: ['把第一个版本再推进一步', '换一种完全不同的基调'] };
   }
 }

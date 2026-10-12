@@ -325,3 +325,16 @@ test('SQLite 省略可选 undefined 字段后，使用原返回卡片纯移动�
     assert.equal(workspace.revision, revision);
   } finally { store.close(); }
 });
+
+test('场景三要素：出场人物只能是人物，环境不能是人物或事件，删除对象会清理场景引用', () => {
+  const original = applyCommands(fixture(), [{ type: 'putObject', value: { id: 'tower', typeId: 'setting', name: '钟楼', fields: {} } }]);
+  const chapterId = original.chapters[0]!.id;
+  const scene = { id: 'scene', chapterId, order: 1, title: '钟楼', povId: null, eventIds: [], outline: '', text: '' };
+  assert.throws(() => applyCommands(original, [{ type: 'putScene', value: { ...scene, castIds: ['tower'] } }]), /出场人物/);
+  assert.throws(() => applyCommands(original, [{ type: 'putScene', value: { ...scene, settingIds: ['anchor'] } }]), /场景环境/);
+  assert.throws(() => applyCommands(original, [{ type: 'putScene', value: { ...scene, settingIds: ['detective'] } }]), /场景环境/);
+  const bound = applyCommands(original, [{ type: 'putScene', value: { ...scene, castIds: ['detective'], settingIds: ['tower'] } }]);
+  const cleaned = applyCommands(bound, [{ type: 'deleteObject', id: 'tower' }, { type: 'deleteObject', id: 'detective' }]);
+  assert.deepEqual(cleaned.scenes[0]!.settingIds, []);
+  assert.deepEqual(cleaned.scenes[0]!.castIds, []);
+});

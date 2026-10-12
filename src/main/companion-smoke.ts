@@ -183,6 +183,32 @@ export async function runCompanionSmoke(window: BrowserWindow, store: NovelStore
   assert.equal(store.getProject(project.id).scenes.find(scene => scene.id === 'scene-a')!.text, '雾从门缝里挤进来。');
   await closePopover();
 
+  // 3b. The diagnosis wants a scene the outline has no chapter for: the proposal opens the chapter itself.
+  const chaptersBefore = store.getProject(project.id).chapters.length;
+  await contextMenu('.react-flow__node[data-id="scene-c"]');
+  await clickText('[data-testid="companion-menu-item"]', '这里之后还能加什么');
+  await idle();
+  const flashback = `[...document.querySelectorAll('.companion-popover [data-testid="companion-proposal"]')].find(e => e.querySelector('.proposal-title strong')?.textContent === '插入一章插叙')`;
+  await until(() => ui<boolean>(`!!(${flashback})?.querySelector('.structure-preview')?.textContent.includes('新章')`), '新章出现在前后对比里');
+  await ui(`(${flashback}).querySelector('[data-testid="adopt-proposal"]').click()`);
+  const opened = await until(() => { const value = store.getProject(project.id); const created = value.chapters.find(item => item.title === '插叙 · 三十年前'); return created && value.scenes.some(scene => scene.chapterId === created.id && scene.title === '旧案') ? value : null; }, '新章与新场景一起采纳');
+  assert.equal(opened.chapters.length, chaptersBefore + 1);
+  const ordered = [...opened.chapters].sort((a, b) => a.order - b.order);
+  assert.equal(ordered[ordered.findIndex(item => item.id === chapter.id) + 1]!.title, '插叙 · 三十年前', '新章紧跟在锚点场景所在章之后');
+  assert.equal(opened.scenes.find(scene => scene.title === '旧案')!.text, '');
+  await closePopover();
+
+  // 3c. 人物与设定 is split into the three elements; settings are designed like the cast.
+  await nav('nav-objects', 'objects');
+  await until(() => ui<boolean>(`document.querySelectorAll('[data-testid="elements-board"] .element-column').length === 3`), '三要素分栏');
+  await click('objects-design-setting'); await idle();
+  await ui(`document.querySelector('.companion-popover [data-testid="adopt-proposal"]').click()`);
+  await until(() => store.getProject(project.id).objects.filter(object => object.typeId === 'setting').length >= 3, '采纳故事环境');
+  await closePopover();
+  await until(() => ui<boolean>(`document.querySelectorAll('[data-element="place"] .object-row').length >= 3`), '环境栏显示新环境');
+  await capture('companion-06b-elements.png');
+  await nav('nav-story', 'story');
+
   // 4. World causality: right-click an event → consequences become causally linked events.
   await nav('nav-world-tab', 'world');
   await contextMenu('.react-flow__node[data-id="bell"]');
@@ -204,6 +230,10 @@ export async function runCompanionSmoke(window: BrowserWindow, store: NovelStore
   assert.equal(store.getProject(project.id).scenes.length, outlineBefore);
   await capture('companion-07-writer-beat.png');
   await closePopover();
+  await click('show-details-panel');
+  await until(() => ui<boolean>(`!!document.querySelector('.writer-details [data-testid="scene-elements"]')`), '场景三要素小结');
+  await capture('companion-07b-scene-elements.png');
+  await click('show-details-panel');
   const rows = await ui<number[]>(`[...document.querySelectorAll('.scene-row')].map(e => Math.round(e.getBoundingClientRect().height))`);
   assert.ok(Math.max(...rows) < 60, `空白场景目录行高度正常 ${JSON.stringify(rows)}`);
 

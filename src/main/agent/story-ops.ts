@@ -4,13 +4,16 @@ import { companionCommands } from '../../shared/companion.js';
 import { DomainValidationError } from '../domain.js';
 
 export const STORY_OPS: readonly CompanionOpKind[] = ['addAct', 'updateAct', 'addChapter', 'updateChapter', 'addScene', 'updateScene', 'moveScene', 'addEvent', 'addCard',
-  'updateNovel', 'addCharacter', 'updateCharacter', 'link', 'addCause'];
+  'updateNovel', 'addCharacter', 'updateCharacter', 'addSetting', 'updateSetting', 'link', 'addCause'];
 export const STORY_OPS_HELP = `opsJson 是 JSON 编码的故事操作数组（与创作伙伴相同的格式），由程序换算成领域命令：画布位置、引用卡片、连线和 ref 引用都自动处理，不需要编 id 或坐标。
-每个操作：{op, ref, targetId, parentRef, parentId, title, content, purpose, order, povName, causes, people, field}，不需要的字段填 null 或 []。
-addCharacter{title=人物名, content=作者设定, purpose=创作目标, ref}；updateCharacter{targetId, title?, content?, purpose?}；link{parentId|parentRef, targetId, title=关系}（卡片/人物/事件/场景之间在灵感画布上连线）；
+每个操作：{op, ref, targetId, parentRef, parentId, title, content, purpose, order, povName, causes, people, places, events, field}，不需要的字段填 null 或 []。
+addCharacter{title=人物名, content=作者设定, purpose=创作目标, ref}；updateCharacter{targetId, title?, content?, purpose?}；addSetting{title=环境名, content=环境设定, purpose=世界规则, ref}；updateSetting{targetId, title?, content?, purpose?}；
+link{parentId|parentRef, targetId, title=关系}（卡片/人物/环境/事件/场景之间在灵感画布上连线）；
 addEvent{title, content, purpose, causes=前因事件 id/ref, targetId=它引发的事件, people=人物名/ref, ref}；addCause{targetId=结果事件, causes=更早的前因}；addCard{title, content, ref}；
-addAct{title, purpose, content, ref}；addChapter{title, content, parentId|parentRef=幕, ref}；addScene{title, content=大纲, parentId|parentRef=章节, povName}；updateAct/updateChapter/updateScene{targetId, …}；moveScene{targetId, parentId=章节, order}；
-updateNovel{field=theme|logline|brief|genre|audience, content}。新建条目用 ref（如 c1），后续操作在 parentRef/targetId/people/povName/causes 中引用它。不能删除，也不能改正文。`;
+addAct{title, purpose, content, ref}；addChapter{title, content, parentId|parentRef=幕, targetId=插在哪一章之后, ref}；
+addScene{title, content=大纲, parentId|parentRef=章节, povName=视角人物, people=出场人物, places=发生地点（环境名/id/ref）, events=呈现的世界事件}；场景必须归入章节：没有合适章节时先 addChapter 再用 parentRef 引用，未指明章节时会自动新建同名章节。
+updateAct/updateChapter/updateScene{targetId, …}（updateScene 的 people/places/events 只追加）；moveScene{targetId, parentId|parentRef=章节, order}；
+updateNovel{field=theme|logline|brief|genre|audience, content}。新建条目用 ref（如 c1），后续操作在 parentRef/targetId/people/places/events/povName/causes 中引用它。不能删除，也不能改正文。`;
 
 /** Fill omitted fields so loosely formatted model output still converts. */
 function normalizeOp(raw: unknown, index: number, allowed: readonly CompanionOpKind[]): CompanionOp {
@@ -21,7 +24,7 @@ function normalizeOp(raw: unknown, index: number, allowed: readonly CompanionOpK
   const list = (key: string) => Array.isArray(value[key]) ? (value[key] as unknown[]).filter((item): item is string => typeof item === 'string') : [];
   return { id: `o${index + 1}`, op: value.op as CompanionOpKind, ref: text('ref'), targetId: text('targetId'), parentRef: text('parentRef'), parentId: text('parentId'),
     title: text('title'), content: text('content'), purpose: text('purpose'), order: typeof value.order === 'number' ? value.order : null, povName: text('povName'),
-    causes: list('causes'), people: list('people'), field: text('field') };
+    causes: list('causes'), people: list('people'), places: list('places'), events: list('events'), field: text('field') };
 }
 
 /** Convert story ops into domain commands through the same guarded path the creative partner uses. */

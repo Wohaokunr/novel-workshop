@@ -3,13 +3,14 @@ import type { CompanionAnchor, CompanionIdea, CompanionMode, CompanionNovelField
 import { cardRect, createdGroup, placeCards } from './canvas.js';
 import { companionNovelFields, ideaKindNames } from './companion-types.js';
 import { personNames, STYLE_LIMITS, STYLE_SCALES, styleProfile, type StyleScale, type StylePerson, type StyleScaleId } from './style-types.js';
+import { isSettingLike } from './story-elements.js';
 
 export interface CompanionSelection { ideas: CompanionIdea[]; ops: Array<{ proposal: CompanionProposal; op: CompanionOp }> }
 export interface CompanionPlacement {
   mode: CompanionMode; anchor: CompanionAnchor; target?: 'canvas' | 'sceneOutline';
   placement?: { x: number; y: number }; group?: boolean; groupTitle?: string;
-  /** Turn selected character ideas into real characters instead of canvas notes. */
-  ideasAs?: 'character';
+  /** Turn selected character / setting ideas into real characters or settings instead of canvas notes. */
+  ideasAs?: 'character' | 'setting';
   /** Entities created by earlier adoptions of the same turn, keyed `${proposalId}:${ref}`. */
   knownRefs?: Record<string, string>;
   newId?: () => string;
@@ -34,7 +35,7 @@ export function selectCompanionItems(response: CompanionResponse, itemIds: reado
     while (grew) {
       grew = false;
       for (const op of proposal.ops) if (chosen.has(op.id)) {
-        for (const handle of [op.parentRef, op.targetId, op.povName, ...op.causes, ...op.people]) {
+        for (const handle of [op.parentRef, op.targetId, op.povName, ...op.causes, ...op.people, ...(op.places ?? []), ...(op.events ?? [])]) {
           const parent = handle ? proposal.ops.find(item => item.ref === handle && item.id !== op.id) : undefined;
           if (parent && !chosen.has(parent.id)) { chosen.add(parent.id); grew = true; }
         }
@@ -56,15 +57,19 @@ function orderAt(sortedOrders: number[], position: number | null): number {
   return (sortedOrders[index - 1]! + sortedOrders[index]!) / 2;
 }
 
-/** Character ideas are titled 「名字：一句话」; fall back to the whole title. */
-export function characterNameOf(title: string): string {
+/** Character and setting ideas are titled 「名字：一句话」; fall back to the whole title. */
+export function entityNameOf(title: string, fallback = '新人物'): string {
   const match = title.match(/^\s*([^：:｜|，,。]{1,12})[：:]/);
-  return (match?.[1] ?? title).trim().slice(0, 40) || '新人物';
+  return (match?.[1] ?? title).trim().slice(0, 40) || fallback;
 }
+export const characterNameOf = (title: string) => entityNameOf(title);
+/** A handle the model wrote as a chapter name (「第五章 雨夜」) rather than an id or ref. */
+const titleLike = (value: string) => /\p{Script=Han}/u.test(value) && Array.from(value).length <= 30;
 
 /**
  * Convert persisted companion suggestions into domain commands.
- * Guards: never deletes, never touches written scene text, new scenes start empty, unknown targets are skipped and reported.
+ * Guards: never deletes, never touches written scene text, new scenes start empty, unknown targets are skipped and reported;
+ * a scene whose chapter does not exist yet gets a new chapter instead of being dropped.
  */
 export function companionCommands(workspace: Workspace, selection: CompanionSelection, options: CompanionPlacement): { commands: Command[]; skipped: string[]; refs: Record<string, string> } {
   const newId = options.newId ?? defaultId;
@@ -104,6 +109,71 @@ export function companionCommands(workspace: Workspace, selection: CompanionSele
     const byRef = refs.get(scope(proposal, value));
     if (isCharacter(byRef)) return byRef!;
     return objects.find(object => object.typeId === 'character' && (object.name === value || object.id === value))?.id ?? null;
+  };
+  /** Setting or event by proposal ref, id or exact name, like personId. */
+  const entityId = (proposal: CompanionProposal, name: string | null, accept: (object: NovelObject) => boolean) => {
+    const value = clean(name);
+    if (!value) return null;
+    const byRef = refs.get(scope(proposal, value));
+    if (byRef && objects.some(object => object.id === byRef && accept(object))) return byRef;
+    return objects.find(object => accept(object) && object.id === value)?.id ?? objects.find(object => accept(object) && object.name === value)?.id ?? null;
+  };
+  const placeId = (proposal: CompanionProposal, value: string | null) => entityId(proposal, value, isSettingLike);
+  const eventRef = (proposal: CompanionProposal, value: string | null) => entityId(proposal, value, object => !!object.event);
+  /** Resolve a scene's people / places / events; names that match nothing are collected so the author hears about them. */
+  const resolveAll = (proposal: CompanionProposal, values: readonly string[] | undefined, find: (proposal: CompanionProposal, value: string | null) => string | null, missing: string[]) =>
+    [...new Set((values ?? []).flatMap(value => { const id = find(proposal, value); if (!id && clean(value)) missing.push(clean(value)); return id ? [id] : []; }))];
+
+  /** Reading order for a chapter placed right after `afterId`, or after the last chapter. */
+  const orderAfter = (afterId: string | undefined) => {
+    const sorted = [...chapters].sort((a, b) => a.order - b.order), index = afterId ? sorted.findIndex(chapter => chapter.id === afterId) : -1;
+    if (index < 0) return (sorted.at(-1)?.order ?? 0) + 1;
+    const next = sorted[index + 1];
+    return next ? (sorted[index]!.order + next.order) / 2 : sorted[index]!.order + 1;
+  };
+  /** A chapter by proposal ref, real id, or an existing chapter's exact title (models often write the title). */
+  const chapterOf = (proposal: CompanionProposal, ...values: Array<string | null>) => {
+    for (const value of values.map(clean)) {
+      if (!value) continue;
+      const byRef = refs.get(scope(proposal, value));
+      if (byRef && chapters.some(chapter => chapter.id === byRef)) return byRef;
+      const found = chapters.find(chapter => chapter.id === value) ?? chapters.find(chapter => chapter.title.trim() === value);
+      if (found) return found.id;
+    }
+    return undefined;
+  };
+  /** An act a scene op pointed at by mistake; the chapter opened for the scene then joins that act. */
+  const actOf = (proposal: CompanionProposal, op: CompanionOp) => {
+    const id = resolve(proposal, op.parentRef, op.parentId);
+    return id && acts.some(act => act.id === id) ? id : undefined;
+  };
+  // A scene proposed where no chapter exists yet gets a new chapter, right after the chapter the author pointed at.
+  const anchorScene = options.anchor.sceneId ?? options.anchor.references.flatMap(reference => reference.kind === 'scene' ? [reference.id]
+    : reference.kind === 'card' ? cards.filter(card => card.id === reference.id && card.kind === 'scene' && card.refId).map(card => card.refId!) : [])[0];
+  let autoAfter = scenes.find(scene => scene.id === anchorScene)?.chapterId;
+  const autoChapters = new Map<string, string>();
+  /** One chapter per unresolved handle; a scene without any handle gets a chapter named after itself. */
+  const autoChapter = (proposal: CompanionProposal, handleText: string, sceneTitle: string, actId?: string) => {
+    const known = handleText ? autoChapters.get(handleText) : undefined;
+    if (known) return known;
+    const title = titleLike(handleText) ? handleText : sceneTitle;
+    let chapter: Chapter;
+    if (placeholder) { chapter = placeholder; placeholder = undefined; Object.assign(chapter, { title, ...(actId ? { actId } : {}) }); }
+    else {
+      const sorted = [...chapters].sort((a, b) => a.order - b.order);
+      const after = actId ? sorted.filter(item => item.actId === actId).at(-1) : chapters.find(item => item.id === autoAfter);
+      const inAct = actId ?? after?.actId;
+      chapter = { id: newId(), title, order: orderAfter(after?.id), ...(inAct ? { actId: inAct } : {}) };
+      chapters.push(chapter);
+    }
+    // Consecutive new chapters keep the order they were proposed in.
+    autoAfter = chapter.id;
+    if (handleText) {
+      autoChapters.set(handleText, chapter.id);
+      // Later partial adoptions of the same turn that name this handle reuse the chapter.
+      refs.set(scope(proposal, handleText), chapter.id);
+    }
+    return chapter.id;
   };
 
   const anchorCards = options.anchor.references.flatMap(reference => {
@@ -153,11 +223,24 @@ export function companionCommands(workspace: Workspace, selection: CompanionSele
     cardFor(id, true);
     return { id, created: true };
   };
+  /** Settings mirror characters; on the canvas they get a reference card like events do. */
+  const addSetting = (name: string, description: string, rules: string) => {
+    const existing = objects.find(object => isSettingLike(object) && object.name === name);
+    if (existing) return { id: existing.id, created: false };
+    const id = newId();
+    objects.push({ id, typeId: 'setting', name, fields: fieldsOf('setting', { description, rules }) });
+    if (onCanvas) cardFor(id, true);
+    return { id, created: true };
+  };
 
   for (const idea of selection.ideas) {
     const body = [idea.content, idea.hook && `钩子：${idea.hook}`].filter(Boolean).join('\n');
     if (options.ideasAs === 'character' && idea.kind === 'character') {
       if (!addCharacter(characterNameOf(idea.title), body, '').created) skipped.push(`${idea.title}：同名人物已存在`);
+      continue;
+    }
+    if (options.ideasAs === 'setting' && idea.kind === 'setting') {
+      if (!addSetting(entityNameOf(idea.title, '新的环境'), body, '').created) skipped.push(`${idea.title}：同名环境已存在`);
       continue;
     }
     if (options.target === 'sceneOutline') {
@@ -192,8 +275,15 @@ export function companionCommands(workspace: Workspace, selection: CompanionSele
         const actId = resolve(proposal, op.parentRef, op.parentId);
         if (actId && !acts.some(act => act.id === actId)) { skip('所属幕/卷不存在'); break; }
         const sorted = [...chapters].sort((a, b) => a.order - b.order);
+        // targetId names the chapter this one follows, so a restructure can open a chapter between two existing ones.
+        const afterId = clean(op.targetId) ? chapterOf(proposal, op.targetId) : undefined;
         let chapter: Chapter;
-        if (placeholder) {
+        if (afterId) {
+          if (placeholder?.id === afterId) placeholder = undefined;
+          const inAct = actId ?? chapters.find(item => item.id === afterId)!.actId;
+          chapter = { id: newId(), title: label, order: orderAfter(afterId), summary: clean(op.content), ...(inAct ? { actId: inAct } : {}) };
+          chapters.push(chapter);
+        } else if (placeholder) {
           chapter = placeholder; placeholder = undefined;
           Object.assign(chapter, { title: label, summary: clean(op.content), ...(actId ? { actId } : {}) });
         } else {
@@ -230,11 +320,19 @@ export function companionCommands(workspace: Workspace, selection: CompanionSele
         break;
       }
       case 'addScene': {
-        const chapterId = resolve(proposal, op.parentRef, op.parentId)
-          ?? (options.anchor.sceneId ? scenes.find(item => item.id === options.anchor.sceneId)?.chapterId : undefined);
-        if (!chapterId || !chapters.some(item => item.id === chapterId)) { skip('所属章节不存在'); break; }
+        // A scene always lands in a chapter: the named one, the anchor scene's, or a new chapter opened for it.
+        const named = clean(op.parentRef) || clean(op.parentId);
+        const chapterId = chapterOf(proposal, op.parentRef, op.parentId)
+          ?? (!named && options.anchor.sceneId ? scenes.find(item => item.id === options.anchor.sceneId)?.chapterId : undefined)
+          ?? autoChapter(proposal, named, label, actOf(proposal, op));
+        const missing: string[] = [];
+        const povId = personId(proposal, op.povName);
+        const castIds = resolveAll(proposal, op.people, personId, missing).filter(id => id !== povId);
+        const settingIds = resolveAll(proposal, op.places, placeId, missing);
         const siblings = scenes.filter(item => item.chapterId === chapterId).map(item => item.order).sort((a, b) => a - b);
-        const scene: NarrativeScene = { id: newId(), chapterId, order: orderAt(siblings, op.order), title: label, povId: personId(proposal, op.povName), eventIds: [], outline: clean(op.content), text: '' };
+        const scene: NarrativeScene = { id: newId(), chapterId, order: orderAt(siblings, op.order), title: label, povId, eventIds: resolveAll(proposal, op.events, eventRef, missing),
+          outline: clean(op.content), text: '', ...(castIds.length ? { castIds } : {}), ...(settingIds.length ? { settingIds } : {}) };
+        if (missing.length) skip(`${missing.map(value => `「${value}」`).join('、')}不在作品中，未关联`);
         scenes.push(scene);
         if (op.ref) refs.set(scope(proposal, op.ref), scene.id);
         if (onCanvas) cardFor(scene.id, true);
@@ -246,13 +344,20 @@ export function companionCommands(workspace: Workspace, selection: CompanionSele
         if (clean(op.title)) scene.title = clean(op.title);
         if (clean(op.content)) scene.outline = clean(op.content);
         if (clean(op.povName)) { const pov = personId(proposal, op.povName); if (pov) scene.povId = pov; else if (/全知|外部/.test(clean(op.povName))) scene.povId = null; }
+        // Elements are filled in, never taken away: an update only adds people, places and events.
+        const missing: string[] = [];
+        const cast = resolveAll(proposal, op.people, personId, missing), places = resolveAll(proposal, op.places, placeId, missing), presented = resolveAll(proposal, op.events, eventRef, missing);
+        if (cast.length) scene.castIds = [...new Set([...(scene.castIds ?? []), ...cast])].filter(id => id !== scene.povId);
+        if (places.length) scene.settingIds = [...new Set([...(scene.settingIds ?? []), ...places])];
+        if (presented.length) scene.eventIds = [...new Set([...scene.eventIds, ...presented])];
+        if (missing.length) skip(`${missing.map(value => `「${value}」`).join('、')}不在作品中，未关联`);
         break;
       }
       case 'moveScene': {
         const scene = scenes.find(item => item.id === op.targetId);
         if (!scene) { skip('场景不存在'); break; }
-        const chapterId = resolve(proposal, op.parentRef, op.parentId) ?? scene.chapterId;
-        if (!chapters.some(item => item.id === chapterId)) { skip('目标章节不存在'); break; }
+        const named = clean(op.parentRef) || clean(op.parentId);
+        const chapterId = chapterOf(proposal, op.parentRef, op.parentId) ?? (named ? autoChapter(proposal, named, scene.title, actOf(proposal, op)) : scene.chapterId);
         const siblings = scenes.filter(item => item.chapterId === chapterId && item.id !== scene.id).map(item => item.order).sort((a, b) => a - b);
         scene.chapterId = chapterId; scene.order = orderAt(siblings, op.order);
         break;
@@ -301,6 +406,22 @@ export function companionCommands(workspace: Workspace, selection: CompanionSele
         const result = addCharacter(name, clean(op.content), clean(op.purpose));
         if (!result.created) skip('同名人物已存在，沿用原人物');
         if (op.ref) refs.set(scope(proposal, op.ref), result.id);
+        break;
+      }
+      case 'addSetting': {
+        const name = clean(op.title);
+        if (!name) { skip('缺少环境名称'); break; }
+        const result = addSetting(name, clean(op.content), clean(op.purpose));
+        if (!result.created) skip('同名环境已存在，沿用原环境');
+        if (op.ref) refs.set(scope(proposal, op.ref), result.id);
+        break;
+      }
+      case 'updateSetting': {
+        const setting = objects.find(object => isSettingLike(object) && object.id === placeId(proposal, op.targetId));
+        if (!setting) { skip('环境不存在'); break; }
+        const name = clean(op.title);
+        if (name && name !== setting.name && !objects.some(object => isSettingLike(object) && object.name === name)) setting.name = name;
+        setting.fields = { ...setting.fields, ...fieldsOf(setting.typeId, { description: clean(op.content), rules: clean(op.purpose) }) };
         break;
       }
       case 'updateCharacter': {

@@ -110,3 +110,29 @@ test('跨章前文按阅读顺序取最近 6000 字符原文，较早内容进�
   assert.ok(!context.sources.includes('scene:future:text'));
   assert.doesNotMatch(JSON.stringify(context), /后文|未来大纲/);
 });
+
+test('写作上下文只带入本场的环境：绑定的、大纲或前文提到的；环境很少时才全部带入', () => {
+  const original = createWorkspace('环境范围');
+  const chapterId = original.chapters[0]!.id;
+  const settings = ['钟楼', '码头', '集市', '档案馆', '灯塔', '渡口', '旧宅'].map((name, index) => ({ type: 'putObject' as const, value: { id: `place-${index}`, typeId: 'setting', name, fields: { description: `${name}的样子` } } }));
+  const workspace = applyCommands(original, [
+    ...settings,
+    { type: 'putObject', value: { id: 'lin', typeId: 'character', name: '林舟', fields: {} } },
+    { type: 'putScene', value: { id: 'before', chapterId, order: 1, title: '前一场', povId: null, eventIds: [], outline: '', text: '他从码头一路跑回来。' } },
+    { type: 'putScene', value: { id: 'target', chapterId, order: 2, title: '目标', povId: null, castIds: ['lin'], settingIds: ['place-0'], eventIds: [], outline: '在档案馆找到旧卷宗', text: '' } },
+    { type: 'putScene', value: { id: 'bare', chapterId, order: 3, title: '无名', povId: null, eventIds: [], outline: '', text: '' } },
+  ]);
+  const context = buildWriterContext(workspace, 'target');
+  const places = context.relatedObjects.filter(object => object.typeId === 'setting').map(object => object.name).sort();
+  assert.deepEqual(places, ['档案馆', '码头', '钟楼'].sort(), '绑定 + 大纲提到 + 前文提到');
+  assert.ok(context.relatedObjects.some(object => object.id === 'lin'), '出场人物进入上下文');
+  assert.deepEqual(context.sceneElements.places, ['钟楼']);
+  assert.deepEqual(context.sceneElements.cast, ['林舟']);
+  // Seven settings and none named near the scene: none are sent, instead of the whole list.
+  const bare = buildWriterContext(applyCommands(workspace, [{ type: 'putScene', value: { ...workspace.scenes.find(scene => scene.id === 'before')!, text: '' } }]), 'bare');
+  assert.equal(bare.relatedObjects.filter(object => object.typeId === 'setting').length, 0);
+  // A small book keeps the old behaviour.
+  const small = applyCommands(workspace, ['place-4', 'place-5', 'place-6'].map(id => ({ type: 'deleteObject' as const, id })));
+  const smallBare = buildWriterContext(applyCommands(small, [{ type: 'putScene', value: { ...small.scenes.find(scene => scene.id === 'before')!, text: '' } }]), 'bare');
+  assert.equal(smallBare.relatedObjects.filter(object => object.typeId === 'setting').length, 4);
+});

@@ -576,7 +576,7 @@ button.empty-brief:hover:not(:disabled) { color: var(--accent-text); background:
 .progress-count small { margin-left: 2px; color: var(--faint); font-size: 13px; font-weight: 500; }
 .progress-bar { height: 4px; margin: -4px 0 14px; overflow: hidden; background: var(--subtle); border-radius: 999px; }
 .progress-bar i { display: block; height: 100%; background: var(--accent); border-radius: inherit; transition: width var(--motion-panel) var(--ease-out); }
-.progress-steps { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin: 0; padding: 0; list-style: none; }
+.progress-steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 0; padding: 0; list-style: none; }
 .progress-steps li { position: relative; }
 .progress-steps button.step-assist { position: absolute; top: 6px; right: 6px; width: 26px; height: 26px; min-height: 0; padding: 0; justify-content: center; align-items: center; color: var(--accent); background: transparent; border-color: transparent; opacity: 0; transition: opacity .15s; }
 .progress-steps li:hover .step-assist, .progress-steps .step-assist:focus-visible, .progress-steps .step-assist.next { opacity: 1; }
@@ -609,8 +609,6 @@ button.empty-brief:hover:not(:disabled) { color: var(--accent-text); background:
    Objects
    ========================================================================== */
 .objects-page { max-width: 1120px; margin: 0 auto; }
-.object-list { padding: 16px; }
-.object-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
 .object-row { justify-content: flex-start; gap: 10px; width: 100%; min-height: 0; padding: 10px; text-align: left; white-space: normal; box-shadow: none; }
 .object-row > span:nth-child(2) { flex: 1; min-width: 0; }
 .object-row strong { display: block; overflow: hidden; text-overflow: ellipsis; font-size: 13px; font-weight: 600; }
@@ -618,6 +616,25 @@ button.empty-brief:hover:not(:disabled) { color: var(--accent-text); background:
 .object-row > svg { color: var(--faint); }
 .object-row.selected { border-color: var(--accent-line); background: var(--accent-soft); }
 .object-avatar { display: grid; place-items: center; width: 32px; height: 32px; flex: none; border-radius: 8px; font-size: 13px; font-weight: 600; }
+.objects-page .search-wrap { flex: 1; max-width: 420px; }
+.objects-page .search-wrap .search { margin: 0; }
+/* Three elements side by side; they stack when the page (or the docked inspector) leaves too little room. */
+.elements-board { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 12px; align-items: start; }
+.element-column { display: flex; flex-direction: column; min-width: 0; padding: 16px; }
+.element-column .section-heading { margin-bottom: 10px; }
+.element-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 10px; }
+.element-actions select { width: auto; min-height: 28px; padding: 0 6px; font-size: 12px; }
+.element-gaps { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; padding: 6px 8px; color: var(--warning); background: var(--warning-soft); border-radius: var(--radius-sm); font-size: 12px; }
+.element-gaps svg { flex: none; }
+.element-list { display: flex; flex-direction: column; gap: 6px; }
+.element-empty { font-size: 12.5px; line-height: 1.7; }
+.health-dot { width: 7px; height: 7px; flex: none; border-radius: 50%; background: var(--warning); }
+.scene-elements { display: grid; gap: 4px; margin-bottom: 14px; padding: 8px 10px; background: var(--surface-2); border-radius: var(--radius); font-size: 12px; }
+.scene-elements > div { display: grid; grid-template-columns: 36px minmax(0, 1fr); gap: 6px; }
+.scene-elements dt { color: var(--muted); font-weight: 600; }
+.scene-elements dd { margin: 0; overflow-wrap: anywhere; color: var(--text-2); }
+.scene-elements .missing dt, .scene-elements .missing dd { color: var(--warning); }
+.object-appearances .chip-picker small { color: var(--muted); }
 .object-inspector .section-heading { align-items: flex-start; }
 .object-inspector h2 { overflow-wrap: anywhere; }
 .type-manager { margin-bottom: 16px; }
@@ -1209,6 +1226,8 @@ button.empty-brief:hover:not(:disabled) { color: var(--accent-text); background:
 .structure-preview ol.before { color: var(--muted); }
 .structure-preview ol.after { color: var(--text); }
 .structure-preview > div > span { color: var(--faint); padding-top: 2px; }
+.structure-preview .new-chapter { margin-left: 6px; padding: 0 6px; border-radius: 4px; background: var(--accent-soft); color: var(--accent-text); font-size: 11px; font-weight: 600; }
+.structure-preview ol.before li.muted { list-style: none; margin-left: -18px; color: var(--faint); }
 
 /* follow-ups, jump, composer */
 .companion-followups { display: flex; flex-wrap: wrap; gap: 6px; margin: -6px 0 0 36px; }

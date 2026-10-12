@@ -8,6 +8,7 @@ import { Combobox, Field, Kbd, Popover, Select, type ComboItem, type Commit, uid
 import { motionDuration, usePresence } from './interaction';
 import { useCompanion, type SummonRequest } from './Companion';
 import type { CompanionFocus } from '../shared/companion-types';
+import { sceneElements } from '../shared/story-elements';
 
 type BoardMode = 'canvas' | 'world' | 'story';
 type BoardData = {
@@ -190,7 +191,7 @@ export default function Board({ mode, workspace: w, commit, selectedObject, sele
     } else {
       graphNodes = scenes.map((value, index) => {
         const lane = povLane(value);
-        return { id: value.id, type: 'story', position: w.layouts[`story:${value.id}`] || storyDefault(value, index), data: { label: value.title, content: value.outline, kind: 'scene', connectable: false, tag: w.chapters.find(chapter => chapter.id === value.chapterId)?.title || '叙述场景', badge: `阅读 ${index + 1}`, tint: colors[lane % colors.length], people: [chars.find(character => character.id === value.povId)?.name || '全知 / 外部视角', `${value.eventIds.length} 个世界事件`] } };
+        return { id: value.id, type: 'story', position: w.layouts[`story:${value.id}`] || storyDefault(value, index), data: { label: value.title, content: value.outline, kind: 'scene', connectable: false, tag: w.chapters.find(chapter => chapter.id === value.chapterId)?.title || '叙述场景', badge: `阅读 ${index + 1}`, tint: colors[lane % colors.length], people: [chars.find(character => character.id === value.povId)?.name || '全知 / 外部视角', ...sceneElements(w, value).places.slice(0, 2), `${value.eventIds.length} 个世界事件`] } };
       });
       edges = scenes.slice(1).map((value, index) => ({ id: `next:${scenes[index].id}:${value.id}`, source: scenes[index].id, target: value.id, type: 'smoothstep', markerEnd: { type: MarkerType.ArrowClosed }, style: { stroke: colors[(value.povId ? chars.findIndex(character => character.id === value.povId) : chars.length) % colors.length], strokeWidth: 2 } }));
     }
