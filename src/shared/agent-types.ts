@@ -23,6 +23,8 @@ export interface AgentCandidate {
   hash: string; commands: Command[]; changes: Change[]; workspace: Workspace;
   sources: EvidenceSource[]; reviews: CandidateReview[];
   status: 'draft' | 'awaitingApproval' | 'applied' | 'rejected' | 'stale';
+  /** Artifacts whose commands this cumulative candidate already contains. */
+  artifactIds?: string[];
   batchId?: string; appliedRevision?: number; commitCallKey?: string; createdAt: string;
 }
 export interface AgentArtifact {
@@ -74,6 +76,8 @@ export interface AgentRuntimeAPI {
   confirmMemory(projectId: string, id: string): Promise<void>;
   deleteMemory(projectId: string, id: string): Promise<void>;
 }
+/** A finished dependency's conclusion handed to a dependent author-side node. */
+export interface UpstreamResult { nodeId: string; role: Exclude<AgentRole, 'coordinator'>; label: string; objective: string; result: unknown }
 export interface SpecialistResult { step: AgentStep; text: string; structured?: unknown; commands?: Command[] }
 export interface SpecialistRequest { role: Exclude<AgentRole, 'coordinator'>; node: PlanNode; project: Workspace; request: RunRequest }
 export interface SearchChunk { source: EvidenceSource; title: string; text: string; score: number }

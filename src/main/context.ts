@@ -9,7 +9,7 @@ export const RECENT_TEXT_CHARS = 6000;
 export const WRITER_CONTEXT_CHARS = 28_000;
 /** Books with this few settings still hand all of them to a scene that names none. */
 export const ALL_SETTINGS_UP_TO = 6;
-export const WRITER_PRIORITY = ['scene', 'sceneElements', 'selectedText', 'style', 'authorRules', 'recentText', 'eventContexts', 'outlinePlan', 'novel', 'storySoFar', 'entityRecall', 'openThreads', 'initialCharacters'];
+export const WRITER_PRIORITY = ['scene', 'sceneElements', 'selectedText', 'style', 'authorRules', 'recentText', 'eventContexts', 'upstream', 'outlinePlan', 'novel', 'storySoFar', 'entityRecall', 'openThreads', 'initialCharacters'];
 
 export function resolveReferences(workspace: Workspace, references: SourceReference[] = []) {
   if (!Array.isArray(references)) throw new Error('参考资料必须是列表');

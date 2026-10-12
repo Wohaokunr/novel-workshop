@@ -127,6 +127,33 @@ export function validatePlan(nodes: PlanNode[], workspace: Workspace, request: R
   for (const node of nodes) visit(node);
 }
 
+/** Writer nodes run in reading order, each after the previous one, so every scene is written after the prose it follows.
+ * Only edges that cannot form a cycle are added (nodes already ordered either way are left alone). Returns how many were added. */
+export function chainWriterNodes(nodes: PlanNode[], workspace: Workspace, request: RunRequest): number {
+  const chapters = new Map([...workspace.chapters].sort((a, b) => a.order - b.order).map((chapter, index) => [chapter.id, index]));
+  const position = (node: PlanNode) => {
+    const scene = workspace.scenes.find(item => item.id === (node.sceneId ?? request.sceneId));
+    return scene ? [chapters.get(scene.chapterId) ?? Infinity, scene.order] : [Infinity, Infinity];
+  };
+  const writers = nodes.filter(node => node.role === 'writer').map(node => ({ node, at: position(node) }))
+    .sort((a, b) => a.at[0]! - b.at[0]! || a.at[1]! - b.at[1]!).map(item => item.node);
+  const byId = new Map(nodes.map(node => [node.id, node]));
+  const reaches = (from: PlanNode, target: string, seen = new Set<string>()): boolean => from.dependsOn.some(id => {
+    if (id === target) return true;
+    if (seen.has(id)) return false;
+    seen.add(id);
+    const next = byId.get(id);
+    return !!next && reaches(next, target, seen);
+  });
+  let added = 0;
+  for (let index = 1; index < writers.length; index++) {
+    const previous = writers[index - 1]!, node = writers[index]!;
+    if (reaches(node, previous.id) || reaches(previous, node.id)) continue;
+    node.dependsOn.push(previous.id); added++;
+  }
+  return added;
+}
+
 const collections = ['objectTypes', 'objects', 'acts', 'chapters', 'scenes', 'facts', 'knowledge', 'characterStates', 'cards', 'canvasLinks'] as const;
 const metadata = NOVEL_FIELDS;
 function changeValue(workspace: Workspace, change: Change): unknown {

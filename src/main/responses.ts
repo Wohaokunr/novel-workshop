@@ -6,7 +6,7 @@ import type { AgentStep, ProviderSecret, TokenUsage } from '../shared/types.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { DomainValidationError } from './domain.js';
 
-class ToolValidationError extends Error {}
+export class ToolValidationError extends Error {}
 
 export type JsonSchema = Record<string, unknown>;
 export interface ToolCallContext {

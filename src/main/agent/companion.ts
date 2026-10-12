@@ -13,7 +13,7 @@ import { NovelStore } from '../store.js';
 import { resolveReferences } from '../context.js';
 import { DomainValidationError } from '../domain.js';
 import { objectSchema, runAgent, type JsonSchema, type ResponseTransport } from '../responses.js';
-import { boundedContext, refreshMemories } from './memory.js';
+import { boundedContext, refreshMemories, selectAuthorRules } from './memory.js';
 import { sceneMentions } from './story-index.js';
 import { entityRecall, openThreads, storyOverview, StoryView } from './story-view.js';
 import { personNames, scaleNames, styleProfile } from '../../shared/style-types.js';
@@ -300,9 +300,7 @@ export class CompanionService {
       provider = await this.getProvider();
       if (provider.mode === 'live' && !provider.apiKey) throw new Error('请先在模型设置中填写 API Key');
       const project = this.store.getProject(thread.projectId);
-      const rules = refreshMemories(project, this.store.getAgentMemories(project.id))
-        .filter(memory => memory.status === 'active' && memory.confirmed && (memory.kind === 'preference' || memory.kind === 'constraint'))
-        .slice(0, 12).map(memory => ({ kind: memory.kind, content: memory.content.slice(0, 600) }));
+      const rules = selectAuthorRules(refreshMemories(project, this.store.getAgentMemories(project.id))).rules.map(memory => ({ kind: memory.kind, content: memory.content }));
       const last = thread.turns.at(-1)!;
       const fullDraft = thread.mode === 'outline' && /全书|完整|草案/.test(last.text);
       const direct = /直接给我|几个版本/.test(last.text);

@@ -306,12 +306,30 @@ export function refreshMemories(workspace: Workspace, memories: AgentMemory[]): 
   });
 }
 
+/** Character budget for confirmed author rules in any context; a fixed count silently dropped the oldest rules. */
+export const AUTHOR_RULES_CHARS = 6000;
+const AUTHOR_RULE_CHARS = 1000;
+/** Active, confirmed preferences and constraints: constraints first, then newest first (the store's order), within a character budget. */
+export function selectAuthorRules(memories: AgentMemory[], maxChars = AUTHOR_RULES_CHARS): { rules: AgentMemory[]; omitted: number } {
+  const active = memories.filter(memory => memory.status === 'active' && memory.confirmed && (memory.kind === 'constraint' || memory.kind === 'preference'));
+  const ordered = [...active.filter(memory => memory.kind === 'constraint'), ...active.filter(memory => memory.kind === 'preference')];
+  const rules: AgentMemory[] = [];
+  let remaining = maxChars;
+  for (const memory of ordered) {
+    const content = memory.content.length > AUTHOR_RULE_CHARS ? `${memory.content.slice(0, AUTHOR_RULE_CHARS)}…` : memory.content;
+    if (content.length > remaining) continue;
+    remaining -= content.length; rules.push({ ...memory, content });
+  }
+  return { rules, omitted: ordered.length - rules.length };
+}
+
 /** Coordinator overview: small catalogs centred on the target + layered story memory, never JSON.stringify(the entire book). */
 export function collectContext(workspace: Workspace, request: RunRequest, memories: AgentMemory[], story?: StoryView): unknown {
   if (workspace.id !== request.projectId) throw new DomainValidationError('上下文项目与任务不匹配');
   const materials = resolveReferences(workspace, request.references);
   const active = refreshMemories(workspace, memories).filter(memory => memory.projectId === workspace.id && memory.status === 'active');
   const take = <T>(items: T[], limit: number) => items.slice(0, limit);
+  const authorRules = selectAuthorRules(active);
   const briefScene = (scene: Workspace['scenes'][number]) => ({ id: scene.id, chapterId: scene.chapterId, title: scene.title,
     order: scene.order, povId: scene.povId, castIds: scene.castIds ?? [], settingIds: scene.settingIds ?? [], eventIds: scene.eventIds, outline: scene.outline.slice(0, 1000), text: scene.text.slice(0, 1800),
     omitted: { outlineChars: Math.max(0, scene.outline.length - 1000), textChars: Math.max(0, scene.text.length - 1800) } });
@@ -337,8 +355,7 @@ export function collectContext(workspace: Workspace, request: RunRequest, memori
     scope: { stage: request.stage, tool: request.tool, sceneId: request.sceneId, chapterId: request.chapterId, selection: request.selection,
       references: request.references ?? [], referencesAreWriteAuthorization: false,
       writeRule: request.stage === 'rewrite' ? '只允许目标正文选区；保护前后缀，不附带任何设定修改。' : request.stage === 'chapter' ? '只写目标场景/章节空白场景；保护正式正文，人物状态仅用同范围的合法场景证据。' : '可提出项目领域修改候选；必须经校验/审阅/作者批准，AI 不移动人工布局。' },
-    confirmedAuthorRules: take(active.filter(memory => memory.confirmed && (memory.kind === 'preference' || memory.kind === 'constraint')), 12)
-      .map(memory => ({ id: memory.id, kind: memory.kind, content: memory.content.slice(0, 1000), sourceMessageId: memory.sourceMessageId, sources: memory.sources.slice(0, 8) })),
+    confirmedAuthorRules: authorRules.rules.map(memory => ({ id: memory.id, kind: memory.kind, content: memory.content, sourceMessageId: memory.sourceMessageId, sources: memory.sources.slice(0, 8) })),
     storyMemory: storyOverview(view, anchorChapter),
     targetScenes: take(scoped, 12).map(briefScene),
     materials: { cards: take(materials.cards, 12).map(card => ({ ...cardContent(card), content: card.content.slice(0, 1200) })),
@@ -351,7 +368,7 @@ export function collectContext(workspace: Workspace, request: RunRequest, memori
       id: memory.id, kind: memory.kind, content: memory.content.slice(0, 700), formalTruth: false, notice: '摘要/经验仅是辅助，正式事实以仍有效的原始正文与领域记录为准。' })),
     omitted: { materialCards: Math.max(0, materials.cards.length - 12), materialObjects: Math.max(0, materials.objects.length - 12), materialScenes: Math.max(0, materials.scenes.length - 12),
       catalogObjects: Math.max(0, workspace.objects.length - 60), catalogScenes: Math.max(0, workspace.scenes.length - Math.min(60, nearScenes.length)),
-      catalogChapters: focus.omitted,
+      catalogChapters: focus.omitted, authorRules: authorRules.omitted,
       unselectedSceneBodies: workspace.scenes.filter(scene => !scoped.includes(scene) && !materials.scenes.some(item => item.id === scene.id)).length,
       notice: '非选定场景正文未载入；目录以目标章节为中心，其余章节只给骨架。逐层放大：read_story_memory 看章节/场景摘要或人物时间线，search_context 检索片段，read_text 读原文窗口。' },
   }, MAX_CONTEXT_CHARS, ['project', 'scope', 'confirmedAuthorRules', 'targetScenes', 'materials', 'storyMemory']);

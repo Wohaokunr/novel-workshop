@@ -234,6 +234,15 @@ export class NovelStore {
       if (hasSemanticChanges(before, next)) next.revision++;
       try { validateWorkspace(next); } catch (error) { throw new Error(`UNDO_CONFLICT：后续内容依赖本次修改，撤销未执行。${(error as Error).message}`); }
       for (const batch of batches) { batch.undone = true; this.db.prepare('UPDATE operations SET data=? WHERE id=?').run(JSON.stringify(batch), batch.id); }
+      // A run's experience ("已写入正式作品") stops being true once everything it applied has been undone.
+      for (const taskId of new Set(batches.flatMap(batch => batch.taskId ? [batch.taskId] : []))) {
+        if (history.some(batch => batch.taskId === taskId && !batch.undone)) continue;
+        const row = this.db.prepare('SELECT data FROM agent_memories WHERE project_id=? AND id=?').get(projectId, `experience-${taskId}`) as Row | undefined;
+        const memory = row ? JSON.parse(row.data) as AgentMemory : undefined;
+        if (memory?.kind !== 'experience' || memory.status !== 'active') continue;
+        const updatedAt = new Date().toISOString();
+        this.db.prepare('UPDATE agent_memories SET updated_at=?,data=? WHERE project_id=? AND id=?').run(updatedAt, json({ ...memory, status: 'stale', updatedAt }), projectId, memory.id);
+      }
       this.save(next); return next;
     });
   }

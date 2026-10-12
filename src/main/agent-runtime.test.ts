@@ -6,12 +6,14 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { randomUUID } from 'node:crypto';
 import type { ResponseOutputItem } from 'openai/resources/responses/responses';
-import type { AgentEvent, AgentRun, ProviderSecret, RunRequest } from '../shared/types.js';
+import type { AgentEvent, AgentRun, Command, ProviderSecret, RunRequest, Workspace } from '../shared/types.js';
 import { NovelStore } from './store.js';
 import { NovelAgentScheduler } from './agents.js';
 import { DemoAgentTransport } from './agent/demo.js';
 import { checkCancelled, type ModelRequest, type ModelResponse, type ResponseTransport } from './responses.js';
 import type { AgentCheckpoint } from './responses.js';
+import type { PlanNode, UpstreamResult } from '../shared/agent-types.js';
+import { MAX_EXPERIENCES, MAX_OUTPUT_REPAIRS } from './agent/runtime.js';
 
 const provider: ProviderSecret = { name: 'fixture', mode: 'mock', baseURL: 'https://example.invalid/v1', model: 'fixture', apiKey: '' };
 const waitingStates = ['awaitingApproval', 'awaitingInput', 'paused', 'failed', 'cancelled', 'completed'];
@@ -490,5 +492,191 @@ test('propose_changes 的 opsJson 经故事操作换算，ask_author 的选项�
     assert.equal(current.objects[0]!.name, '林舟');
     assert.equal(current.cards.length, 2);
     assert.equal(current.canvasLinks.length, 1);
+  } finally { store.close(); }
+});
+
+/** Coordinator that plans one planner node, then delegates it `times` times and records each delegate result. */
+function delegatingCoordinator(results: unknown[], times: number) {
+  let turn = 0;
+  return (request: ModelRequest) => {
+    const outputs = request.input.filter(item => item.type === 'function_call_output');
+    if (turn >= 2) results.push(JSON.parse(String((outputs.at(-1) as { output: string }).output)));
+    turn++;
+    if (turn === 1) return stream(tool('set_plan', { summary: '编排', nodes: [{ id: 'n1', role: 'planner', objective: '补一个人物', dependsOn: [], acceptance: '人物候选',
+      sceneId: null, chapterId: null, characterId: null, eventId: null }] }));
+    if (turn <= 1 + times) return stream(tool('delegate_tasks', { nodeIds: ['n1'] }));
+    return stream(tool('ask_author', { question: '继续吗？', options: [] }));
+  };
+}
+const rewritesProse = (project: Workspace) => reply({ summary: '改写正文', opsJson: '[]', commandsJson: JSON.stringify([{ type: 'putScene', value: { ...project.scenes[0]!, text: '覆盖作者正文' } }]) });
+const addsCharacter = reply({ summary: '补人物', commandsJson: '[]', opsJson: JSON.stringify([{ op: 'addCharacter', ref: 'c1', title: '许砚', content: '修钟学徒' }]) });
+
+test('专长输出未通过领域校验时带着原因让同一专长修正，而不是重放被拒的旧输出', { timeout: 15000 }, async () => {
+  const store = new NovelStore(':memory:');
+  try {
+    const project = scenes(store, ['人工正文']), results: unknown[] = [], planner: ModelRequest[] = [];
+    const coordinate = delegatingCoordinator(results, 1);
+    const h = harness(store, request => {
+      if (request.agentId !== 'planner') return coordinate(request);
+      planner.push(request);
+      return stream(planner.length === 1 ? rewritesProse(project) : addsCharacter);
+    });
+    const run = h.start({ projectId: project.id, stage: 'agent', objective: '补一个人物' });
+    assert.equal((await wait(store, run)).status, 'awaitingInput');
+    assert.equal(planner.length, 2);
+    const repair = planner[1]!.input.at(-1) as { role: string; content: string };
+    assert.equal(repair.role, 'user'); assert.match(repair.content, /运行时校验未通过：编排专家不能删除或改写已有正式正文/);
+    const delegated = results[0] as { artifacts: Array<{ structured: { commands: Command[] } }> };
+    assert.equal(delegated.artifacts.length, 1); assert.ok(delegated.artifacts[0]!.structured.commands.some(command => command.type === 'putObject'));
+    assert.equal(store.getRun(run.id)!.runtime!.plan!.nodes[0]!.status, 'completed');
+  } finally { store.close(); }
+});
+
+test('修正次数用尽后节点失败并说明原因，再次委派从头开始而不是复用同一份被拒输出', { timeout: 15000 }, async () => {
+  const store = new NovelStore(':memory:');
+  try {
+    const project = scenes(store, ['人工正文']), results: unknown[] = [], planner: ModelRequest[] = [];
+    const coordinate = delegatingCoordinator(results, 2);
+    const h = harness(store, request => {
+      if (request.agentId !== 'planner') return coordinate(request);
+      planner.push(request);
+      return stream(planner.length <= MAX_OUTPUT_REPAIRS + 1 ? rewritesProse(project) : addsCharacter);
+    });
+    const run = h.start({ projectId: project.id, stage: 'agent', objective: '补一个人物' });
+    assert.equal((await wait(store, run)).status, 'awaitingInput');
+    const [failed, retried] = results as [{ ok: boolean; reason: string }, { artifacts: unknown[] }];
+    assert.equal(failed.ok, false); assert.match(failed.reason, new RegExp(`连续 ${MAX_OUTPUT_REPAIRS + 1} 次输出未通过校验`));
+    assert.equal(planner.length, MAX_OUTPUT_REPAIRS + 2);
+    // The fresh attempt sees only its context, not the rejected history.
+    assert.equal(planner[MAX_OUTPUT_REPAIRS + 1]!.input.length, 1);
+    assert.equal(retried.artifacts.length, 1);
+    const steps = store.getRun(run.id)!.steps.filter(step => step.agentId === 'planner');
+    assert.deepEqual(steps.map(step => step.status), ['failed', 'completed']);
+  } finally { store.close(); }
+});
+
+test('不严格遵守 JSON Schema 的模型返回非 JSON 时同样获得修正机会', { timeout: 15000 }, async () => {
+  const store = new NovelStore(':memory:');
+  try {
+    const project = scenes(store, ['人工正文']), results: unknown[] = [], planner: ModelRequest[] = [];
+    const coordinate = delegatingCoordinator(results, 1);
+    const h = harness(store, request => {
+      if (request.agentId !== 'planner') return coordinate(request);
+      planner.push(request);
+      return stream(planner.length === 1 ? reply('好的，下面是我的方案：新增人物许砚。') : addsCharacter);
+    });
+    const run = h.start({ projectId: project.id, stage: 'agent', objective: '补一个人物' });
+    assert.equal((await wait(store, run)).status, 'awaitingInput');
+    assert.equal(planner.length, 2); assert.match(String((planner[1]!.input.at(-1) as { content: string }).content), /运行时校验未通过/);
+    assert.equal((results[0] as { artifacts: unknown[] }).artifacts.length, 1);
+  } finally { store.close(); }
+});
+
+test('创作经验不随无关修改失效；撤销该任务的修改后过期，过期与超量经验在下次完成时清理', { timeout: 20000 }, async () => {
+  const store = new NovelStore(':memory:');
+  try {
+    const project = store.createProject('经验'), h = harness(store);
+    const run = h.start({ projectId: project.id, stage: 'idea', objective: '发散小说构思' });
+    assert.equal((await approve(store, h.scheduler, run)).status, 'completed');
+    const experience = () => store.getAgentMemories(project.id).find(memory => memory.id === `experience-${run.id}`);
+    assert.equal(experience()?.status, 'active'); assert.deepEqual(experience()?.sources, []); assert.match(experience()!.content, /^目标：发散小说构思\n结果：/);
+    const edited = store.execute({ projectId: project.id, expectedRevision: store.getProject(project.id).revision, actor: 'human', commands: [{ type: 'putCard', value: { id: 'human-note', kind: 'note', title: '作者便笺', content: '与本次任务无关的修改', x: 0, y: 0 } }] });
+    assert.equal(h.scheduler.getMemories(project.id).find(memory => memory.id === `experience-${run.id}`)?.status, 'active');
+    store.undo(edited.id, run.id);
+    assert.equal(experience()?.status, 'stale');
+
+    for (let index = 0; index < MAX_EXPERIENCES + 5; index++) {
+      const at = new Date(Date.UTC(2026, 0, 1, 0, index)).toISOString();
+      store.putAgentMemory({ id: `old-${index}`, projectId: project.id, kind: 'experience', content: `旧经验${index}`, confirmed: true, status: 'active', sources: [], createdAt: at, updatedAt: at });
+    }
+    const analysis = h.start({ projectId: project.id, stage: 'agent', objective: '仅分析现有作品的问题，不要改动作品' });
+    assert.equal((await wait(store, analysis)).status, 'completed');
+    const experiences = store.getAgentMemories(project.id).filter(memory => memory.kind === 'experience');
+    assert.equal(experiences.length, MAX_EXPERIENCES); assert.ok(experiences.every(memory => memory.status === 'active'));
+    assert.equal(experiences[0]!.id, `experience-${analysis.id}`); assert.ok(!experiences.some(memory => memory.id === `experience-${run.id}` || memory.id === 'old-0'));
+  } finally { store.close(); }
+});
+
+test('依赖节点读到前置结论：角色代入进入写作上下文，后一场读到前一场刚写、尚未组成候选的正文', { timeout: 20000 }, async () => {
+  const store = new NovelStore(':memory:');
+  try {
+    const initial = store.createProject('依赖传递'), chapterId = initial.chapters[0]!.id;
+    const project = store.execute({ projectId: initial.id, actor: 'human', commands: [
+      { type: 'putObject', value: { id: 'hero', typeId: 'character', name: '林舟', fields: { selfKnowledge: '修钟学徒' } } },
+      { type: 'putObject', value: { id: 'ev', typeId: 'event', name: '钟声', fields: {}, event: { worldOrder: 1, timeLabel: '', thread: '主线', participants: ['hero'], causes: [], critical: true, observations: { hero: '听见第十三声钟响' } } } },
+      ...[0, 1].map(order => ({ type: 'putScene' as const, value: { id: `s${order}`, chapterId, order, title: `场景${order}`, text: '', outline: '林舟追查钟声', povId: 'hero', eventIds: ['ev'] } })),
+    ] });
+    const writers = new Map<string, Record<string, any>>(), results: any[] = [];
+    let turn = 0;
+    const h = harness(store, (request, signal, demo) => {
+      if (request.agentId === 'writer') {
+        const { context } = JSON.parse(String((request.input[0] as { content: string }).content));
+        writers.set(context.scene.id, context);
+        return stream(reply(context.scene.id === 's0' ? '铜钟响了第十三下，林舟攥紧了扳手。' : '他沿着钟楼的台阶往上走。'));
+      }
+      if (request.agentId !== 'coordinator') return demo.stream(request, signal);
+      const outputs = request.input.filter(item => item.type === 'function_call_output');
+      if (outputs.length) results.push(JSON.parse(String((outputs.at(-1) as { output: string }).output)));
+      turn++;
+      const node = (id: string, role: PlanNode['role'], patch: Partial<Record<string, string | string[] | null>>) => ({ id, role, objective: '写本章', acceptance: '完成', dependsOn: [],
+        sceneId: null, chapterId: null, characterId: null, eventId: null, ...patch });
+      if (turn === 1) return stream(tool('set_plan', { summary: '先代入再写', nodes: [node('p', 'character', { sceneId: 's0', characterId: 'hero', eventId: 'ev' }),
+        node('w1', 'writer', { sceneId: 's1' }), node('w0', 'writer', { sceneId: 's0', dependsOn: ['p'] })] }));
+      if (turn === 2) return stream(tool('delegate_tasks', { nodeIds: ['p'] }));
+      if (turn === 3) return stream(tool('delegate_tasks', { nodeIds: ['w0'] }));
+      if (turn === 4) return stream(tool('delegate_tasks', { nodeIds: ['w1'] }));
+      return stream(tool('ask_author', { question: '继续吗？', options: [] }));
+    });
+    const run = h.start({ projectId: project.id, stage: 'chapter', chapterId, objective: '写完本章' });
+    assert.equal((await wait(store, run)).status, 'awaitingInput');
+    const plan = results[0] as { nodes: PlanNode[]; next: { notice: string } };
+    assert.deepEqual(plan.nodes.find(node => node.id === 'w1')!.dependsOn, ['w0']); assert.match(plan.next.notice, /按阅读顺序串联/);
+    const first = writers.get('s0')!, second = writers.get('s1')!;
+    const perspective = first.upstream.results.find((item: UpstreamResult) => item.role === 'character');
+    assert.ok(perspective?.result.conclusion.perspective, '角色代入结论进入写作上下文');
+    assert.ok(second.recentText.some((item: { text: string }) => item.text.includes('铜钟响了第十三下')), '后一场读到前一场新写的正文');
+    assert.ok(second.upstream.results.some((item: UpstreamResult) => item.nodeId === 'w0' && (item.result as { changesInWorkspace?: boolean }).changesInWorkspace));
+    assert.equal(store.getProject(project.id).scenes.find(scene => scene.id === 's0')!.text, '', '正式作品零写入');
+  } finally { store.close(); }
+});
+
+test('协调者中途只用文字作答时，运行时提醒把尚未组成候选的后续产物并入候选', { timeout: 15000 }, async () => {
+  const store = new NovelStore(':memory:');
+  try {
+    const project = store.createProject('补全候选'), coordinator: ModelRequest[] = [];
+    const planner = (title: string) => reply({ summary: title, commandsJson: '[]', opsJson: JSON.stringify([{ op: 'addCharacter', ref: 'c1', title }]) });
+    const h = harness(store, (request, signal, demo) => {
+      if (request.agentId === 'planner') return stream(planner(JSON.parse(String((request.input[0] as { content: string }).content)).objective));
+      if (request.agentId !== 'coordinator') return demo.stream(request, signal);
+      coordinator.push(request);
+      const last = JSON.parse(String((request.input.filter(item => item.type === 'function_call_output').at(-1) as { output?: string } | undefined)?.output ?? '{}'));
+      const node = (id: string, objective: string) => ({ id, role: 'planner', objective, acceptance: '人物', dependsOn: [], sceneId: null, chapterId: null, characterId: null, eventId: null });
+      switch (coordinator.length) {
+        case 1: return stream(tool('set_plan', { summary: '两个人物', nodes: [node('n1', '许砚'), node('n2', '沈照')] }));
+        case 2: return stream(tool('delegate_tasks', { nodeIds: ['n1'] }));
+        case 3: return stream(tool('propose_changes', { label: '许砚', artifactIds: last.artifacts.map((artifact: { id: string }) => artifact.id), commandsJson: '', opsJson: '' }));
+        case 4: return stream(tool('delegate_tasks', { nodeIds: ['n2'] }));
+        case 5: return stream(reply('两个人物都设计好了。'));
+        default: return stream(tool('ask_author', { question: '继续吗？', options: [] }));
+      }
+    });
+    const run = h.start({ projectId: project.id, stage: 'agent', objective: '设计两个人物' });
+    assert.equal((await wait(store, run)).status, 'awaitingInput');
+    const second = store.getRun(run.id)!.runtime!.plan!.nodes.find(node => node.id === 'n2')!.artifactId!;
+    const reminder = coordinator[5]!.input.at(-1) as { role: string; content: string };
+    assert.equal(reminder.role, 'user'); assert.match(reminder.content, /propose_changes/); assert.ok(reminder.content.includes(second));
+  } finally { store.close(); }
+});
+
+test('作者保存的约束进入编排专长的上下文，而不只给协调者和写作者', { timeout: 15000 }, async () => {
+  const store = new NovelStore(':memory:');
+  try {
+    const project = store.createProject('约束'), planner: ModelRequest[] = [];
+    const h = harness(store, (request, signal, demo) => { if (request.agentId === 'planner') planner.push(request); return demo.stream(request, signal); });
+    await h.scheduler.saveMemory(project.id, '全书不出现穿越元素', 'constraint');
+    const run = h.start({ projectId: project.id, stage: 'agent', objective: '构思小说并编排三幕大纲' });
+    assert.equal((await wait(store, run)).status, 'awaitingApproval');
+    const { context } = JSON.parse(String((planner[0]!.input[0] as { content: string }).content));
+    assert.deepEqual(context.authorRules, [{ kind: 'constraint', content: '全书不出现穿越元素' }]);
   } finally { store.close(); }
 });

@@ -1,13 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import type { AgentEvent, AgentRun, AgentStep, Command, ProviderSecret, RunRequest, Workspace } from '../../shared/types.js';
-import type { AgentArtifact, AgentCandidate, AgentDecision, AgentMemory, AgentReceipt, AgentRuntimeSummary, AgentState, EvidenceSource, PlanNode } from '../../shared/agent-types.js';
+import type { AgentArtifact, AgentCandidate, AgentDecision, AgentMemory, AgentPlan, AgentReceipt, AgentRuntimeSummary, AgentState, EvidenceSource, PlanNode, UpstreamResult } from '../../shared/agent-types.js';
 import { NovelStore } from '../store.js';
 import { buildWriterContext, resolveReferences, WRITER_CONTEXT_CHARS, WRITER_PRIORITY } from '../context.js';
 import { DomainValidationError, hasSemanticChanges } from '../domain.js';
-import { addUsage, AgentSuspended, emptyUsage, runAgent, settleCheckpointTool, type AgentCheckpoint, type AgentDefinition, type ResponseTransport, type ToolCallContext } from '../responses.js';
-import { boundedContext, collectContext, compactChanges, fingerprint, refreshMemories, searchContext, sourcesForWorkspace } from './memory.js';
-import { assertWriteScope, canProposeCommands, createBudget, touchesProse, validatePlan } from './policy.js';
-import { specialistDefinition } from './specialists.js';
+import type { ResponseInputItem } from 'openai/resources/responses/responses';
+import { addUsage, AgentSuspended, emptyUsage, runAgent, settleCheckpointTool, ToolValidationError, type AgentCheckpoint, type AgentDefinition, type ResponseTransport, type ToolCallContext } from '../responses.js';
+import { boundedContext, collectContext, compactChanges, fingerprint, refreshMemories, searchContext, selectAuthorRules, sourcesForWorkspace } from './memory.js';
+import { assertWriteScope, canProposeCommands, canReadAuthor, chainWriterNodes, createBudget, touchesProse, validatePlan } from './policy.js';
+import { specialistDefinition, type SpecialistDefinition } from './specialists.js';
 import { createCoordinatorTools, type ToolName } from './tools.js';
 import { sceneMentions } from './story-index.js';
 import { StoryView } from './story-view.js';
@@ -20,6 +21,28 @@ const terminal = new Set(['completed', 'failed', 'cancelled']);
 const roles = new Set(['theme', 'planner', 'world', 'narrative', 'canvas', 'cast', 'writer', 'character', 'evolution', 'reader', 'continuity']);
 /** Times a run is nudged to carry on after the coordinator answers with text while work is still pending. */
 const MAX_CONTINUATIONS = 3;
+/** Recent run experiences kept per project; older and stale ones are deleted when a run completes. */
+export const MAX_EXPERIENCES = 20;
+/** Times a specialist is shown why its output was rejected and asked again, before the node fails. */
+export const MAX_OUTPUT_REPAIRS = 2;
+const REPAIR_NOTICE = '运行时校验未通过：';
+/** Dependency conclusions handed to a dependent node: the nearest few, each clipped. */
+const MAX_UPSTREAM = 6, UPSTREAM_TEXT_CHARS = 1500;
+function commandsOf(artifact: AgentArtifact): Command[] { return (artifact.structured as { commands?: Command[] } | undefined)?.commands ?? []; }
+function clipText(text: string, length: number) { return text.length > length ? `${text.slice(0, length)}…` : text; }
+/** A dependency's conclusion without its raw commands; writer prose is pointed to in the workspace when it was folded in. */
+function upstreamResult(artifact: AgentArtifact, inWorkspace: boolean): unknown {
+  const changes = commandsOf(artifact).length ? { changesInWorkspace: inWorkspace } : {};
+  if (artifact.role === 'writer') return inWorkspace ? { prose: '本场正文已并入工作区，可从上下文的原文中读到。', ...changes } : { proseTail: artifact.text.slice(-UPSTREAM_TEXT_CHARS), ...changes };
+  const structured = artifact.structured && typeof artifact.structured === 'object' && !Array.isArray(artifact.structured)
+    ? Object.fromEntries(Object.entries(artifact.structured).filter(([key]) => !['commands', 'commandsJson', 'opsJson'].includes(key))) : undefined;
+  const conclusion: unknown = structured && Object.keys(structured).length ? structured : artifact.text;
+  const text = typeof conclusion === 'string' ? conclusion : JSON.stringify(conclusion);
+  return { conclusion: text.length > UPSTREAM_TEXT_CHARS ? clipText(text, UPSTREAM_TEXT_CHARS) : conclusion, ...changes };
+}
+function isRepairRequest(item: ResponseInputItem): boolean {
+  return 'role' in item && item.role === 'user' && typeof item.content === 'string' && item.content.startsWith(REPAIR_NOTICE);
+}
 
 interface Entry { run: AgentRun; state: AgentState; controller: AbortController; provider?: ProviderSecret; transport?: ResponseTransport; stop?: 'paused' | 'cancelled'; done?: Promise<void>; activeSince?: number }
 function stamp() { return new Date().toISOString(); }
@@ -269,8 +292,7 @@ export class PersistentAgentRuntime {
       const summaryId = `run-summary-${entry.run.id}`;
       if (!session.messages.some(message => message.id === summaryId)) session.messages.push({ id: summaryId, role: 'agent', text: entry.state.finalSummary, runId: entry.run.id, at: stamp() });
       session.updatedAt = stamp(); this.store.saveSession(session);
-      this.store.putAgentMemory({ id: `experience-${entry.run.id}`, projectId: entry.run.projectId, kind: 'experience', content: entry.state.finalSummary,
-        confirmed: true, status: 'active', sources: sourcesForWorkspace(this.store.getProject(entry.run.projectId)).slice(0, 1), sourceMessageId: summaryId, createdAt: entry.run.startedAt, updatedAt: stamp() });
+      this.recordExperience(entry, summaryId);
     } catch (error) {
       if (entry.stop === 'cancelled') { entry.run.status = 'cancelled'; entry.run.finishedAt = stamp(); entry.state.waiting = undefined; }
       else if (entry.stop === 'paused' || error instanceof AgentSuspended) {
@@ -327,6 +349,16 @@ export class PersistentAgentRuntime {
     if (entry.controller.signal.aborted || entry.stop) throw new AgentSuspended(entry.stop === 'cancelled' ? '任务取消' : '任务暂停');
     if (entry.state.budget.activeMs >= entry.state.budget.maxActiveMs) throw new AgentSuspended('任务活动时长预算耗尽');
   }
+  /** An experience is advisory history, not evidence: it is not bound to content hashes (any later edit would void it),
+   * goes stale when the run's applied changes are undone (see NovelStore.undo), and only the most recent ones are kept. */
+  private recordExperience(entry: Entry, summaryId: string) {
+    const projectId = entry.run.projectId, objective = entry.run.objective.trim();
+    this.store.putAgentMemory({ id: `experience-${entry.run.id}`, projectId, kind: 'experience', content: `目标：${objective.length > 200 ? `${objective.slice(0, 200)}…` : objective}\n结果：${entry.state.finalSummary}`,
+      confirmed: true, status: 'active', sources: [], sourceMessageId: summaryId, createdAt: entry.run.startedAt, updatedAt: stamp() });
+    const experiences = this.store.getAgentMemories(projectId).filter(memory => memory.kind === 'experience');
+    const kept = new Set(experiences.filter(memory => memory.status !== 'stale').slice(0, MAX_EXPERIENCES).map(memory => memory.id));
+    for (const memory of experiences) if (!kept.has(memory.id)) this.store.deleteAgentMemory(projectId, memory.id);
+  }
   private memories(projectId: string) {
     const project = this.store.getProject(projectId), memories = this.store.getAgentMemories(projectId);
     const refreshed = refreshMemories(project, memories);
@@ -335,8 +367,36 @@ export class PersistentAgentRuntime {
   }
   private workspace(entry: Entry, candidateId?: unknown): Workspace {
     if (candidateId) return this.candidate(entry, String(candidateId)).workspace;
-    const candidate = [...entry.state.candidates].reverse().find(value => value.status === 'draft' || value.status === 'awaitingApproval');
-    return candidate?.workspace ?? entry.state.baseWorkspace;
+    return this.workingCandidate(entry)?.workspace ?? entry.state.baseWorkspace;
+  }
+  private workingCandidate(entry: Entry): AgentCandidate | undefined {
+    return [...entry.state.candidates].reverse().find(value => value.status === 'draft' || value.status === 'awaitingApproval');
+  }
+  /** What a plan node builds on. Its dependencies' commands that the working candidate does not contain yet are previewed on top of it,
+   * so a scene is written after the prose just written before it; author-side roles also get the dependencies' conclusions. */
+  private nodeInputs(entry: Entry, plan: AgentPlan, node: PlanNode): { workspace: Workspace; upstream: UpstreamResult[] } {
+    const byId = new Map(plan.nodes.map(item => [item.id, item])), seen = new Set<string>(), ordered: PlanNode[] = [];
+    const visit = (id: string) => {
+      const item = byId.get(id);
+      if (!item || seen.has(id)) return;
+      seen.add(id); item.dependsOn.forEach(visit); ordered.push(item);
+    };
+    node.dependsOn.forEach(visit);
+    const finished = ordered.flatMap(item => {
+      const artifact = item.status === 'completed' ? entry.state.artifacts.find(value => value.id === item.artifactId) : undefined;
+      return artifact ? [{ node: item, artifact }] : [];
+    });
+    const working = this.workingCandidate(entry), included = new Set(working?.artifactIds ?? []);
+    const pending = finished.filter(({ artifact }) => !included.has(artifact.id) && commandsOf(artifact).length);
+    let workspace = working?.workspace ?? entry.state.baseWorkspace;
+    if (pending.length) {
+      try {
+        workspace = this.store.previewCommands(workspace, pending.flatMap(({ artifact }) => commandsOf(artifact))).workspace;
+        for (const { artifact } of pending) included.add(artifact.id);
+      } catch { /* Conflicting drafts stay out of the workspace; their conclusions are still passed below. */ }
+    }
+    return { workspace, upstream: finished.slice(-MAX_UPSTREAM).map(({ node: item, artifact }) => ({ nodeId: item.id, role: item.role, label: artifact.label,
+      objective: clipText(item.objective, 200), result: upstreamResult(artifact, included.has(artifact.id)) })) };
   }
   private candidate(entry: Entry, id: string): AgentCandidate { return entry.state.candidates.find(candidate => candidate.id === id) ?? fail('候选不存在或不属于此任务'); }
   private sources(entry: Entry) { return sourcesForWorkspace(entry.state.baseWorkspace); }
@@ -411,11 +471,12 @@ export class PersistentAgentRuntime {
         const nodes = (args.nodes as Array<Record<string, unknown>>).map(raw => Object.fromEntries(Object.entries(raw).filter(([, value]) => value !== null)) as unknown as PlanNode);
         for (const node of nodes) { if (!roles.has(node.role)) fail('专长不存在'); node.status = 'pending'; }
         validatePlan(nodes, this.workspace(entry), entry.run);
+        const chained = chainWriterNodes(nodes, this.workspace(entry), entry.run);
         if (state.plan) state.budget.replans++;
         state.planVersion = (state.planVersion ?? state.plan?.version ?? 0) + 1;
         state.plan = { version: state.planVersion, summary: String(args.summary), nodes };
         const ready = nodes.filter(node => !node.dependsOn.length).slice(0, state.budget.maxParallel).map(node => node.id);
-        return { ...state.plan, next: { tool: 'delegate_tasks', nodeIds: ready, notice: '计划已保存但尚未执行，请立即 delegate_tasks。' } };
+        return { ...state.plan, next: { tool: 'delegate_tasks', nodeIds: ready, notice: `计划已保存但尚未执行，请立即 delegate_tasks。${chained ? '写作节点已按阅读顺序串联：后一场会读到前一场刚写的正文。' : ''}` } };
       }
       case 'delegate_tasks': {
         if (!state.plan) fail('先保存任务计划');
@@ -427,7 +488,8 @@ export class PersistentAgentRuntime {
           if (node.status === 'completed') return state.artifacts.find(artifact => artifact.id === node.artifactId)!;
           node.status = 'running'; this.publish(entry);
           try {
-            const artifact = await this.specialist(entry, node, `node:${plan.version}:${node.id}`);
+            const { workspace, upstream } = this.nodeInputs(entry, plan, node);
+            const artifact = await this.specialist(entry, node, `node:${plan.version}:${node.id}`, workspace, undefined, upstream);
             node.status = 'completed'; node.artifactId = artifact.id; this.publish(entry); return artifact;
           } catch (error) { node.status = error instanceof AgentSuspended || entry.controller.signal.aborted ? 'running' : 'failed'; this.publish(entry); throw error; }
         }));
@@ -467,7 +529,8 @@ export class PersistentAgentRuntime {
         const version = (state.candidates.at(-1)?.version ?? 0) + 1;
         const candidate: AgentCandidate = { id: `candidate-${fingerprint(call.key).slice(0, 24)}`, runId: entry.run.id, projectId, label: String(args.label), baseRevision: state.baseWorkspace.revision,
           version, hash: fingerprint({ baseRevision: state.baseWorkspace.revision, commands: preview.commands, changes: preview.changes }), commands: preview.commands, workspace: preview.workspace,
-          changes: preview.changes, sources: this.sources(entry), reviews: [], status: 'draft', createdAt: stamp() };
+          changes: preview.changes, sources: this.sources(entry), reviews: [], status: 'draft', createdAt: stamp(),
+          artifactIds: [...new Set([...(latest?.artifactIds ?? []), ...args.artifactIds as string[]])] };
         if (latest) latest.status = 'stale';
         state.candidates.push(candidate);
         if (latest?.reviews.length) state.budget.revisions++;
@@ -538,12 +601,15 @@ export class PersistentAgentRuntime {
       const ready = pending.filter(node => node.dependsOn.every(id => done.has(id))).slice(0, entry.state.budget.maxParallel).map(node => node.id);
       if (ready.length) return `计划还有 ${pending.length} 个未执行节点，请调用 delegate_tasks 执行 ${JSON.stringify(ready)}；有修改的产物再用 propose_changes 组成候选。`;
     }
+    // Fold every plan result into the candidate before reviewing or committing it. Candidates from before
+    // artifact tracking only tell whether anything was proposed at all.
+    const tracked = candidates.every(candidate => candidate.artifactIds), proposed = new Set(candidates.flatMap(candidate => candidate.artifactIds ?? []));
+    const unproposed = entry.state.artifacts.filter(artifact => commandsOf(artifact).length
+      && (tracked ? !proposed.has(artifact.id) && !!plan?.nodes.some(node => node.artifactId === artifact.id) : !candidates.length));
+    if (unproposed.length) return `已有 ${unproposed.length} 个带修改的产物尚未组成候选，请调用 propose_changes（artifactIds=${JSON.stringify(unproposed.map(artifact => artifact.id))}）。`;
     const draft = [...candidates].reverse().find(candidate => candidate.status === 'draft');
     if (draft && touchesProse(draft) && !draft.reviews.some(review => review.candidateHash === draft.hash)) return `候选 ${draft.id} 修改了正文，请先 review_candidate。`;
     if (draft) return `候选 ${draft.id} 尚未提交作者批准，请调用 commit_candidate（candidateHash=${draft.hash}）。`;
-    const unproposed = entry.state.artifacts.filter(artifact => (artifact.structured as { commands?: unknown[] } | undefined)?.commands?.length
-      && !candidates.length);
-    if (unproposed.length) return `已有 ${unproposed.length} 个带修改的产物尚未组成候选，请调用 propose_changes（artifactIds=${JSON.stringify(unproposed.map(artifact => artifact.id))}）。`;
     return '';
   }
 
@@ -599,7 +665,7 @@ export class PersistentAgentRuntime {
     }
   }
 
-  private async specialist(entry: Entry, node: PlanNode, slot: string, workspace = this.workspace(entry), focusSceneIds?: string[]): Promise<AgentArtifact> {
+  private async specialist(entry: Entry, node: PlanNode, slot: string, workspace = this.workspace(entry), focusSceneIds?: string[], upstream?: UpstreamResult[]): Promise<AgentArtifact> {
     const previous = entry.state.artifacts.find(artifact => artifact.id === `artifact-${fingerprint(`${entry.run.id}:${slot}`).slice(0, 24)}`);
     if (previous) return previous;
     const reservations = entry.state.reservedChildren ??= [];
@@ -617,20 +683,47 @@ export class PersistentAgentRuntime {
       const original = entry.state.baseWorkspace.scenes.find(scene => scene.id === candidateScene.id)!;
       specialistRequest = { ...entry.run, selection: { ...entry.run.selection, end: entry.run.selection.end + candidateScene.text.length - original.text.length } };
     }
-    const authorRules = node.role === 'writer' ? this.memories(entry.run.projectId).filter(memory => memory.status === 'active' && (memory.kind === 'preference' || memory.kind === 'constraint'))
-      .map(memory => ({ kind: memory.kind, content: memory.content })) : undefined;
-    const specification = specialistDefinition({ role: node.role, node, project: workspace, request: specialistRequest, story: this.story(workspace), focusSceneIds, authorRules });
+    // Author rules go wherever author material may go; character, reader and stylist views stay bounded.
+    const authorRules = canReadAuthor(node.role) ? selectAuthorRules(this.memories(entry.run.projectId)).rules.map(memory => ({ kind: memory.kind, content: memory.content })) : undefined;
+    const specification = specialistDefinition({ role: node.role, node, project: workspace, request: specialistRequest, story: this.story(workspace), focusSceneIds, authorRules, upstream });
     if (canProposeCommands(node.role)) {
       const candidate = [...entry.state.candidates].reverse().find(candidate => candidate.workspace === workspace);
       const reviews = candidate?.reviews.filter(review => review.candidateHash === candidate.hash);
       if (reviews?.length) specification.context = { ...(specification.context as Record<string, unknown>), candidateReviews: reviews.map(({ role, verdict, issues, recommendation }) => ({ role, verdict, issues, recommendation })) };
     }
-    const step = await this.model(entry, slot, specification.definition, specification.context, specification.objective, specification.sources);
-    const commands = specification.toCommands?.(step);
+    const { step, commands } = await this.specialistOutput(entry, slot, specification);
     const structured = commands ? { ...(step.structured && typeof step.structured === 'object' ? step.structured : {}), commands } : step.structured;
     const artifact: AgentArtifact = { id: `artifact-${fingerprint(`${entry.run.id}:${slot}`).slice(0, 24)}`, nodeId: node.id, role: node.role, label: specification.definition.label,
       text: step.output, structured, stepId: step.id, sources: specification.sources, createdAt: stamp() };
     this.check(entry); entry.state.artifacts.push(artifact); this.publish(entry); return artifact;
+  }
+
+  /** Run a specialist and convert its output. A schema or domain rejection goes back to the same specialist as feedback a bounded
+   * number of times; once exhausted the slot is cleared, so delegating the node again starts over instead of replaying the rejected output. */
+  private async specialistOutput(entry: Entry, slot: string, specification: SpecialistDefinition): Promise<{ step: AgentStep; commands?: Command[] }> {
+    while (true) {
+      try {
+        const step = await this.model(entry, slot, specification.definition, specification.context, specification.objective, specification.sources);
+        return { step, commands: specification.toCommands?.(step) };
+      } catch (error) {
+        const cp = entry.state.checkpoints[slot] as AgentCheckpoint | undefined;
+        const rejected = error instanceof DomainValidationError || error instanceof ToolValidationError || error instanceof SyntaxError;
+        const answered = cp?.phase === 'completed' || (cp?.phase === 'tools' && !cp.pendingCalls.length);
+        if (!rejected || !cp || !answered || entry.controller.signal.aborted || entry.stop) throw error;
+        const reason = error instanceof Error ? error.message : String(error);
+        const used = cp.input.filter(isRepairRequest).length;
+        if (used >= MAX_OUTPUT_REPAIRS) {
+          delete entry.state.checkpoints[slot];
+          const published = entry.run.steps.find(step => step.id === cp.step.id);
+          if (published) { published.status = 'failed'; published.finishedAt ??= stamp(); }
+          this.publish(entry);
+          fail(`${specification.definition.label}连续 ${used + 1} 次输出未通过校验：${reason}。请调整该节点的目标或范围（set_plan）后再委派`);
+        }
+        cp.input.push({ role: 'user', content: `${REPAIR_NOTICE}${reason}\n请对照要求修正，重新输出完整结果（格式不变），不要解释。` });
+        cp.turn++; cp.phase = 'ready'; cp.pendingCalls = []; cp.cursor = 0; cp.uncertain = false;
+        this.publish(entry);
+      }
+    }
   }
 
   /** Zoom levels between the overview and raw text: chapter / scene digests for a range, or an entity's timeline. */
