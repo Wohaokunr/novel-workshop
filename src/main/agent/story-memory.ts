@@ -3,7 +3,7 @@ import type { ResponseOutputItem, ResponseStreamEvent } from 'openai/resources/r
 import type { AgentEvent, ProviderSecret, TokenUsage, Workspace } from '../../shared/types.js';
 import type { RollupDigest, SceneDigest, StoryDigest, StoryMemoryStatus } from '../../shared/story-types.js';
 import { NovelStore } from '../store.js';
-import { addUsage, checkCancelled, emptyUsage, objectSchema, runAgent, type JsonSchema, type ModelRequest, type ModelResponse, type ResponseTransport } from '../responses.js';
+import { addUsage, checkCancelled, emptyUsage, ModelOutputError, objectSchema, runAgent, ToolValidationError, type JsonSchema, type ModelRequest, type ModelResponse, type ResponseTransport } from '../responses.js';
 import { extractSummary, sceneHash, textSketch } from './story-index.js';
 import { StoryView } from './story-view.js';
 
@@ -51,11 +51,11 @@ export class StoryMemoryService {
   constructor(private store: NovelStore, private getProvider: () => ProviderSecret | Promise<ProviderSecret>,
     private onEvent: (event: AgentEvent) => void, private transportFactory: (provider: ProviderSecret) => ResponseTransport) {}
 
-  /** Summary model when configured; the reasoning parameter belongs to the main model only. */
+  /** Summary model when configured; the reasoning parameter and output limit belong to the main model only. */
   static summaryProvider(provider: ProviderSecret): ProviderSecret {
     const model = provider.summaryModel?.trim();
     if (!model) return provider;
-    const { reasoningEffort: _effort, ...rest } = provider;
+    const { reasoningEffort: _effort, maxOutputTokens: _limit, ...rest } = provider;
     return { ...rest, model };
   }
 
@@ -108,13 +108,22 @@ export class StoryMemoryService {
       const summary = StoryMemoryService.summaryProvider(provider), transport = this.transportFactory(summary);
       // Each target is attempted once per run; edits made meanwhile are picked up by the follow-up run.
       const attempted = new Set<string>();
+      // An answer that does not fit one batch skips only that batch, which stays pending for the next run;
+      // a service or connection error stops the run, since every later batch would hit it too.
+      let skipped = 0, lastSkip = '';
+      const attempt = async (work: () => Promise<void>) => {
+        try { await work(); } catch (failure) {
+          if (controller.signal.aborted || !(failure instanceof ModelOutputError || failure instanceof ToolValidationError || failure instanceof SyntaxError)) throw failure;
+          skipped++; lastSkip = failure.message;
+        }
+      };
       while (!controller.signal.aborted) {
         const project = this.store.getProject(projectId);
         const view = new StoryView(project, this.store.getStoryDigests(projectId));
         const batch = digestBatch(view, attempted);
         if (!batch.length) break;
         for (const scene of batch) attempted.add(scene.id);
-        await this.digestScenes(project, view, batch, transport, summary.model, controller.signal);
+        await attempt(() => this.digestScenes(project, view, batch, transport, summary.model, controller.signal));
         await this.emit(projectId);
       }
       for (const kind of ['chapter', 'volume', 'book'] as const) {
@@ -123,9 +132,10 @@ export class StoryMemoryService {
           const work = rollupBatch(new StoryView(project, this.store.getStoryDigests(projectId)), kind, attempted);
           if (!work.length) break;
           for (const item of work) attempted.add(`${kind}:${item.id}`);
-          await this.rollup(project, kind, work, transport, summary.model, controller.signal);
+          await attempt(() => this.rollup(project, kind, work, transport, summary.model, controller.signal));
         }
       }
+      if (skipped && !controller.signal.aborted) this.errors.set(projectId, `${skipped} 批内容整理失败，下次整理时重试：${lastSkip}`);
       if (!controller.signal.aborted) {
         const project = this.store.getProject(projectId), view = new StoryView(project);
         this.store.pruneStoryDigests(projectId, { scene: new Set(project.scenes.map(scene => scene.id)), chapter: new Set(project.chapters.map(chapter => chapter.id)),

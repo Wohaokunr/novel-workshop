@@ -110,3 +110,14 @@ test('正常保存、读取及密钥轮换有效，演示模式不解密密钥',
   assert.equal(decryptions, 2);
   assert.equal(store.public().hasKey, true);
 });
+
+test('单次输出上限只接受合理整数，留空不保存', async t => {
+  const { store } = fixture(t);
+  for (const maxOutputTokens of [0, 999, 200_001, 1500.5, Number.NaN]) {
+    await assert.rejects(store.save({ ...oldProvider, maxOutputTokens }), /单次输出上限/);
+  }
+  await store.save({ ...oldProvider, maxOutputTokens: 64_000 });
+  assert.equal((await store.secret()).maxOutputTokens, 64_000);
+  await store.save({ ...oldProvider, maxOutputTokens: undefined });
+  assert.equal(store.public().maxOutputTokens, undefined);
+});

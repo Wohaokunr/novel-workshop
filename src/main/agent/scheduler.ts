@@ -53,7 +53,7 @@ export class NovelAgentScheduler {
     if (!provider.apiKey) throw new Error('请先填写 API Key');
     try {
       await runAgent({ id: 'connection', label: '连接测试', instructions: 'Reply briefly with OK.' }, {
-        transport: new OpenAIResponseTransport(provider), context: {}, objective: 'Reply OK.', signal: new AbortController().signal, contextSources: [],
+        transport: new OpenAIResponseTransport(provider, { retries: 0 }), context: {}, objective: 'Reply OK.', signal: new AbortController().signal, contextSources: [],
       });
       return `已连接 ${provider.name} / ${provider.model}（Responses 流式请求成功）`;
     } catch (error) { throw new Error((error instanceof Error ? error.message : String(error)).replaceAll(provider.apiKey, '[API Key 已隐藏]')); }

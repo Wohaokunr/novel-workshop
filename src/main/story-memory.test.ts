@@ -15,6 +15,7 @@ import { storyIndex, textHash, textSketch } from './agent/story-index.js';
 import { StoryView } from './agent/story-view.js';
 import { DemoStoryTransport, DIGEST_BATCH_CHARS, digestBatch, rollupBatch, StoryMemoryService } from './agent/story-memory.js';
 import { NovelStore } from './store.js';
+import { ModelServiceError, OutputLimitError, type ModelRequest, type ResponseTransport } from './responses.js';
 
 const CHAPTERS = 300, SCENES = 4;
 const pool = ['雾从港口漫上石阶，灯笼一盏接一盏地熄灭。', '他把手按在冰冷的栏杆上，数着远处的钟声。', '码头的工人低声议论着昨夜的船只。',
@@ -210,6 +211,7 @@ test('后台故事记忆：演示传输完成场景摘要与章/卷/全书汇总
     assert.equal(store.getStoryDigests(project.id).length, calls, '没有变化时不重复整理');
     assert.equal(StoryMemoryService.summaryProvider({ name: '', baseURL: '', model: 'main', reasoningEffort: 'high', summaryModel: 'mini', mode: 'live', apiKey: 'k' }).model, 'mini');
     assert.equal(StoryMemoryService.summaryProvider({ name: '', baseURL: '', model: 'main', reasoningEffort: 'high', summaryModel: 'mini', mode: 'live', apiKey: 'k' }).reasoningEffort, undefined);
+    assert.equal(StoryMemoryService.summaryProvider({ name: '', baseURL: '', model: 'main', maxOutputTokens: 64_000, summaryModel: 'mini', mode: 'live', apiKey: 'k' }).maxOutputTokens, undefined);
   } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
@@ -221,4 +223,36 @@ test('小作品写作上下文与原有边界一致：无摘要时用大纲与�
   assert.deepEqual(context.recentText, []);
   assert.match(context.storySoFar.thisChapterEarlierScenes[0]!.summary, /甲的大纲/);
   assert.equal(context.storySoFar.thisChapterEarlierScenes[0]!.freshness, 'extract');
+});
+
+test('后台故事记忆：一批内容无法整理时只跳过这一批并说明；服务出错则停止整理', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'story-skip-'));
+  const store = new NovelStore(join(directory, 'test.sqlite'));
+  try {
+    const project = store.createProject('跳过');
+    const chapterId = project.chapters[0]!.id, long = '雾从港口漫上石阶，灯笼一盏接一盏地熄灭。'.repeat(700);
+    store.execute({ projectId: project.id, actor: 'human', commands: [0, 1, 2].map(index => ({ type: 'putScene' as const,
+      value: { id: `s${index}`, chapterId, order: index, title: `场景${index}`, povId: null, eventIds: [], outline: '', text: `${index}${long}` } })) });
+    const demo = new DemoStoryTransport();
+    let failure: Error | undefined, requests = 0;
+    const transport: ResponseTransport = { stream(request: ModelRequest, signal: AbortSignal) {
+      requests++;
+      const first = request.agentId === 'story:digest' && String((request.input[0] as { content: string }).content).includes('"sceneId":"s0"');
+      if (failure && first) throw failure;
+      return demo.stream(request, signal);
+    } };
+    const service = new StoryMemoryService(store, () => ({ name: 'demo', baseURL: '', model: 'demo', mode: 'mock', apiKey: '' }), () => {}, () => transport);
+    failure = new ModelServiceError('模型服务出错：401 Incorrect API key', 401);
+    await service.run(project.id);
+    assert.equal((await service.status(project.id)).lastError, '模型服务出错：401 Incorrect API key');
+    assert.equal(requests, 1, 'a service error stops the run');
+    failure = new OutputLimitError('模型输出达到单次上限被截断');
+    await service.run(project.id);
+    const status = await service.status(project.id);
+    assert.equal(status.fresh, 2); assert.equal(status.pending, 1);
+    assert.equal(status.lastError, '1 批内容整理失败，下次整理时重试：模型输出达到单次上限被截断');
+    failure = undefined;
+    await service.run(project.id);
+    assert.equal((await service.status(project.id)).pending, 0);
+  } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
 });

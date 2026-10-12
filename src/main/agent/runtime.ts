@@ -5,7 +5,7 @@ import { NovelStore } from '../store.js';
 import { buildWriterContext, resolveReferences, WRITER_CONTEXT_CHARS, WRITER_PRIORITY } from '../context.js';
 import { DomainValidationError, hasSemanticChanges } from '../domain.js';
 import type { ResponseInputItem } from 'openai/resources/responses/responses';
-import { addUsage, AgentSuspended, emptyUsage, runAgent, settleCheckpointTool, ToolValidationError, type AgentCheckpoint, type AgentDefinition, type ResponseTransport, type ToolCallContext } from '../responses.js';
+import { addUsage, AgentSuspended, emptyUsage, OutputLimitError, runAgent, settleCheckpointTool, ToolValidationError, type AgentCheckpoint, type AgentDefinition, type ResponseTransport, type ToolCallContext } from '../responses.js';
 import { bookSources, boundedContext, changeSources, collectContext, compactChanges, fingerprint, refreshMemories, searchContext, selectAuthorRules } from './memory.js';
 import { assertWriteScope, canProposeCommands, canReadAuthor, chainWriterNodes, createBudget, touchesProse, validatePlan } from './policy.js';
 import { specialistDefinition, type SpecialistDefinition } from './specialists.js';
@@ -287,7 +287,7 @@ export class PersistentAgentRuntime {
 所有正式修改都要 commit_candidate 等待作者一键批准。只有修改正文的候选需要先 review_candidate；只改设定、画布、人物、大纲的候选按 propose_changes 返回的 nextAction 直接 commit_candidate。审查意见是建议，不代替作者决定；修订额度耗尽或仍有分歧时，将候选及意见提交作者审阅，不要反复 finish_run 或停止在普通文字总结。不能把“已生成”说成“已保存”。作者拒绝时尊重拒绝，不再次提交同一候选。
 人工修改导致revision冲突时必须 refresh_context 后重新规划和审查，不重放旧命令。缺少作者必须决定的信息才 ask_author，并给出 2–4 个可点选的 options。
 完成时用 finish_run 提交证据明确的简短总结，区分实际产物、已应用修改和未解决问题。纯分析无需更改作品。不要在最终文字里伪造工具执行。` };
-      await this.model(entry, 'coordinator', definition, collectContext(entry.state.baseWorkspace, entry.run, this.memories(entry.run.projectId), this.story(entry.state.baseWorkspace)), entry.run.objective, this.sources(entry));
+      await this.coordinate(entry, definition, collectContext(entry.state.baseWorkspace, entry.run, this.memories(entry.run.projectId), this.story(entry.state.baseWorkspace)));
       // A text answer in the middle of a plan used to pause the run; remind the coordinator of what is left and carry on.
       for (let nudge = 0; nudge < MAX_CONTINUATIONS && !entry.state.finalSummary && !entry.state.waiting; nudge++) {
         const reminder = this.pendingWork(entry);
@@ -296,7 +296,7 @@ export class PersistentAgentRuntime {
         cp.input.push({ role: 'user', content: `运行时提醒：${reminder}不要只用文字回复；完成后用 finish_run 提交总结。` });
         cp.turn++; cp.phase = 'ready'; cp.pendingCalls = []; cp.cursor = 0;
         this.publish(entry);
-        await this.model(entry, 'coordinator', definition, {}, entry.run.objective, this.sources(entry));
+        await this.coordinate(entry, definition, {});
       }
       if (!entry.state.finalSummary) {
         const candidate = [...entry.state.candidates].reverse().find(candidate => candidate.status === 'draft' && (!touchesProse(candidate) || (candidate.reviews.length
@@ -309,7 +309,7 @@ export class PersistentAgentRuntime {
             name: 'finish_run', arguments: JSON.stringify({ summary: '将已审查候选交给作者决定。', artifactIds: [] }) };
           cp.input.push(call); cp.pendingCalls = [call]; cp.cursor = 0; cp.phase = 'tools';
           this.publish(entry);
-          await this.model(entry, 'coordinator', definition, {}, entry.run.objective, this.sources(entry));
+          await this.coordinate(entry, definition, {});
         }
       }
       if (!entry.state.finalSummary && !entry.state.plan?.nodes.some(node => node.status !== 'completed')) {
@@ -342,6 +342,24 @@ export class PersistentAgentRuntime {
     }
   }
 
+  /** A coordinator turn cut at the output limit executed nothing. Ask for smaller steps; if the very next turn is cut too, pause
+   * so the author can raise the limit in the model settings (or narrow the goal) and resume. */
+  private async coordinate(entry: Entry, definition: AgentDefinition, context: unknown): Promise<AgentStep> {
+    let asked: number | undefined;
+    while (true) {
+      try {
+        return await this.model(entry, 'coordinator', definition, context, entry.run.objective, this.sources(entry));
+      } catch (error) {
+        if (!(error instanceof OutputLimitError) || entry.controller.signal.aborted || entry.stop) throw error;
+        // A truncated answer has already advanced the turn, so the reminded turn is cut again exactly when we land one past it.
+        const cp = entry.state.checkpoints.coordinator as AgentCheckpoint;
+        if (asked !== undefined && cp.turn === asked + 1) throw new AgentSuspended(`${error.message}。可在模型设置中调高「单次输出上限」后恢复任务，或缩小目标`);
+        cp.input.push({ role: 'user', content: `运行时提醒：${error.message}，没有执行任何操作。请把这一步拆小：一次 propose_changes 只放一部分操作，较大的内容委派给专长分批完成。` });
+        asked = cp.turn;
+        this.publish(entry);
+      }
+    }
+  }
   private async model(entry: Entry, slot: string, definition: AgentDefinition, context: unknown, objective: string, sources: EvidenceSource[]): Promise<AgentStep> {
     const checkpoint = entry.state.checkpoints[slot] as AgentCheckpoint | undefined;
     if (checkpoint?.phase === 'completed') return checkpoint.step;
@@ -362,11 +380,13 @@ export class PersistentAgentRuntime {
         if (turns?.some(turn => turn.output && !turn.output.usage)) entry.state.budget.usageUnknown = true;
         this.publish(entry);
         if (cp.phase === 'requesting') {
-          if (JSON.stringify(cp.input).length > 200000) throw new AgentSuspended('当前协议上下文过大；已保留完整记录，请缩小目标后建立新任务');
+          // Encrypted reasoning is opaque replay state, not context the author's material has to fit beside.
+          if (JSON.stringify(cp.input, (key, value: unknown) => key === 'encrypted_content' ? undefined : value).length > 200000) throw new AgentSuspended('当前协议上下文过大；已保留完整记录，请缩小目标后建立新任务');
           this.store.recordAgentTurn(entry.run.id, cp.step.id, cp.turn, request);
-        } else if (previous?.phase === 'requesting' && cp.phase === 'tools') {
+        } else if (previous?.phase === 'requesting') {
+          // Every answered request is logged once, usable or not (a truncated answer moves on to a new turn); one the service turned down has no response.
           const response = turns?.at(-1)?.output;
-          this.store.recordAgentTurn(entry.run.id, cp.step.id, cp.turn, turnRecord(previous, definition.instructions), response);
+          if (response) this.store.recordAgentTurn(entry.run.id, cp.step.id, previous.turn, turnRecord(previous, definition.instructions), response);
         }
       },
       onStep: step => { const index = entry.run.steps.findIndex(value => value.id === step.id); const published = publicStep(step); if (index < 0) entry.run.steps.push(published); else entry.run.steps[index] = published; this.publish(entry); },
@@ -746,8 +766,10 @@ export class PersistentAgentRuntime {
         return { step, commands: specification.toCommands?.(step) };
       } catch (error) {
         const cp = entry.state.checkpoints[slot] as AgentCheckpoint | undefined;
-        const rejected = error instanceof DomainValidationError || error instanceof ToolValidationError || error instanceof SyntaxError;
-        const answered = cp?.phase === 'completed' || (cp?.phase === 'tools' && !cp.pendingCalls.length);
+        const truncated = error instanceof OutputLimitError;
+        const rejected = truncated || error instanceof DomainValidationError || error instanceof ToolValidationError || error instanceof SyntaxError;
+        // A truncated answer has already moved the checkpoint to a fresh turn.
+        const answered = truncated || cp?.phase === 'completed' || (cp?.phase === 'tools' && !cp.pendingCalls.length);
         if (!rejected || !cp || !answered || entry.controller.signal.aborted || entry.stop) throw error;
         const reason = error instanceof Error ? error.message : String(error);
         const used = cp.input.filter(isRepairRequest).length;
@@ -758,8 +780,11 @@ export class PersistentAgentRuntime {
           this.publish(entry);
           fail(`${specification.definition.label}连续 ${used + 1} 次输出未通过校验：${reason}。请调整该节点的目标或范围（set_plan）后再委派`);
         }
-        cp.input.push({ role: 'user', content: `${REPAIR_NOTICE}${reason}\n请对照要求修正，重新输出完整结果（格式不变），不要解释。` });
-        cp.turn++; cp.phase = 'ready'; cp.pendingCalls = []; cp.cursor = 0; cp.uncertain = false;
+        cp.input.push({ role: 'user', content: `${REPAIR_NOTICE}${reason}\n${truncated
+          ? '请重新输出更精简的完整结果（格式不变）：压缩说明性文字，只保留本节点必需的内容；内容确实太多时只完成最关键的部分，并说明其余部分需要另行委派。'
+          : '请对照要求修正，重新输出完整结果（格式不变），不要解释。'}` });
+        if (!truncated) cp.turn++;
+        cp.phase = 'ready'; cp.pendingCalls = []; cp.cursor = 0; cp.uncertain = false;
         this.publish(entry);
       }
     }

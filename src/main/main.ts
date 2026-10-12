@@ -44,7 +44,7 @@ try {
   const providers = new ProviderStore(join(dataDir, 'provider.json'));
   const send = (event: AgentEvent) => { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('agent:event', event); };
   storyMemory = new StoryMemoryService(store, () => providers.secret(), send,
-    provider => provider.mode === 'mock' ? new DemoStoryTransport() : new OpenAIResponseTransport(provider));
+    provider => provider.mode === 'mock' ? new DemoStoryTransport() : new OpenAIResponseTransport(provider, { background: true }));
   styleLearning = new StyleLearningService(store, () => providers.secret(), send,
     provider => provider.mode === 'mock' ? new DemoStyleTransport() : new OpenAIResponseTransport(provider));
   // Any saved change may leave prose without an up-to-date digest.

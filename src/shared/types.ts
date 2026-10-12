@@ -95,6 +95,8 @@ export interface ProviderSettings {
   summaryModel?: string;
   /** auto: digest prose in the background after edits; manual: only when the author asks. */
   storyMemory?: 'auto' | 'manual';
+  /** Output token cap per request, reasoning included; empty uses a default (see outputTokenLimit). Not applied to a separate summary model. */
+  maxOutputTokens?: number;
 }
 export interface ProviderInput extends Omit<ProviderSettings, 'hasKey'> { apiKey?: string }
 export interface ProviderSecret extends Omit<ProviderSettings, 'hasKey'> { apiKey: string }

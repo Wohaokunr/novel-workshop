@@ -11,7 +11,7 @@ import { KEEP_FINISHED_SNAPSHOTS, NovelStore } from './store.js';
 import { DatabaseSync } from 'node:sqlite';
 import { NovelAgentScheduler } from './agents.js';
 import { DemoAgentTransport } from './agent/demo.js';
-import { checkCancelled, type ModelRequest, type ModelResponse, type ResponseTransport } from './responses.js';
+import { checkCancelled, CONTINUE_NOTICE, ModelServiceError, type ModelRequest, type ModelResponse, type ResponseTransport } from './responses.js';
 import type { AgentCheckpoint } from './responses.js';
 import type { PlanNode, UpstreamResult } from '../shared/agent-types.js';
 import { MAX_EXPERIENCES, MAX_OUTPUT_REPAIRS } from './agent/runtime.js';
@@ -754,5 +754,104 @@ test('重开数据库后重发中断的后续轮请求，任务日志写入相�
       .map(row => JSON.parse(row.request) as { from?: number });
     db.close();
     assert.ok(requests.length > 2); assert.ok(requests.slice(1).every(value => typeof value.from === 'number' && value.from > 0));
+  } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+function truncated(text: string, calls: ResponseOutputItem[] = []): ModelResponse {
+  const output: ResponseOutputItem[] = text ? [{ type: 'message', id: randomUUID(), role: 'assistant', status: 'incomplete', content: [{ type: 'output_text', text, annotations: [] }] }] : [];
+  return { id: randomUUID(), status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' }, output: [...output, ...calls],
+    usage: { input_tokens: 10, output_tokens: 16000, total_tokens: 16010, output_tokens_details: { reasoning_tokens: 9000 } } };
+}
+
+test('服务明确拒绝的请求（如限流）暂停但不要求费用确认，直接恢复即重发并完成', { timeout: 10000 }, async () => {
+  const store = new NovelStore(':memory:');
+  let reject = true;
+  try {
+    const apiKey = 'sk-test-echoed-credential', project = store.createProject('限流'), h = harness(store, (request, signal, demo) => {
+      if (reject && request.agentId === 'coordinator') { reject = false; throw new ModelServiceError(`模型服务出错（已自动重试 4 次）：429 Rate limit reached for ${apiKey}`, 429); }
+      return demo.stream(request, signal);
+    }, { ...provider, mode: 'live', apiKey });
+    const run = h.start({ projectId: project.id, stage: 'agent', objective: '只分析作品' });
+    const paused = await wait(store, run);
+    assert.equal(paused.status, 'paused'); assert.equal(paused.runtime!.uncertain, false);
+    assert.match(paused.runtime!.pauseReason ?? '', /429 Rate limit reached for \[API Key 已隐藏\]。这一轮没有产生结果/);
+    assert.ok(!JSON.stringify(h.events).includes(apiKey)); assert.ok(!JSON.stringify(store.getAgentState(run.id)).includes(apiKey));
+    await h.scheduler.resume(run.id);
+    const completed = await until(store, run.id, value => !!value.finishedAt);
+    assert.equal(completed.status, 'completed', completed.error ?? completed.runtime?.pauseReason ?? '');
+  } finally { store.close(); }
+});
+
+test('专长的结构化输出被截断时要求精简重写；协调者被截断时提醒拆小，紧接着再被截断才暂停', { timeout: 20000 }, async () => {
+  let store = new NovelStore(':memory:');
+  try {
+    const project = scenes(store, ['人工正文']), results: unknown[] = [], planner: ModelRequest[] = [];
+    const coordinate = delegatingCoordinator(results, 1);
+    const h = harness(store, request => {
+      if (request.agentId !== 'planner') return coordinate(request);
+      planner.push(request);
+      return stream(planner.length === 1 ? truncated('{"summary":"补人物","opsJson":"[{\\"op') : addsCharacter);
+    });
+    const run = h.start({ projectId: project.id, stage: 'agent', objective: '补一个人物' });
+    assert.equal((await wait(store, run)).status, 'awaitingInput');
+    assert.equal(planner.length, 2);
+    assert.equal(planner[1]!.input.length, 2, 'the cut answer is not replayed');
+    const repair = planner[1]!.input.at(-1) as { role: string; content: string };
+    assert.match(repair.content, /单次上限被截断（本次输出 16000 tokens，其中推理 9000）[\s\S]*更精简/);
+    assert.equal(store.getRun(run.id)!.runtime!.plan!.nodes[0]!.status, 'completed');
+  } finally { store.close(); }
+
+  for (const cuts of [1, 2]) {
+    store = new NovelStore(':memory:');
+    try {
+      const project = store.createProject('截断'), coordinator: ModelRequest[] = [];
+      let left = cuts;
+      const h = harness(store, (request, signal, demo) => {
+        if (request.agentId === 'coordinator') {
+          coordinator.push(request);
+          if (left-- > 0) return stream(truncated('', [{ type: 'function_call', id: randomUUID(), call_id: randomUUID(), name: 'save_report', arguments: '{"title":"' }]));
+        }
+        return demo.stream(request, signal);
+      });
+      const run = h.start({ projectId: project.id, stage: 'agent', objective: '只分析作品' });
+      const reminder = () => coordinator[1]!.input.at(-1) as { role: string; content: string };
+      if (cuts === 1) {
+        const done = await until(store, run.id, value => !!value.finishedAt);
+        assert.equal(done.status, 'completed', done.error ?? done.runtime?.pauseReason ?? '');
+        assert.match(reminder().content, /^运行时提醒：模型输出达到单次上限被截断[\s\S]*拆小/);
+      } else {
+        const paused = await wait(store, run);
+        assert.equal(paused.status, 'paused'); assert.equal(coordinator.length, 2);
+        assert.match(paused.runtime!.pauseReason ?? '', /单次上限被截断[\s\S]*调高「单次输出上限」/);
+        assert.equal(paused.runtime!.uncertain, false);
+        await h.scheduler.resume(run.id);
+        assert.equal((await until(store, run.id, value => !!value.finishedAt)).status, 'completed');
+      }
+    } finally { store.close(); }
+  }
+});
+
+test('写作者正文达到输出上限时自动续写拼接，截断的回答与续写各记一轮日志', { timeout: 20000 }, async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'novel-continue-')), filename = join(directory, 'novel.sqlite');
+  const store = new NovelStore(filename);
+  try {
+    const project = scenes(store, ['']), writer: ModelRequest[] = [], partial = '直到雨停下来的时候，她才推开门。';
+    const h = harness(store, (request, signal, demo) => {
+      if (request.agentId === 'writer') { writer.push(request); if (writer.length === 1) return stream(truncated(partial)); }
+      return demo.stream(request, signal);
+    });
+    const run = h.start({ projectId: project.id, stage: 'chapter', chapterId: project.chapters[0]!.id, objective: '写完本章空白场景' });
+    const pending = await wait(store, run);
+    assert.equal(pending.status, 'awaitingApproval', pending.error ?? pending.runtime?.pauseReason ?? '');
+    assert.deepEqual(writer[1]!.input.slice(-2), [{ role: 'assistant', content: partial }, { role: 'user', content: CONTINUE_NOTICE }]);
+    const step = pending.steps.find(value => value.agentId === 'writer')!;
+    assert.equal(step.status, 'completed'); assert.ok(step.output.startsWith(partial) && step.output.length > partial.length);
+    const db = new DatabaseSync(filename, { readOnly: true });
+    const turns = db.prepare('SELECT turn, request, response FROM agent_turns WHERE run_id=? AND step_id=? ORDER BY turn').all(run.id, step.id) as Array<{ turn: number; request: string; response: string | null }>;
+    db.close();
+    assert.deepEqual(turns.map(turn => turn.turn), [0, 1]);
+    assert.ok(turns.every(turn => turn.response !== null));
+    assert.equal((JSON.parse(turns[0]!.response!) as ModelResponse).status, 'incomplete');
+    assert.deepEqual(JSON.parse(turns[1]!.request), { from: 1, input: [{ role: 'assistant', content: partial }, { role: 'user', content: CONTINUE_NOTICE }] });
   } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
 });
