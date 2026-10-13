@@ -2,16 +2,16 @@ import type { AgentDecision, AgentMemory } from '../../shared/agent-types.js';
 import type { AgentEvent, AgentRun, ProviderSecret, RunRequest, NarrativeScene } from '../../shared/types.js';
 import { NovelStore } from '../store.js';
 import { resolveReferences } from '../context.js';
-import { OpenAIResponseTransport, runAgent, type ResponseTransport } from '../responses.js';
+import { OpenAIResponseTransport, runAgent, type EmbeddingTransport, type ResponseTransport } from '../responses.js';
 import { PersistentAgentRuntime } from './runtime.js';
 import { DemoAgentTransport } from './demo.js';
 
 export class NovelAgentScheduler {
   private readonly runtime: PersistentAgentRuntime;
   constructor(private store: NovelStore, private getProvider: () => ProviderSecret | Promise<ProviderSecret>, private onEvent: (event: AgentEvent) => void,
-    transportFactory?: (provider: ProviderSecret) => ResponseTransport) {
+    transportFactory?: (provider: ProviderSecret) => ResponseTransport, embedderFactory?: (provider: ProviderSecret & { embeddingModel: string }) => EmbeddingTransport) {
     this.runtime = new PersistentAgentRuntime(store, getProvider, onEvent, (provider, request, project) => transportFactory?.(provider)
-      ?? (provider.mode === 'mock' ? new DemoAgentTransport(request, project) : new OpenAIResponseTransport(provider)));
+      ?? (provider.mode === 'mock' ? new DemoAgentTransport(request, project) : new OpenAIResponseTransport(provider)), embedderFactory);
   }
   start(request: RunRequest): AgentRun { return this.runtime.start(request); }
   async cancel(id: string) {

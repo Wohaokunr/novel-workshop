@@ -101,6 +101,8 @@ export interface ProviderSettings {
   storyMemory?: 'auto' | 'manual';
   /** Output token cap per request, reasoning included; empty uses a default (see outputTokenLimit). Not applied to a separate summary model. */
   maxOutputTokens?: number;
+  /** Optional embedding model: story memory then keeps a local semantic index and searches recall by meaning as well as by words. */
+  embeddingModel?: string;
 }
 export interface ProviderInput extends Omit<ProviderSettings, 'hasKey'> { apiKey?: string }
 export interface ProviderSecret extends Omit<ProviderSettings, 'hasKey'> { apiKey: string }

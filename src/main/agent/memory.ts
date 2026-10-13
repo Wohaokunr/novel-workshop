@@ -7,6 +7,7 @@ import { styleProfile } from '../../shared/style-types.js';
 import { buildCharacterContext, buildReaderContext, resolveReferences } from '../context.js';
 import { cardContent, DomainValidationError } from '../domain.js';
 import { canReadAuthor, isRole } from './policy.js';
+import type { SemanticHit } from './semantic.js';
 import { searchChunks, sceneMentions } from './story-index.js';
 import { storyOverview, StoryView } from './story-view.js';
 
@@ -189,7 +190,7 @@ function authorDocuments(workspace: Workspace, scenes?: Set<string>): SearchDocu
   }
   return result;
 }
-function filteredScenes(workspace: Workspace, filter: SearchFilter): Set<string> | undefined {
+export function filteredScenes(workspace: Workspace, filter: SearchFilter): Set<string> | undefined {
   if (!filter.chapterFrom && !filter.chapterTo && !filter.entityId) return undefined;
   const chapters = [...workspace.chapters].sort((a, b) => a.order - b.order);
   const from = filter.chapterFrom ? chapters.findIndex(chapter => chapter.id === filter.chapterFrom) : 0;
@@ -212,8 +213,10 @@ function queryTerms(query: string): string[] {
 }
 
 /** Filter the corpus before matching. Query words never grant access to an author or future document.
- * Scene prose comes from the paragraph-chunk index (BM25, at most two chunks per scene); small records are scored directly. */
-export function searchContext(workspace: Workspace, query: string, limit = 6, role: AgentRole = 'coordinator', anchor: ContextAnchor = {}, filter: SearchFilter = {}): SearchChunk[] {
+ * Scene prose comes from the paragraph-chunk index (BM25, at most two chunks per scene); small records are scored directly.
+ * `semantic`: chunks nearest in meaning (optional vector index); they join the prose results and lift keyword hits they overlap. */
+export function searchContext(workspace: Workspace, query: string, limit = 6, role: AgentRole = 'coordinator', anchor: ContextAnchor = {}, filter: SearchFilter = {},
+  semantic: SemanticHit[] = []): SearchChunk[] {
   if (!isRole(role)) throw new DomainValidationError('检索角色无效');
   const scoped = role === 'reader' || role === 'character' ? undefined : filteredScenes(workspace, filter);
   const allowed = role === 'reader' ? readerScenes(workspace, anchor) : role === 'character' ? new Set<string>() : scoped;
@@ -251,6 +254,16 @@ export function searchContext(workspace: Workspace, query: string, limit = 6, ro
       const end = Math.min(hit.end, hit.start + MAX_SEARCH_CHUNK_CHARS);
       matches.push({ source: { ...sourceFor(workspace, 'scene:text', scene.id)!, start: hit.start, end }, title: title.slice(0, 160),
         text: scene.text.slice(hit.start, end), score, index: documents.length + view.positionOf(scene.id) });
+    }
+    for (const hit of semantic) {
+      const scene = view.scene(hit.sceneId);
+      if (!scene || (allowed && !allowed.has(scene.id))) continue;
+      const source = sourceFor(workspace, 'scene:text', scene.id)!;
+      const overlapping = matches.find(match => match.source.kind === source.kind && match.source.id === scene.id && match.source.start! < hit.end && hit.start < match.source.end!);
+      if (overlapping) { overlapping.score += hit.similarity * 10; continue; }
+      const title = role === 'reader' ? chapterTitles.get(scene.chapterId) ?? '' : scene.title, end = Math.min(hit.end, hit.start + MAX_SEARCH_CHUNK_CHARS);
+      matches.push({ source: { ...source, start: hit.start, end }, title: title.slice(0, 160), text: scene.text.slice(hit.start, end), score: hit.similarity * 30,
+        index: documents.length + view.positionOf(scene.id) });
     }
   }
   return matches.sort((a, b) => b.score - a.score || a.index - b.index).slice(0, requested).map(({ index: _index, ...chunk }) => chunk);

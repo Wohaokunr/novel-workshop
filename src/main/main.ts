@@ -9,11 +9,12 @@ import { CompanionService } from './agent/companion.js';
 import { DemoCompanionTransport } from './agent/companion-demo.js';
 import { DemoStoryTransport, StoryMemoryService } from './agent/story-memory.js';
 import { DemoStyleTransport, StyleLearningService } from './agent/style-learning.js';
-import { OpenAIResponseTransport } from './responses.js';
+import { OpenAIEmbeddingTransport, OpenAIResponseTransport } from './responses.js';
+import { DemoEmbeddingTransport } from './agent/semantic.js';
 import type { CompanionAdoptRequest, CompanionAskRequest } from '../shared/companion-types.js';
 import { chapterText } from './domain.js';
 import type { AgentDecision, AgentMemory } from '../shared/agent-types.js';
-import type { AgentEvent, Command, CommandRequest, ProviderInput, RunRequest } from '../shared/types.js';
+import type { AgentEvent, Command, CommandRequest, ProviderInput, ProviderSecret, RunRequest } from '../shared/types.js';
 
 app.setName('叙境');
 if (process.env.NOVEL_TEST_USER_DATA) { mkdirSync(process.env.NOVEL_TEST_USER_DATA, { recursive: true }); app.setPath('userData', process.env.NOVEL_TEST_USER_DATA); }
@@ -43,13 +44,15 @@ try {
   store = new NovelStore(join(dataDir, 'workspaces.sqlite'));
   const providers = new ProviderStore(join(dataDir, 'provider.json'));
   const send = (event: AgentEvent) => { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('agent:event', event); };
+  // Story memory builds the optional vector index in the background; the coordinator embeds its search queries in the foreground.
+  const embedder = (background: boolean) => (provider: ProviderSecret & { embeddingModel: string }) => provider.mode === 'mock' ? new DemoEmbeddingTransport() : new OpenAIEmbeddingTransport(provider, { background });
   storyMemory = new StoryMemoryService(store, () => providers.secret(), send,
-    provider => provider.mode === 'mock' ? new DemoStoryTransport() : new OpenAIResponseTransport(provider, { background: true }));
+    provider => provider.mode === 'mock' ? new DemoStoryTransport() : new OpenAIResponseTransport(provider, { background: true }), embedder(true));
   styleLearning = new StyleLearningService(store, () => providers.secret(), send,
     provider => provider.mode === 'mock' ? new DemoStyleTransport() : new OpenAIResponseTransport(provider));
   // Any saved change may leave prose without an up-to-date digest.
   const relay = (event: AgentEvent) => { send(event); if (event.type === 'projectChanged') storyMemory.touch(event.projectId); };
-  scheduler = new NovelAgentScheduler(store, () => providers.secret(), relay);
+  scheduler = new NovelAgentScheduler(store, () => providers.secret(), relay, undefined, embedder(false));
   companion = new CompanionService(store, () => providers.secret(), relay,
     provider => provider.mode === 'mock' ? new DemoCompanionTransport() : new OpenAIResponseTransport(provider));
   scheduler.recover();

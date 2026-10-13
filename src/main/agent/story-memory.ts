@@ -3,7 +3,8 @@ import type { ResponseOutputItem, ResponseStreamEvent } from 'openai/resources/r
 import type { AgentEvent, ProviderSecret, TokenUsage, Workspace } from '../../shared/types.js';
 import type { RollupDigest, SceneDigest, StoryDigest, StoryMemoryStatus, StoryThread } from '../../shared/story-types.js';
 import { NovelStore } from '../store.js';
-import { addUsage, checkCancelled, emptyUsage, ModelOutputError, objectSchema, runAgent, ToolValidationError, type JsonSchema, type ModelRequest, type ModelResponse, type ResponseTransport } from '../responses.js';
+import { addUsage, checkCancelled, emptyUsage, ModelOutputError, objectSchema, runAgent, ToolValidationError, type EmbeddingTransport, type JsonSchema, type ModelRequest, type ModelResponse, type ResponseTransport } from '../responses.js';
+import { indexVectors, vectorCoverage } from './semantic.js';
 import { extractSummary, sceneHash, textHash, textSketch } from './story-index.js';
 import { ledgerForDigest, StoryView, threadOverlap } from './story-view.js';
 
@@ -53,7 +54,8 @@ export class StoryMemoryService {
   private usage = new Map<string, TokenUsage>();
 
   constructor(private store: NovelStore, private getProvider: () => ProviderSecret | Promise<ProviderSecret>,
-    private onEvent: (event: AgentEvent) => void, private transportFactory: (provider: ProviderSecret) => ResponseTransport) {}
+    private onEvent: (event: AgentEvent) => void, private transportFactory: (provider: ProviderSecret) => ResponseTransport,
+    private embedderFactory?: (provider: ProviderSecret & { embeddingModel: string }) => EmbeddingTransport) {}
 
   /** Summary model when configured; the reasoning parameter and output limit belong to the main model only. */
   static summaryProvider(provider: ProviderSecret): ProviderSecret {
@@ -68,7 +70,9 @@ export class StoryMemoryService {
     const provider = await this.getProvider();
     const coverage = new StoryView(project, this.store.getStoryDigests(projectId)).coverage();
     const auto = provider.storyMemory !== 'manual';
+    const embeddingModel = provider.embeddingModel;
     return { projectId, ...coverage, running: this.running.has(projectId), auto,
+      ...(embeddingModel && this.embedderFactory ? { vectors: { model: embeddingModel, ...vectorCoverage(this.store, project, embeddingModel) } } : {}),
       awaitingConfirmation: auto && provider.mode === 'live' && coverage.pendingChars > AUTO_LIMIT_CHARS,
       ...(this.errors.has(projectId) ? { lastError: this.errors.get(projectId) } : {}), usage: this.usage.get(projectId) ?? emptyUsage(), updatedAt: stamp() };
   }
@@ -141,6 +145,12 @@ export class StoryMemoryService {
       }
       const problems = [skipped ? `${skipped} 批内容整理失败：${lastSkip}` : '', omitted ? `${omitted} 场被模型漏掉` : ''].filter(Boolean);
       if (problems.length && !controller.signal.aborted) this.errors.set(projectId, `${problems.join('；')}。这些场景下次整理时重试`);
+      // The semantic index embeds the prose itself, so it does not wait for digests.
+      const embeddingModel = provider.embeddingModel;
+      if (embeddingModel && this.embedderFactory && !controller.signal.aborted) {
+        await indexVectors(this.store, projectId, this.embedderFactory({ ...provider, embeddingModel }), embeddingModel, controller.signal,
+          tokens => this.track(projectId, { ...emptyUsage(), input: tokens, total: tokens, provided: tokens > 0 }));
+      }
       if (!controller.signal.aborted) {
         const project = this.store.getProject(projectId), view = new StoryView(project);
         this.store.pruneStoryDigests(projectId, { scene: new Set(project.scenes.map(scene => scene.id)), chapter: new Set(project.chapters.map(chapter => chapter.id)),

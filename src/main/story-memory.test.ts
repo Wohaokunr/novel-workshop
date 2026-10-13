@@ -13,9 +13,10 @@ import { specialistDefinition } from './agent/specialists.js';
 import { companionContext } from './agent/companion.js';
 import { sceneMentions, storyIndex, textHash, textSketch } from './agent/story-index.js';
 import { ledgerForDigest, openThreads, StoryView, THREAD_EXPIRY_CHAPTERS } from './agent/story-view.js';
+import { DemoEmbeddingTransport, indexVectors, nearestChunks, vectorChunks } from './agent/semantic.js';
 import { DemoStoryTransport, DIGEST_BATCH_CHARS, digestBatch, LONG_SCENE_CHARS, rollupBatch, splitParts, stableThreads, StoryMemoryService } from './agent/story-memory.js';
 import { NovelStore } from './store.js';
-import { ModelServiceError, OutputLimitError, type ModelRequest, type ResponseTransport } from './responses.js';
+import { ModelServiceError, OutputLimitError, type EmbeddingTransport, type ModelRequest, type ResponseTransport } from './responses.js';
 
 const CHAPTERS = 300, SCENES = 4;
 const pool = ['雾从港口漫上石阶，灯笼一盏接一盏地熄灭。', '他把手按在冰冷的栏杆上，数着远处的钟声。', '码头的工人低声议论着昨夜的船只。',
@@ -384,4 +385,79 @@ test('人物别名：按别名找到出场，最长名字优先避免「李明�
   assert.throws(() => applyCommands(workspace, [{ type: 'putObject', value: { ...workspace.objects[0]!, aliases: [''] } }]), DomainValidationError);
   const renamed = applyCommands(workspace, [{ type: 'putObject', value: { ...workspace.objects[1]!, aliases: ['小月'] } }]);
   assert.deepEqual(renamed.objects.find(object => object.id === 'yue')!.aliases, ['小月']);
+});
+
+/** A tiny "meaning" space: keys and locks, sea and tide, everything else. Lets a test show recall without shared words. */
+class MeaningEmbedder implements EmbeddingTransport {
+  calls: string[][] = [];
+  async embed(texts: string[]) {
+    this.calls.push(texts);
+    return { vectors: texts.map(text => [/钥匙|开锁|锁孔/.test(text) ? 1 : 0, /潮|海|浪/.test(text) ? 1 : 0, 0.05]), tokens: texts.length * 10 };
+  }
+}
+function vectorBook(store: NovelStore) {
+  const project = store.createProject('语义'), chapterId = project.chapters[0]!.id;
+  return store.execute({ projectId: project.id, actor: 'human', commands: [
+    { type: 'putScene', value: { id: 'key', chapterId, order: 0, title: '旧灯塔', povId: null, eventIds: [], outline: '', text: '沈卿在旧灯塔下摸到一枚冰凉的铜钥匙，上面刻着潮汐纹。' } },
+    { type: 'putScene', value: { id: 'sea', chapterId, order: 1, title: '码头', povId: null, eventIds: [], outline: '', text: '浪头一阵阵拍上码头，工人们收起了缆绳。' } },
+    { type: 'putScene', value: { id: 'tea', chapterId, order: 2, title: '茶馆', povId: null, eventIds: [], outline: '', text: '账房先生在茶馆里拨着算盘，谁也没有抬头。' } },
+  ] });
+}
+
+test('语义索引：向量随正文增量更新，只重算改动的段落；换模型或删场景后清理旧向量', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'story-vectors-'));
+  const store = new NovelStore(join(directory, 'test.sqlite'));
+  try {
+    const project = vectorBook(store), embedder = new MeaningEmbedder(), signal = new AbortController().signal;
+    let tokens = 0;
+    assert.deepEqual(await indexVectors(store, project.id, embedder, 'meaning', signal, value => { tokens += value; }), { indexed: 3, total: 3 });
+    assert.equal(embedder.calls.flat().length, 3); assert.equal(tokens, 30);
+    const stored = store.getStoryVectors(project.id, 'meaning');
+    assert.deepEqual([...stored.find(row => row.sceneId === 'key')!.vector].map(value => Math.round(value * 100) / 100), [1, 1, 0.05]);
+    await indexVectors(store, project.id, embedder, 'meaning', signal, () => {});
+    assert.equal(embedder.calls.length, 1, '没有改动时不再请求');
+    const edited = store.execute({ projectId: project.id, actor: 'human', commands: [{ type: 'putScene', value: { ...store.getProject(project.id).scenes.find(scene => scene.id === 'tea')!, text: '账房先生把算盘推到一边。' } }] });
+    await indexVectors(store, edited.id, embedder, 'meaning', signal, () => {});
+    assert.deepEqual(embedder.calls.at(-1), ['账房先生把算盘推到一边。']);
+    assert.equal(vectorChunks(store.getProject(project.id)).length, 3);
+    await indexVectors(store, project.id, new DemoEmbeddingTransport(), 'demo', signal, () => {});
+    assert.equal(store.getStoryVectors(project.id, 'meaning').length, 0, '换模型后旧模型的向量清除');
+    assert.equal(store.getStoryVectors(project.id, 'demo')[0]!.vector.length, 256);
+  } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('语义检索：没有共同字词的原文也能按意思找到；正文改动后旧向量不再使用', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'story-semantic-'));
+  const store = new NovelStore(join(directory, 'test.sqlite'));
+  try {
+    const project = vectorBook(store), embedder = new MeaningEmbedder(), signal = new AbortController().signal;
+    await indexVectors(store, project.id, embedder, 'meaning', signal, () => {});
+    const workspace = store.getProject(project.id), query = '能打开锁孔的东西';
+    assert.deepEqual(searchContext(workspace, query, 6).filter(hit => hit.source.kind === 'scene:text'), [], '关键词检索找不到');
+    const { vectors } = await embedder.embed([query]);
+    const near = nearestChunks(store, workspace, 'meaning', vectors[0]!, { limit: 2 });
+    assert.equal(near[0]!.sceneId, 'key');
+    const hits = searchContext(workspace, query, 6, 'coordinator', {}, {}, near);
+    assert.equal(hits[0]!.source.id, 'key'); assert.match(hits[0]!.text, /铜钥匙/);
+    assert.deepEqual(nearestChunks(store, workspace, 'meaning', vectors[0]!, { allowed: new Set(['sea']), limit: 2 }).map(hit => hit.sceneId), ['sea'], '范围过滤先于排序');
+    const candidate = { ...workspace, scenes: workspace.scenes.map(scene => scene.id === 'key' ? { ...scene, text: '钥匙被扔进了海里。' } : scene) };
+    assert.ok(!nearestChunks(store, candidate, 'meaning', vectors[0]!, { limit: 3 }).some(hit => hit.sceneId === 'key'), '正文已改的段落不用旧向量');
+  } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('设置向量检索模型后，故事记忆整理一并建立语义索引并计入用量；未设置时不建索引', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'story-vector-service-'));
+  const store = new NovelStore(join(directory, 'test.sqlite'));
+  try {
+    const project = vectorBook(store), embedder = new MeaningEmbedder();
+    const provider = { name: 'demo', baseURL: '', model: 'demo', mode: 'mock' as const, apiKey: '' };
+    const plain = new StoryMemoryService(store, () => provider, () => {}, () => new DemoStoryTransport(), () => embedder);
+    await plain.run(project.id);
+    assert.equal(embedder.calls.length, 0); assert.equal((await plain.status(project.id)).vectors, undefined);
+    const service = new StoryMemoryService(store, () => ({ ...provider, embeddingModel: 'meaning' }), () => {}, () => new DemoStoryTransport(), () => embedder);
+    await service.run(project.id);
+    const status = await service.status(project.id);
+    assert.deepEqual(status.vectors, { model: 'meaning', indexed: 3, total: 3 });
+    assert.equal(status.usage.input, 30); assert.equal(status.lastError, undefined);
+  } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
 });

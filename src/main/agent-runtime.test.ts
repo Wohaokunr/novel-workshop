@@ -11,7 +11,8 @@ import { KEEP_FINISHED_SNAPSHOTS, NovelStore } from './store.js';
 import { DatabaseSync } from 'node:sqlite';
 import { NovelAgentScheduler } from './agents.js';
 import { DemoAgentTransport } from './agent/demo.js';
-import { checkCancelled, CONTINUE_NOTICE, ModelServiceError, type ModelRequest, type ModelResponse, type ResponseTransport } from './responses.js';
+import { checkCancelled, CONTINUE_NOTICE, ModelServiceError, type EmbeddingTransport, type ModelRequest, type ModelResponse, type ResponseTransport } from './responses.js';
+import { indexVectors } from './agent/semantic.js';
 import type { AgentCheckpoint } from './responses.js';
 import type { PlanNode, UpstreamResult } from '../shared/agent-types.js';
 import { MAX_EXPERIENCES, MAX_OUTPUT_REPAIRS } from './agent/runtime.js';
@@ -961,4 +962,33 @@ test('运行时不重复已失败的步骤：作者中途修改作品使候选�
     assert.deepEqual(tools, ['set_plan', 'delegate_tasks', 'propose_changes'], '失败的 propose_changes 不再重试');
     assert.match(done.runtime!.finalSummary!, /运行时记录：尚未组成候选的修改产物：/);
   } finally { store.close(); }
+});
+
+test('协调者的 search_context 在有语义索引时按意思召回原文；未设置向量模型时只做关键词检索', async () => {
+  for (const embeddingModel of ['meaning', undefined]) {
+    const store = new NovelStore(':memory:');
+    try {
+      const initial = store.createProject('语义检索'), chapterId = initial.chapters[0]!.id;
+      const project = store.execute({ projectId: initial.id, actor: 'human', commands: [
+        { type: 'putScene', value: { id: 'key', chapterId, order: 0, title: '旧灯塔', povId: null, eventIds: [], outline: '', text: '沈卿在旧灯塔下摸到一枚冰凉的铜钥匙。' } },
+        { type: 'putScene', value: { id: 'tea', chapterId, order: 1, title: '茶馆', povId: null, eventIds: [], outline: '', text: '账房先生在茶馆里拨着算盘。' } }] });
+      const embedder: EmbeddingTransport = { embed: async texts => ({ vectors: texts.map(text => [/钥匙|锁孔/.test(text) ? 1 : 0, 0.05]), tokens: 0 }) };
+      await indexVectors(store, project.id, embedder, 'meaning', new AbortController().signal, () => {});
+      const request: RunRequest = { projectId: project.id, stage: 'agent', objective: '找到能打开锁孔的东西在哪一场出现' };
+      const results: unknown[] = [];
+      const coordinator = (input: ModelRequest) => {
+        const outputs = input.input.filter(item => item.type === 'function_call_output');
+        if (!outputs.length) return stream(tool('search_context', { query: '能打开锁孔的东西', chapterFrom: null, chapterTo: null, entityId: null }));
+        results.push(JSON.parse(String((outputs.at(-1) as { output: string }).output)));
+        return stream(reply('找到了。'));
+      };
+      const scheduler = new NovelAgentScheduler(store, () => ({ ...provider, ...(embeddingModel ? { embeddingModel } : {}) }), () => {},
+        () => ({ stream: (input, signal) => input.agentId === 'coordinator' ? coordinator(input) : new DemoAgentTransport(request, project).stream(input, signal) }), () => embedder);
+      const run = scheduler.start(request);
+      assert.equal((await wait(store, run)).status, 'completed');
+      const hits = results[0] as Array<{ source: { kind: string; id: string } }>;
+      const prose = hits.filter(hit => hit.source.kind === 'scene:text').map(hit => hit.source.id);
+      assert.deepEqual(prose, embeddingModel ? ['key'] : []);
+    } finally { store.close(); }
+  }
 });

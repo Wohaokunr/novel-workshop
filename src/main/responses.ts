@@ -238,6 +238,25 @@ export class OpenAIResponseTransport implements ResponseTransport {
   }
 }
 
+/** Turns texts into vectors for the optional semantic index. Usage is reported in tokens. */
+export interface EmbeddingTransport { embed(texts: string[], signal: AbortSignal): Promise<{ vectors: number[][]; tokens: number }> }
+export class OpenAIEmbeddingTransport implements EmbeddingTransport {
+  private readonly client: OpenAI;
+  constructor(private readonly provider: ProviderSecret & { embeddingModel: string }, private readonly options: { background?: boolean } = {}) {
+    this.client = new OpenAI({ baseURL: provider.baseURL, apiKey: provider.apiKey, maxRetries: MODEL_RETRIES });
+  }
+  async embed(texts: string[], signal: AbortSignal) {
+    checkCancelled(signal);
+    const exit = await gateFor(this.provider.baseURL).enter(!!this.options.background, signal);
+    try {
+      const response = await this.client.embeddings.create({ model: this.provider.embeddingModel, input: texts }, { signal });
+      return { vectors: [...response.data].sort((a, b) => a.index - b.index).map(item => item.embedding), tokens: response.usage?.prompt_tokens ?? 0 };
+    } catch (error) {
+      throw serviceError(error, MODEL_RETRIES);
+    } finally { exit(); }
+  }
+}
+
 function responseText(response: ModelResponse): string {
   if (response.output_text !== undefined) return response.output_text;
   return response.output.flatMap(item => item.type === 'message'

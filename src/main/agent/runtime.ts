@@ -5,8 +5,9 @@ import { NovelStore } from '../store.js';
 import { buildWriterContext, resolveReferences, WRITER_CONTEXT_CHARS, WRITER_PRIORITY } from '../context.js';
 import { DomainValidationError, hasSemanticChanges } from '../domain.js';
 import type { ResponseInputItem } from 'openai/resources/responses/responses';
-import { addUsage, AgentSuspended, emptyUsage, OutputLimitError, runAgent, runtimeCalls, settleCheckpointTool, ToolValidationError, type AgentCheckpoint, type AgentDefinition, type ResponseTransport, type RunAgentOptions, type RuntimeCall, type ToolCallContext } from '../responses.js';
-import { bookSources, boundedContext, changeSources, collectContext, compactChanges, fingerprint, refreshMemories, searchContext, selectAuthorRules } from './memory.js';
+import { addUsage, AgentSuspended, emptyUsage, OutputLimitError, runAgent, runtimeCalls, settleCheckpointTool, ToolValidationError, type AgentCheckpoint, type AgentDefinition, type EmbeddingTransport, type ResponseTransport, type RunAgentOptions, type RuntimeCall, type ToolCallContext } from '../responses.js';
+import { bookSources, boundedContext, changeSources, collectContext, compactChanges, filteredScenes, fingerprint, refreshMemories, searchContext, selectAuthorRules } from './memory.js';
+import { nearestChunks, type SemanticHit } from './semantic.js';
 import { assertWriteScope, canProposeCommands, canReadAuthor, chainWriterNodes, createBudget, PLAN_ROLES, touchesProse, validatePlan } from './policy.js';
 import { specialistDefinition, type SpecialistDefinition } from './specialists.js';
 import { createCoordinatorTools, type ToolName } from './tools.js';
@@ -134,7 +135,8 @@ export function runtimeSummary(state: AgentState): AgentRuntimeSummary {
 export class PersistentAgentRuntime {
   private active = new Map<string, Entry>();
   constructor(private store: NovelStore, private getProvider: () => ProviderSecret | Promise<ProviderSecret>, private onEvent: (event: AgentEvent) => void,
-    private transportFactory: (provider: ProviderSecret, request: RunRequest, project: Workspace) => ResponseTransport) {}
+    private transportFactory: (provider: ProviderSecret, request: RunRequest, project: Workspace) => ResponseTransport,
+    private embedderFactory?: (provider: ProviderSecret & { embeddingModel: string }) => EmbeddingTransport) {}
 
   start(request: RunRequest): AgentRun {
     const project = this.store.getProject(request.projectId);
@@ -536,8 +538,11 @@ export class PersistentAgentRuntime {
         const text = JSON.stringify(values);
         return text.length > READ_ENTITIES_CHARS ? { ok: false, reason: '内容过大，请减少实体或用 search_context 读取片段' } : { revision: workspace.revision, values, missing: ids.filter(id => !values.some(value => value.id === id)) };
       }
-      case 'search_context': return searchContext(this.workspace(entry), String(args.query), 6, 'coordinator', {},
-        { chapterFrom: args.chapterFrom as string | null, chapterTo: args.chapterTo as string | null, entityId: args.entityId as string | null });
+      case 'search_context': {
+        const workspace = this.workspace(entry), query = String(args.query);
+        const filter = { chapterFrom: args.chapterFrom as string | null, chapterTo: args.chapterTo as string | null, entityId: args.entityId as string | null };
+        return searchContext(workspace, query, 6, 'coordinator', {}, filter, await this.semantic(entry, workspace, query, filteredScenes(workspace, filter)));
+      }
       case 'get_context': {
         const workspace = this.workspace(entry, args.candidateId);
         const { sources: _sources, ...context } = buildWriterContext(workspace, String(args.sceneId), entry.run.references, this.story(workspace));
@@ -754,6 +759,20 @@ export class PersistentAgentRuntime {
   private withUnfinished(entry: Entry, summary: string): string {
     const outstanding = this.outstanding(entry);
     return outstanding ? `${summary}\n\n运行时记录：${outstanding}` : summary;
+  }
+
+  /** Chunks nearest in meaning when an embedding model is set and the book has a vector index; keyword search alone otherwise,
+   * including when the embedding request fails (story memory reports indexing problems). */
+  private async semantic(entry: Entry, workspace: Workspace, query: string, allowed: Set<string> | undefined): Promise<SemanticHit[]> {
+    const model = entry.provider?.embeddingModel;
+    if (!model || !this.embedderFactory || !query.trim() || !this.store.getStoryVectors(workspace.id, model).length) return [];
+    try {
+      const { vectors } = await this.embedderFactory({ ...entry.provider!, embeddingModel: model }).embed([query.slice(0, 500)], entry.controller.signal);
+      return nearestChunks(this.store, workspace, model, vectors[0]!, { allowed, limit: 12 });
+    } catch (error) {
+      if (entry.controller.signal.aborted) throw error;
+      return [];
+    }
   }
 
   private async reviseCandidate(entry: Entry, candidate: AgentCandidate, nodes: PlanNode[], objective: string, call: ToolCallContext): Promise<unknown> {

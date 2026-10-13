@@ -26,6 +26,8 @@ export interface StoryMemoryStatus {
   /** Auto mode found a backlog too large to spend on silently; the author starts it explicitly. */
   awaitingConfirmation: boolean;
   lastError?: string; usage: TokenUsage; updatedAt?: string;
+  /** Present when an embedding model is set: paragraph chunks with a vector for their current text. */
+  vectors?: { model: string; indexed: number; total: number };
 }
 
 export interface StoryMemoryAPI {

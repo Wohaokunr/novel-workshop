@@ -588,6 +588,29 @@ export class NovelStore {
     });
   }
 
+  /** Optional semantic index over paragraph chunks: derived and local like story digests, keyed by chunk start. */
+  getStoryVectors(projectId: string, model: string): Array<{ sceneId: string; start: number; end: number; textHash: string; vector: Float32Array }> {
+    const rows = this.db.prepare('SELECT scene_id,start,end,text_hash,vector FROM story_vectors WHERE project_id=? AND model=?').all(projectId, model) as Array<{ scene_id: string; start: number; end: number; text_hash: string; vector: Uint8Array }>;
+    // Copy into an aligned buffer: SQLite hands back blobs at arbitrary offsets.
+    return rows.map(row => ({ sceneId: row.scene_id, start: row.start, end: row.end, textHash: row.text_hash, vector: new Float32Array(Uint8Array.from(row.vector).buffer) }));
+  }
+  putStoryVectors(projectId: string, model: string, rows: Array<{ sceneId: string; start: number; end: number; textHash: string; vector: Float32Array }>): void {
+    if (!rows.length) return;
+    this.transaction(() => {
+      this.requireProject(projectId);
+      const statement = this.db.prepare('INSERT INTO story_vectors(project_id,scene_id,start,end,text_hash,model,vector) VALUES(?,?,?,?,?,?,?) ON CONFLICT(project_id,scene_id,start) DO UPDATE SET end=excluded.end,text_hash=excluded.text_hash,model=excluded.model,vector=excluded.vector');
+      for (const row of rows) statement.run(projectId, row.sceneId, row.start, row.end, row.textHash, model, new Uint8Array(row.vector.buffer, row.vector.byteOffset, row.vector.byteLength));
+    });
+  }
+  /** Keep only the given chunks (`sceneId:start`) of the current model. */
+  pruneStoryVectors(projectId: string, model: string, live: Set<string>): void {
+    this.transaction(() => {
+      const rows = this.db.prepare('SELECT scene_id,start,model FROM story_vectors WHERE project_id=?').all(projectId) as Array<{ scene_id: string; start: number; model: string }>;
+      const remove = this.db.prepare('DELETE FROM story_vectors WHERE project_id=? AND scene_id=? AND start=?');
+      for (const row of rows) if (row.model !== model || !live.has(`${row.scene_id}:${row.start}`)) remove.run(projectId, row.scene_id, row.start);
+    });
+  }
+
   /** Edits and rejections already turned into style suggestions; local learning state, not part of a backup. */
   getStyleObservations(projectId: string): Set<string> {
     return new Set((this.db.prepare('SELECT key FROM style_observations WHERE project_id=?').all(projectId) as Array<{ key: string }>).map(row => row.key));
