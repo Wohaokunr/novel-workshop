@@ -224,6 +224,14 @@ NOVEL_EVAL_MODEL=<模型名> NOVEL_EVAL_API_KEY=<API Key> npm run eval -- --repe
 
 `NOVEL_EVAL_BASE_URL`、`NOVEL_EVAL_REASONING_EFFORT`、`NOVEL_EVAL_MAX_OUTPUT_TOKENS` 可选。报告列出改动的提示词和通过率下降的检查；有下降、或上下文检查失败时退出码为 1，加 `--strict` 时任何检查未通过都返回 1。不设置模型与 API Key 时使用本地演示响应，只验证评测流程与上下文检查。检查是基于标记词与本地统计的确定性检查，能抓住明显的退步；没有命中不等于完全合规，细微的问题仍需人工阅读报告中的输出。
 
+检查只能证明正文“没写错”，不能证明“写得更好”。改了写作提示词后，在第二条命令后加 `--judge`，让模型盲评每个写作任务的新旧两版正文：
+
+```bash
+NOVEL_EVAL_MODEL=<模型名> NOVEL_EVAL_API_KEY=<API Key> npm run eval -- --repeat 3 --baseline artifacts/eval/before/latest-live.json --judge
+```
+
+评审只看到 A、B 两版和同一份大纲、文风与作者约束，不知道哪版来自基线，按戏剧性、画面感、对白、去 AI 腔、贴合度逐项比较，允许判持平。每对正反顺序各评一次，两次结论一致才算胜出，偏向先出现那版的评审只会得到持平。报告给出整体与各维度的“当前胜 / 基线胜 / 持平”对数和评审理由，结果写入报告的 `judge` 字段，不影响退出码。`NOVEL_EVAL_JUDGE_MODEL` 可指定另一个评审模型，默认用评测模型。基线与本次需要同一任务、同一轮次都写出正文才会配对，`--repeat 3` 时每个写作任务比较 3 对。演示模式下评审一律判持平，只验证流程。
+
 ## 参与贡献
 
 欢迎提交 Issue 与 Pull Request。提交前请至少运行 `npm run typecheck` 与 `npm test`；涉及界面流程的修改再运行对应的 `npm run smoke`。桌面冒烟需要可交互的桌面环境，只使用演示模式，不调用真实模型，也不需要 API Key。

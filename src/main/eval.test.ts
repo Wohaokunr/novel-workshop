@@ -1,10 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import type { ModelRequest, ModelResponse, ResponseTransport } from './responses.js';
+import { restoreProse, type ModelRequest, type ModelResponse, type ResponseTransport } from './responses.js';
 import { BENCHMARK } from './eval/bench.js';
 import { compareReports, formatReport, runBenchmark, runTask, type BenchReport } from './eval/harness.js';
 import { absent, proseFormat, styleCheck } from './eval/checks.js';
+import { judgePairs, judgeReports } from './eval/judge.js';
+import { JUDGE_DIMENSIONS } from './prompts/eval.js';
 import { PROMPTS, PROMPT_SET_VERSION, prompt, promptVersion } from './prompts/index.js';
 import { writerPrompt, writerScopePrompts } from './prompts/specialists.js';
 import { styleProfile } from '../shared/style-types.js';
@@ -67,6 +69,37 @@ test('与基线比较：报告通过率下降的检查与改动的提示词；�
   const edited: BenchReport = { ...baseline, prompts: baseline.prompts.map(item => item.id === 'writer' ? { ...item, version: 'changed' } : item) };
   assert.match(formatReport(worse, edited), /改动的提示词 writer/);
   assert.match(formatReport(worse, baseline), /通过率下降 \d+ 项/);
+});
+
+test('盲评：同一任务同一轮的两版正文正反各评一次，两次一致才算胜出，只认先出现那版的评审判持平', async () => {
+  const baseline = await runBenchmark(compliant(), { mode: 'fixture', repeat: 2 });
+  const current = await runBenchmark(compliant(request => request.agentId === 'writer' ? `新版。${'雾里有人敲了三下门，许砚没有应。\n'.repeat(20)}` : undefined), { mode: 'fixture', repeat: 2 });
+  const writers = BENCHMARK.flatMap(item => item.tasks).filter(task => task.role === 'writer').length;
+  assert.equal(judgePairs(baseline, current).length, writers * 2);
+  assert.equal(judgePairs({ ...baseline, results: baseline.results.map(result => ({ ...result, error: '服务不可用', output: '' })) }, current).length, 0, '失败的写作不配对');
+
+  const seen: Array<Record<string, any>> = [];
+  const judge = (pick: (context: Record<string, any>) => 'A' | 'B') => (() => ({ stream: (request: ModelRequest) => {
+    const context = restoreProse(request.input); seen.push(context);
+    const winner = pick(context);
+    const value = { dimensions: JUDGE_DIMENSIONS.map(name => ({ name, winner: name === 'dialogue' ? 'tie' : winner, reason: '依据正文。' })), winner, reason: '整体如此。' };
+    return { events: (async function* () {})(), finalResponse: async () => answer(value) };
+  } })) as never;
+  const prefersNew = await judgeReports(baseline, current, judge(context => String(context.A).startsWith('新版') ? 'A' : 'B'));
+  assert.equal(prefersNew.pairs.length, writers * 2);
+  assert.equal(seen.length, writers * 2 * 2, '每对评两次');
+  assert.ok(seen.every(context => context.outline && context.A && context.B && !('baseline' in context) && !('current' in context)), '评审只看到 A/B，不知道出处');
+  assert.ok(prefersNew.pairs.every(pair => pair.overall === 'current' && pair.dimensions.drama === 'current' && pair.dimensions.dialogue === 'tie'));
+
+  const positional = await judgeReports(baseline, current, judge(() => 'A'));
+  assert.ok(positional.pairs.every(pair => pair.overall === 'tie' && JUDGE_DIMENSIONS.every(name => pair.dimensions[name] === 'tie')));
+
+  const text = formatReport({ ...current, judge: prefersNew }, baseline);
+  assert.match(text, new RegExp(`整体：当前胜 ${writers * 2} · 基线胜 0 · 持平 0`));
+  assert.match(text, /对白：当前胜 0 · 基线胜 0 · 持平 \d+/);
+  const failing = await judgeReports(baseline, current, (() => ({ stream: () => ({ events: (async function* () {})(), finalResponse: async () => answer('不是 JSON') }) })) as never);
+  assert.ok(failing.pairs.every(pair => pair.error));
+  assert.match(formatReport({ ...current, judge: failing }), /评审失败/);
 });
 
 test('提示词独立成文件：id 唯一、版本由文本计算，写作步骤记录所用提示词的版本', async () => {
