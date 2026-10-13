@@ -71,7 +71,7 @@ export async function runWriterSmoke(window: BrowserWindow, store: NovelStore) {
   await click('continue-writing');
   await until(() => ui<boolean>(`(${el('live-draft')})?.textContent.includes('正在续写')`), '续写预览出现');
   await until(() => ui<boolean>(streaming), '续写过程显示在编辑区');
-  await ui(`document.documentElement.dataset.theme='dark'`); await delay(60);
+  await ui(`document.documentElement.dataset.theme='dark'`); await delay(500);
   await capture('writer-02-continue-dark.png');
   await ui(`document.documentElement.dataset.theme='light'`);
   await click('approve-candidate');
