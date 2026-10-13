@@ -166,7 +166,8 @@ export class StoryMemoryService {
     const context = {
       openThreads: threadList(ledgerForDigest(open, batch.map(passage => passage.text).join('\n'), LEDGER_LIMIT)),
       previousSummary: previousSummary(view, batch[0]!.id),
-      passages: batch.map(passage => ({ passageId: passage.id, chapter: chapterTitle(view, passage), scene: view.label(passage.id), text: passage.text })),
+      // Scene titles are author notes and may give the plot away; digests are read as reader-safe, so they see the prose only.
+      passages: batch.map(passage => ({ passageId: passage.id, chapter: chapterTitle(view, passage), ...sceneOf(view, passage), text: passage.text })),
     };
     const result = await this.digestCall(project.id, transport, context, signal);
     const at = stamp(), digests: PassageDigest[] = [];
@@ -185,13 +186,13 @@ export class StoryMemoryService {
    * summaries are merged into one. Nothing is stored unless every part was digested. */
   private async digestLongPassage(project: Workspace, view: StoryView, passage: Passage, transport: ResponseTransport, model: string, signal: AbortSignal): Promise<number> {
     const parts = splitParts(passage.text, PASSAGE_PART_CHARS), open = view.ledgerBefore(passage.id), known = new Set(open.map(thread => thread.id));
-    const chapter = chapterTitle(view, passage), scene = view.label(passage.id), previousThreads = view.storedDigest(passage.id)?.threadsOpened ?? [];
+    const chapter = chapterTitle(view, passage), scene = sceneOf(view, passage), previousThreads = view.storedDigest(passage.id)?.threadsOpened ?? [];
     const digested: Array<DigestItem & { threads: StoryThread[] }> = [], openedHere: StoryThread[] = [];
     let previous = previousSummary(view, passage.id);
     for (const [index, part] of parts.entries()) {
       const partId = `${passage.id}#${index + 1}/${parts.length}`;
       const result = await this.digestCall(project.id, transport, { openThreads: [...threadList(ledgerForDigest(open, part, LEDGER_LIMIT)), ...threadList(openedHere)],
-        previousSummary: previous, passages: [{ passageId: partId, chapter, scene, text: part }] }, signal);
+        previousSummary: previous, passages: [{ passageId: partId, chapter, ...scene, text: part }] }, signal);
       const item = result.passages.find(value => value.passageId === partId) ?? (result.passages.length === 1 ? result.passages[0] : undefined);
       if (!item) return 1;
       const threads = stableThreads(passage.id, item.threadsOpened.slice(0, 3), previousThreads.filter(thread => !openedHere.some(other => other.id === thread.id)));
@@ -199,7 +200,7 @@ export class StoryMemoryService {
       for (const thread of threads) known.add(thread.id);
     }
     const step = await runAgent({ id: 'story:merge', label: '故事记忆 · 长段合并', instructions: mergePrompt.text, outputSchema: rollupSchema },
-      { transport, context: { items: [{ id: passage.id, title: scene, parts: digested.map(item => ({ summary: item.summary, events: item.events })) }] }, objective: '合并为这一段的摘要。', signal, contextSources: [] });
+      { transport, context: { items: [{ id: passage.id, title: chapter, parts: digested.map(item => ({ summary: item.summary, events: item.events })) }] }, objective: '合并为这一段的摘要。', signal, contextSources: [] });
     this.track(project.id, step.usage);
     const merged = (step.structured as { items: Array<{ id: string; summary: string }> }).items.find(item => item.id === passage.id)?.summary;
     // A thread opened and answered inside the same long passage was never open after it.
@@ -234,9 +235,18 @@ export class StoryMemoryService {
 interface DigestItem { passageId: string; summary: string; events: string[]; changes: PassageDigest['changes']; threadsOpened: Array<{ title: string; major: boolean }>; threadsClosed: string[]; facts: string[] }
 
 function chapterTitle(view: StoryView, passage: Passage): string { return view.chapters[view.chapterIndex(passage.chapterId)]?.title ?? ''; }
+/** Which scene a passage belongs to, by id and part, never by title. */
+function sceneOf(view: StoryView, passage: Passage): { sceneId: string; part?: string } {
+  const part = view.part(passage.id);
+  return { sceneId: passage.sceneId, ...(part ? { part } : {}) };
+}
+/** The lead-in comes from the nearest earlier passage with prose; empty placeholders (a scene continued into a chapter) are skipped. */
 function previousSummary(view: StoryView, passageId: string): string {
-  const before = view.order[view.positionOf(passageId) - 1];
-  return before ? view.digest(before.id)?.summary ?? extractSummary(before.text).closing : '';
+  for (let at = view.positionOf(passageId) - 1; at >= 0; at--) {
+    const before = view.order[at]!;
+    if (before.text.trim()) return view.digest(before.id)?.summary ?? extractSummary(before.text).closing;
+  }
+  return '';
 }
 function threadList(threads: StoryThread[]) { return threads.map(thread => ({ id: thread.id, title: thread.title, ...(thread.major ? { major: true } : {}) })); }
 

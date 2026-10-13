@@ -10,7 +10,7 @@ import { buildCharacterContext, buildReaderContext, resolveReferences } from '..
 import { cardContent, DomainValidationError } from '../domain.js';
 import { canReadAuthor, isRole } from './policy.js';
 import type { SemanticHit } from './semantic.js';
-import { passageMentions, searchChunks } from './story-index.js';
+import { passageMentions, searchChunks, storyIndex } from './story-index.js';
 import { storyOverview, StoryView } from './story-view.js';
 
 export const MAX_CONTEXT_CHARS = 32_000;
@@ -217,7 +217,7 @@ export function filteredPassages(workspace: Workspace, filter: SearchFilter): Se
   const entityId = filter.entityId;
   if (entityId && !workspace.objects.some(object => object.id === entityId)) throw new DomainValidationError('检索对象不存在');
   const range = new Set(chapters.slice(Math.min(from, to), Math.max(from, to) + 1).map(chapter => chapter.id));
-  const index = new StoryView(workspace).index, scenes = new Map(workspace.scenes.map(scene => [scene.id, scene]));
+  const index = storyIndex(workspace), scenes = new Map(workspace.scenes.map(scene => [scene.id, scene]));
   const onStage = (passage: Passage) => {
     const scene = scenes.get(passage.sceneId);
     return !!scene && (scene.povId === entityId || scene.eventIds.includes(entityId!) || !!scene.castIds?.includes(entityId!) || !!scene.settingIds?.includes(entityId!)
@@ -240,9 +240,10 @@ function queryTerms(query: string): string[] {
  * Prose comes from the paragraph-chunk index (BM25, at most two chunks per passage); small records are scored directly.
  * `semantic`: chunks nearest in meaning (optional vector index); they join the prose results and lift keyword hits they overlap. */
 export function searchContext(workspace: Workspace, query: string, limit = 6, role: AgentRole = 'coordinator', anchor: ContextAnchor = {}, filter: SearchFilter = {},
-  semantic: SemanticHit[] = []): SearchChunk[] {
+  semantic: SemanticHit[] = [], filtered?: Set<string>): SearchChunk[] {
   if (!isRole(role)) throw new DomainValidationError('检索角色无效');
-  const scoped = role === 'reader' || role === 'character' ? undefined : filteredPassages(workspace, filter);
+  // filtered: filteredPassages(workspace, filter) when the caller has already worked it out.
+  const scoped = role === 'reader' || role === 'character' ? undefined : filtered ?? filteredPassages(workspace, filter);
   const allowed = role === 'reader' ? readerPassages(workspace, anchor) : role === 'character' ? new Set<string>() : scoped;
   const documents = role === 'reader' ? [] : role === 'character' ? characterDocuments(workspace, anchor) : authorDocuments(workspace, scoped);
   if (typeof query !== 'string' || !query.trim()) return [];

@@ -168,8 +168,17 @@ test('a scene running across chapters records its change on the passage being wr
   assert.match(JSON.stringify(again.context), /"recorded":\[\{"eventId":"","becomes":\{"状态":"站在门内"\}/);
   const second = (again.toCommands!(step('', { changes: [{ ...output.changes[0]!, aspects: [{ aspect: '状态', value: '退回门外' }] }] }))[0] as Extract<Command, { type: 'putStateChange' }>).value;
   assert.equal(second.id, first.id);
+  // Naming a cause the first run did not still updates that change instead of adding a second, contradicting one.
+  const third = again.toCommands!(step('', { changes: [{ ...output.changes[0]!, eventId: 'now', aspects: [{ aspect: '状态', value: '退回门外' }] }] }));
+  assert.equal(third.length, 1); assert.equal((third[0] as Extract<Command, { type: 'putStateChange' }>).value.id, first.id);
   // A chapter task writes only its own chapter's part, so it cannot record a change for the scene as a whole.
   assert.throws(() => specialist(workspace, 'evolution', { sceneId: 'blank' }, { stage: 'chapter', chapterId: 'chapter' }), /超出章节写作范围/);
+});
+
+test('evolution with nobody on stage or named in the prose completes without a model call', () => {
+  const workspace = applyCommands(fixture(), scene('empty', 'later', 1, { text: '雨下了一整夜。' }));
+  assert.ok(specialist(workspace, 'evolution', { sceneId: 'empty' }, { stage: 'chapter', passageId: 'empty' }).skip);
+  assert.equal(specialist(workspace, 'evolution', { sceneId: 'target' }).skip, undefined);
 });
 
 test('writer commands only replace the designated passage text and splice rewrite selections', () => {

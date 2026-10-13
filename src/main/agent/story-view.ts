@@ -1,6 +1,6 @@
 import type { Chapter, NarrativeScene, Passage, Workspace } from '../../shared/types.js';
 import type { PassageDigest, RollupDigest, StoryDigest, StoryThread } from '../../shared/story-types.js';
-import { orderedChapters, orderedPassages, passageLabel } from '../../shared/structure.js';
+import { orderedChapters, orderedPassages } from '../../shared/structure.js';
 import { extractSummary, indexTerms, mentionExcerpt, passageHash, passageMentions, sketchSimilarity, storyIndex, textHash, textSketch, type Mention, type StoryIndex } from './story-index.js';
 
 /** fresh: digest of this exact text; drifted: digest of an earlier, mostly similar version; extract: zero-token fallback. */
@@ -48,6 +48,7 @@ export class StoryView {
   private readonly position = new Map<string, number>();
   private readonly chapterPosition = new Map<string, number>();
   private readonly scenes: Map<string, NarrativeScene>;
+  private readonly partsByScene = new Map<string, Passage[]>();
   private readonly passageDigests = new Map<string, PassageDigest>();
   private readonly rollups = new Map<string, RollupDigest>();
   private readonly freshnessCache = new Map<string, Freshness>();
@@ -58,7 +59,11 @@ export class StoryView {
     this.chapters = orderedChapters(workspace);
     this.chapters.forEach((chapter, index) => this.chapterPosition.set(chapter.id, index));
     this.order = orderedPassages(workspace);
-    this.order.forEach((passage, index) => this.position.set(passage.id, index));
+    this.order.forEach((passage, index) => {
+      this.position.set(passage.id, index);
+      const parts = this.partsByScene.get(passage.sceneId);
+      if (parts) parts.push(passage); else this.partsByScene.set(passage.sceneId, [passage]);
+    });
     this.scenes = new Map(workspace.scenes.map(scene => [scene.id, scene]));
     for (const digest of digests) {
       if (digest.kind === 'passage') this.passageDigests.set(digest.passageId, digest);
@@ -71,11 +76,21 @@ export class StoryView {
   /** The scene a passage belongs to. */
   sceneOf(passageId: string): NarrativeScene | undefined { const passage = this.passage(passageId); return passage && this.scenes.get(passage.sceneId); }
   /** 「雨夜对峙（2/3）」: the scene title, and which of its passages this is when the scene runs through several chapters. */
-  label(passageId: string): string { const passage = this.passage(passageId); return passage ? passageLabel(this.workspace, passage) : ''; }
+  label(passageId: string): string {
+    const passage = this.passage(passageId);
+    if (!passage) return '';
+    const title = this.scenes.get(passage.sceneId)?.title ?? '场景', part = this.part(passageId);
+    return part ? `${title}（${part}）` : title;
+  }
+  /** 「2/3」 when the passage's scene runs through several chapters, else ''. Carries no author material, unlike label. */
+  part(passageId: string): string {
+    const passage = this.passage(passageId), parts = passage ? this.scenePassages(passage.sceneId) : [];
+    return parts.length > 1 ? `${parts.indexOf(passage!) + 1}/${parts.length}` : '';
+  }
   positionOf(passageId: string): number { return this.position.get(passageId) ?? -1; }
   chapterIndex(id: string): number { return this.chapterPosition.get(id) ?? -1; }
-  /** Passages of a scene in reading order. */
-  scenePassages(sceneId: string): Passage[] { return this.order.filter(passage => passage.sceneId === sceneId); }
+  /** Passages of a scene in reading order. Shared with the view: callers must not mutate it. */
+  scenePassages(sceneId: string): Passage[] { return this.partsByScene.get(sceneId) ?? []; }
 
   freshness(passageId: string): Freshness {
     const cached = this.freshnessCache.get(passageId);

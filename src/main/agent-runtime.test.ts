@@ -93,7 +93,9 @@ for (const stage of ['chapter', 'rewrite'] as const) test(`${stage === 'chapter'
       ...(stage === 'rewrite' ? { selection: { start: 6, end: 6 } } : {}) });
     const pending = await wait(store, run);
     assert.equal(pending.status, 'awaitingApproval', pending.error ?? pending.runtime?.pauseReason ?? '');
-    assert.deepEqual(pending.runtime!.plan!.nodes.map(node => node.role), ['writer']);
+    // Writing a passage always plans its state changes; with nobody on stage or named in the prose, evolution makes no model call.
+    assert.deepEqual(pending.runtime!.plan!.nodes.map(node => node.role), stage === 'chapter' ? ['writer', 'evolution'] : ['writer']);
+    assert.ok(!h.requests.some(request => request.agentId.startsWith('evolution:')));
     const candidate = pending.runtime!.candidates.at(-1)!;
     await h.scheduler.decide({ runId: run.id, candidateId: candidate.id, candidateHash: candidate.hash, approve: true });
     const done = await until(store, run.id, value => value.status === 'completed' || value.status === 'paused' || value.status === 'failed');
@@ -372,6 +374,42 @@ for (const stillRevise of [false, true]) test(`自动审查直接驱动写作者
     assert.match(store.getProject(project.id).passages[0]!.text, new RegExp(`第${revisions}次修订`));
     assert.equal(store.getProject(project.id).passages[1]!.text, '作者保留的正文');
     assert.equal(store.history(project.id).filter(batch => batch.taskId === run.id).length, 1);
+  } finally { store.close(); }
+});
+
+test('自动修订改写正文后，人物状态变化依据改写后的正文重新记录，不留下旧依据', { timeout: 10000 }, async () => {
+  const store = new NovelStore(':memory:'); let revisions = 0;
+  try {
+    const initial = store.createProject('状态随修订');
+    const project = store.execute({ projectId: initial.id, actor: 'human', commands: [
+      { type: 'putObject', value: { id: 'lin', typeId: 'character', name: '林舟', fields: {} } },
+      { type: 'putScene', value: { id: 'scene-0', title: '场景0', outline: '人物面对当场线索作出选择', povId: 'lin', eventIds: [] } },
+      { type: 'putPassage', value: { id: 'scene-0', sceneId: 'scene-0', chapterId: initial.chapters[0]!.id, order: 0, text: '' } }] });
+    const evolutionProse: string[] = [];
+    const h = harness(store, (request, signal, demo) => {
+      if (request.agentId === 'continuity') return stream(reply({ verdict: revisions ? 'pass' : 'revise', issues: revisions ? [] : [issue('说明谁在岸上接绳')], recommendation: '交代救援站位' }));
+      if (request.agentId === 'patch') { revisions++; return stream(patch(request, '\n\n第1次修订：林舟站在岸上接住了绳子。')); }
+      if (request.agentId.startsWith('evolution:')) {
+        const context = JSON.parse((request.input[0] as { content: string }).content).context;
+        const text = String(context.prose?.map((item: { text: string }) => item.text).join('') ?? '');
+        evolutionProse.push(text);
+        return stream(reply({ changes: [{ subjectId: 'lin', eventId: '', note: text.includes('第1次修订') ? '依据：接住了绳子' : '依据：旧稿', aspects: [{ aspect: '状态', value: text.includes('第1次修订') ? '站在岸上' : '还在船上' }] }] }));
+      }
+      return demo.stream(request, signal);
+    });
+    const run = h.start({ projectId: project.id, stage: 'chapter', passageId: 'scene-0', objective: '生成正文' });
+    const pending = await wait(store, run);
+    assert.equal(pending.status, 'awaitingApproval', pending.error ?? pending.runtime?.pauseReason ?? '');
+    assert.equal(revisions, 1);
+    assert.equal(evolutionProse.length, 2, '修订后重新记录一次状态变化');
+    assert.ok(evolutionProse[1]!.includes('第1次修订'), '重新记录读到的是改写后的正文');
+    const candidate = pending.runtime!.candidates.at(-1)!;
+    await h.scheduler.decide({ runId: run.id, candidateId: candidate.id, candidateHash: candidate.hash, approve: true });
+    const done = await until(store, run.id, value => value.status === 'completed' || value.status === 'paused' || value.status === 'failed');
+    assert.equal(done.status, 'completed', done.runtime?.pauseReason ?? done.error ?? '');
+    const changes = store.getProject(project.id).stateChanges.filter(change => change.subjectId === 'lin');
+    assert.equal(changes.length, 1);
+    assert.equal(changes[0]!.note, '依据：接住了绳子'); assert.equal(changes[0]!.aspects.condition, '站在岸上');
   } finally { store.close(); }
 });
 
