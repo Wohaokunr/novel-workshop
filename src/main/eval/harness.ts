@@ -47,7 +47,7 @@ function outputChecks(benchCase: BenchCase, task: BenchTask, project: Workspace,
 export async function runTask(benchCase: BenchCase, task: BenchTask, transport: (project: Workspace, request: RunRequest) => ResponseTransport, attempt = 1, signal = new AbortController().signal): Promise<TaskResult> {
   const project = benchCase.build();
   const node: PlanNode = { id: task.id, role: task.role, objective: task.objective, acceptance: '', dependsOn: [], status: 'pending',
-    ...(task.sceneId ? { sceneId: task.sceneId } : {}), ...(task.chapterId ? { chapterId: task.chapterId } : {}),
+    ...(task.passageId ? { passageId: task.passageId } : {}), ...(task.chapterId ? { chapterId: task.chapterId } : {}),
     ...(task.characterId ? { characterId: task.characterId } : {}), ...(task.eventId ? { eventId: task.eventId } : {}) };
   const request: RunRequest = { projectId: project.id, stage: 'agent', objective: task.objective };
   const base = { caseId: benchCase.id, taskId: task.id, label: task.label, role: task.role, attempt };

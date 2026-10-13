@@ -3,15 +3,15 @@ import type { Workspace } from '../../shared/types.js';
 import { objectNames } from '../../shared/story-elements.js';
 
 /** Zero-token index over prose: paragraph chunks, an inverted bigram index and entity mentions.
- * Rebuilt incrementally per scene; nothing here calls a model or leaves the process. */
+ * Rebuilt incrementally per passage (a scene's prose in one chapter); nothing here calls a model or leaves the process. */
 export const CHUNK_CHARS = 500;
 const MAX_CACHED_PROJECTS = 3;
 
-export interface IndexChunk { id: number; sceneId: string; start: number; end: number; terms: string[] }
+export interface IndexChunk { id: number; passageId: string; start: number; end: number; terms: string[] }
 export interface Mention { count: number; first: number; last: number }
-interface SceneEntry { text: string; hash: string; chunks: number[]; mentions: Map<string, Mention> }
+interface PassageEntry { text: string; hash: string; chunks: number[]; mentions: Map<string, Mention> }
 export interface StoryIndex {
-  projectId: string; scenes: Map<string, SceneEntry>; chunks: Map<number, IndexChunk>;
+  projectId: string; passages: Map<string, PassageEntry>; chunks: Map<number, IndexChunk>;
   postings: Map<string, Set<number>>; nextChunk: number; namesKey: string; names: Array<{ id: string; name: string }>;
 }
 
@@ -50,7 +50,7 @@ export function chunkText(text: string): Array<{ start: number; end: number }> {
   return result;
 }
 
-/** 16-value MinHash over character bigrams; estimates how much of a scene changed since its digest. */
+/** 16-value MinHash over character bigrams; estimates how much of a passage changed since its digest. */
 export function textSketch(text: string): number[] {
   const sketch = new Array<number>(16).fill(0xffffffff);
   const letters = Array.from(text.replace(/\s+/g, ''));
@@ -98,8 +98,8 @@ function mentionsOf(text: string, names: StoryIndex['names']): Map<string, Menti
   return result;
 }
 
-function removeScene(index: StoryIndex, sceneId: string) {
-  const entry = index.scenes.get(sceneId);
+function removePassage(index: StoryIndex, passageId: string) {
+  const entry = index.passages.get(passageId);
   if (!entry) return;
   for (const id of entry.chunks) {
     for (const term of index.chunks.get(id)?.terms ?? []) {
@@ -109,14 +109,14 @@ function removeScene(index: StoryIndex, sceneId: string) {
     }
     index.chunks.delete(id);
   }
-  index.scenes.delete(sceneId);
+  index.passages.delete(passageId);
 }
 
-/** The shared index for this workspace's scenes; a candidate workspace re-syncs only the scenes that differ. */
+/** The shared index for this workspace's passages; a candidate workspace re-syncs only the passages that differ. */
 export function storyIndex(workspace: Workspace): StoryIndex {
   let index = cache.get(workspace.id);
   if (index) cache.delete(workspace.id);
-  else index = { projectId: workspace.id, scenes: new Map(), chunks: new Map(), postings: new Map(), nextChunk: 0, namesKey: '', names: [] };
+  else index = { projectId: workspace.id, passages: new Map(), chunks: new Map(), postings: new Map(), nextChunk: 0, namesKey: '', names: [] };
   cache.set(workspace.id, index);
   while (cache.size > MAX_CACHED_PROJECTS) cache.delete(cache.keys().next().value!);
 
@@ -125,31 +125,31 @@ export function storyIndex(workspace: Workspace): StoryIndex {
   const renamed = namesKey !== index.namesKey;
   index.names = names; index.namesKey = namesKey;
   const live = new Set<string>();
-  for (const scene of workspace.scenes) {
-    live.add(scene.id);
-    const entry = index.scenes.get(scene.id);
-    if (entry && entry.text === scene.text) { if (renamed) entry.mentions = mentionsOf(scene.text, names); continue; }
-    removeScene(index, scene.id);
+  for (const passage of workspace.passages) {
+    live.add(passage.id);
+    const entry = index.passages.get(passage.id);
+    if (entry && entry.text === passage.text) { if (renamed) entry.mentions = mentionsOf(passage.text, names); continue; }
+    removePassage(index, passage.id);
     const chunks: number[] = [];
-    for (const range of chunkText(scene.text)) {
-      const id = index.nextChunk++, terms = indexTerms(scene.text.slice(range.start, range.end));
-      index.chunks.set(id, { id, sceneId: scene.id, ...range, terms });
+    for (const range of chunkText(passage.text)) {
+      const id = index.nextChunk++, terms = indexTerms(passage.text.slice(range.start, range.end));
+      index.chunks.set(id, { id, passageId: passage.id, ...range, terms });
       for (const term of terms) { let posting = index.postings.get(term); if (!posting) index.postings.set(term, posting = new Set()); posting.add(id); }
       chunks.push(id);
     }
-    index.scenes.set(scene.id, { text: scene.text, hash: textHash(scene.text), chunks, mentions: mentionsOf(scene.text, names) });
+    index.passages.set(passage.id, { text: passage.text, hash: textHash(passage.text), chunks, mentions: mentionsOf(passage.text, names) });
   }
-  for (const id of [...index.scenes.keys()]) if (!live.has(id)) removeScene(index, id);
+  for (const id of [...index.passages.keys()]) if (!live.has(id)) removePassage(index, id);
   return index;
 }
 
-export function sceneHash(index: StoryIndex, sceneId: string): string | undefined { return index.scenes.get(sceneId)?.hash; }
-export function sceneMentions(index: StoryIndex, sceneId: string): Map<string, Mention> { return index.scenes.get(sceneId)?.mentions ?? new Map(); }
+export function passageHash(index: StoryIndex, passageId: string): string | undefined { return index.passages.get(passageId)?.hash; }
+export function passageMentions(index: StoryIndex, passageId: string): Map<string, Mention> { return index.passages.get(passageId)?.mentions ?? new Map(); }
 
-export interface ChunkHit { sceneId: string; start: number; end: number; score: number; matchedTerms: number; containsNeedle: boolean }
+export interface ChunkHit { passageId: string; start: number; end: number; score: number; matchedTerms: number; containsNeedle: boolean }
 
-/** BM25 over candidate chunks. `allowed` filters scenes before any scoring, so query words never widen access. */
-export function searchChunks(index: StoryIndex, workspace: Workspace, query: string, options: { allowed?: Set<string>; limit: number; perScene?: number }): ChunkHit[] {
+/** BM25 over candidate chunks. `allowed` filters passages before any scoring, so query words never widen access. */
+export function searchChunks(index: StoryIndex, workspace: Workspace, query: string, options: { allowed?: Set<string>; limit: number; perPassage?: number }): ChunkHit[] {
   const needle = query.trim().slice(0, 256).toLowerCase();
   const terms = indexTerms(needle).filter(term => index.postings.has(term)).slice(0, 128);
   if (!needle || !terms.length) return [];
@@ -157,13 +157,13 @@ export function searchChunks(index: StoryIndex, workspace: Workspace, query: str
   const candidates = new Set<number>();
   for (const term of terms) for (const id of index.postings.get(term)!) {
     const chunk = index.chunks.get(id)!;
-    if (!options.allowed || options.allowed.has(chunk.sceneId)) candidates.add(id);
+    if (!options.allowed || options.allowed.has(chunk.passageId)) candidates.add(id);
   }
-  const texts = new Map(workspace.scenes.map(scene => [scene.id, scene.text]));
+  const texts = new Map(workspace.passages.map(passage => [passage.id, passage.text]));
   const hits: ChunkHit[] = [];
   for (const id of candidates) {
     const chunk = index.chunks.get(id)!;
-    const text = (texts.get(chunk.sceneId) ?? '').slice(chunk.start, chunk.end).toLowerCase();
+    const text = (texts.get(chunk.passageId) ?? '').slice(chunk.start, chunk.end).toLowerCase();
     let score = 0, matchedTerms = 0;
     for (const term of terms) {
       const posting = index.postings.get(term)!;
@@ -176,20 +176,20 @@ export function searchChunks(index: StoryIndex, workspace: Workspace, query: str
     }
     const containsNeedle = text.includes(needle);
     if (containsNeedle) score += 4;
-    hits.push({ sceneId: chunk.sceneId, start: chunk.start, end: chunk.end, score, matchedTerms, containsNeedle });
+    hits.push({ passageId: chunk.passageId, start: chunk.start, end: chunk.end, score, matchedTerms, containsNeedle });
   }
   hits.sort((a, b) => b.score - a.score);
-  const perScene = new Map<string, number>(), result: ChunkHit[] = [];
+  const perPassage = new Map<string, number>(), result: ChunkHit[] = [];
   for (const hit of hits) {
-    const used = perScene.get(hit.sceneId) ?? 0;
-    if (used >= (options.perScene ?? 2)) continue;
-    perScene.set(hit.sceneId, used + 1); result.push(hit);
+    const used = perPassage.get(hit.passageId) ?? 0;
+    if (used >= (options.perPassage ?? 2)) continue;
+    perPassage.set(hit.passageId, used + 1); result.push(hit);
     if (result.length >= options.limit) break;
   }
   return result;
 }
 
-/** A short raw excerpt around an entity's last mention in a scene. */
+/** A short raw excerpt around an entity's last mention in a passage. */
 export function mentionExcerpt(text: string, mention: Mention, radius = 150): { start: number; end: number; text: string } {
   const start = Math.max(0, mention.last - radius), end = Math.min(text.length, mention.last + radius);
   return { start, end, text: text.slice(start, end) };

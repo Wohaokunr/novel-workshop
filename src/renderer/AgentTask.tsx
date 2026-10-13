@@ -4,6 +4,8 @@ import type { AgentRun, Change, Workspace } from '../shared/types';
 import { ROLE_LABELS, type AgentDecision, type AgentMemory, type AgentRole, type AgentRuntimeSummary, type AgentSession } from '../shared/agent-types';
 import { diffStats, diffText } from '../shared/text-diff';
 import { Callout, StatusPill, canResumeRun, fire, isAgentRun, isRunActive, runStatus, showValue } from './ui';
+import { passageLabel } from '../shared/structure';
+import { aspectLabel } from '../shared/story-state';
 import Markdown from './Markdown';
 
 export interface AgentTaskActions {
@@ -19,16 +21,19 @@ const reviewNames: Record<'reader' | 'continuity' | 'style', string> = { reader:
 const nodeStatuses = { pending: '尚未开始', running: '进行中', completed: '已完成', failed: '失败' };
 const candidateStatuses = { draft: '草案', awaitingApproval: '等待作者审批', applied: '已批准并写入', rejected: '已拒绝', stale: '版本已过期' };
 const collectionNames: Record<string, string> = {
-  novel: '作品信息', metadata: '作品元数据', style: '文风档案', objects: '人物与设定', chapters: '章节', scenes: '场景', facts: '世界事实', knowledge: '人物认知',
-  characterStates: '人物演进', cards: '画布卡片', canvasLinks: '素材关联', layouts: '画布位置', reading: '阅读偏好', objectTypes: '对象类型',
+  novel: '作品信息', metadata: '作品元数据', style: '文风档案', objects: '人物与设定', acts: '卷', chapters: '章节', scenes: '场景', passages: '场景段', facts: '世界事实', knowledge: '人物认知',
+  stateChanges: '状态变化', characterStates: '人物演进', cards: '画布卡片', canvasLinks: '素材关联', layouts: '画布位置', reading: '阅读偏好', objectTypes: '对象类型',
 };
 const fieldNames: Record<string, string> = {
   title: '标题', name: '名称', text: '正文', outline: '大纲', content: '内容', brief: '创作简述', genre: '题材',
   audience: '目标读者', theme: '立意', fields: '设定字段', event: '世界事件', perspective: '人物视角', psychology: '心理变化',
   motivation: '人物动机', evidence: '变化依据', value: '事实内容', key: '事实名称', order: '顺序', chapterId: '所属章节',
   povId: '视角人物', eventIds: '关联事件', sceneIds: '关联场景', participants: '参与人物', causes: '前置原因',
+  sceneId: '所属场景', passageId: '场景段', subjectId: '人物或环境', eventId: '关联事件', castIds: '出场人物', settingIds: '场景环境', note: '说明', beat: '这一段写什么',
 };
-const proseFields = new Set(['text', 'outline', 'content', 'brief', 'theme', 'perspective', 'psychology', 'motivation', 'evidence', 'value']);
+const proseFields = new Set(['text', 'outline', 'content', 'brief', 'theme', 'perspective', 'psychology', 'motivation', 'evidence', 'value', 'note', 'beat']);
+/** A state change's aspects show as fields of their own, e.g. 「状态·心理」. */
+const ASPECT_FIELD = '状态·';
 
 export function AgentRunControls({ run, actions, busy = false, otherActive = false, compact = false }: {
   run: AgentRun; actions: Pick<AgentTaskActions, 'onPause' | 'onResume' | 'onCancel'>; busy?: boolean; otherActive?: boolean; compact?: boolean;
@@ -42,18 +47,25 @@ export function AgentRunControls({ run, actions, busy = false, otherActive = fal
   </div>;
 }
 
-function changeTitle(change: Change): string {
+function changeTitle(change: Change, resolve: (value: unknown) => unknown): string {
   const item = change.after ?? change.before;
   const record = item && typeof item === 'object' ? item as Record<string, unknown> : undefined;
-  const title = record?.title ?? record?.name ?? record?.key;
+  // A passage is named by its scene, a state change by who or what changes.
+  const title = change.collection === 'passages' ? resolve(record?.id) !== record?.id ? resolve(record?.id) : resolve(record?.sceneId)
+    : change.collection === 'stateChanges' ? resolve(record?.subjectId) : record?.title ?? record?.name ?? record?.key;
   return `${collectionNames[change.collection] || change.collection}${typeof title === 'string' ? `「${title}」` : ''}`;
 }
 
 function changeFields(change: Change): Array<{ key: string; before: unknown; after: unknown }> {
   const isRecord = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
   if (isRecord(change.before) || isRecord(change.after)) {
-    const before = isRecord(change.before) ? change.before : {};
-    const after = isRecord(change.after) ? change.after : {};
+    const spread = (value: Record<string, unknown>) => {
+      if (change.collection !== 'stateChanges' || !isRecord(value.aspects)) return value;
+      const { aspects, ...rest } = value;
+      return { ...rest, ...Object.fromEntries(Object.entries(aspects).map(([key, text]) => [`${ASPECT_FIELD}${aspectLabel(key)}`, text])) };
+    };
+    const before = isRecord(change.before) ? spread(change.before) : {};
+    const after = isRecord(change.after) ? spread(change.after) : {};
     return [...new Set([...Object.keys(before), ...Object.keys(after)])]
       .filter(key => key !== 'id' && JSON.stringify(before[key]) !== JSON.stringify(after[key]))
       .map(key => ({ key, before: before[key], after: after[key] }));
@@ -67,6 +79,8 @@ function nameResolver(workspace?: Workspace) {
   for (const item of workspace.objects) names.set(item.id, item.name);
   for (const item of workspace.scenes) names.set(item.id, item.title);
   for (const item of workspace.chapters) names.set(item.id, item.title);
+  for (const item of workspace.acts ?? []) names.set(item.id, item.title);
+  for (const item of workspace.passages) names.set(item.id, passageLabel(workspace, item));
   const resolve = (value: unknown): unknown => typeof value === 'string' ? names.get(value) ?? value : Array.isArray(value) ? value.map(resolve) : value;
   return resolve;
 }
@@ -79,7 +93,7 @@ function plain(value: unknown, after: boolean): string {
 }
 
 function FieldDiff({ name, before, after, resolve }: { name: string; before: unknown; after: unknown; resolve: (value: unknown) => unknown }) {
-  const prose = proseFields.has(name) && (typeof before === 'string' || before === undefined) && typeof after === 'string';
+  const prose = (proseFields.has(name) || name.startsWith(ASPECT_FIELD)) && (typeof before === 'string' || before === undefined) && typeof after === 'string';
   const label = fieldNames[name] || name;
   if (prose) {
     const parts = diffText(typeof before === 'string' ? before : '', after as string), stats = diffStats(parts);
@@ -102,11 +116,13 @@ export function candidateSummary(changes: Change[]): { text: string; prose: bool
   const count = (collection: string, test: (change: Change) => boolean = () => true) => changes.filter(change => change.collection === collection && test(change)).length;
   const added = (change: Change) => change.before === undefined && change.after !== undefined;
   const typeOf = (change: Change) => (change.after as { typeId?: string; event?: unknown } | undefined);
-  const prose = changes.some(change => change.collection === 'scenes' && ((change.before as { text?: string } | undefined)?.text ?? '') !== ((change.after as { text?: string } | undefined)?.text ?? ''));
+  const prose = changes.some(change => change.collection === 'passages' && ((change.before as { text?: string } | undefined)?.text ?? '') !== ((change.after as { text?: string } | undefined)?.text ?? ''));
+  const newScenes = new Set(changes.filter(change => change.collection === 'scenes' && added(change)).map(change => change.key));
   const parts = [
     [count('metadata'), '项作品信息'], [count('style'), '项文风设定'], [count('objects', change => added(change) && typeOf(change)?.typeId === 'character'), '个新人物'],
-    [count('objects', change => added(change) && !!typeOf(change)?.event), '个新事件'], [count('acts', added), '个幕/卷'], [count('chapters', added), '个新章节'],
-    [count('scenes', added), '个新场景'], [count('cards', added), '张画布卡片'], [count('canvasLinks', added), '条画布连线'],
+    [count('objects', change => added(change) && !!typeOf(change)?.event), '个新事件'], [count('acts', added), '个卷'], [count('chapters', added), '个新章节'],
+    [count('scenes', added), '个新场景'], [count('passages', change => added(change) && !newScenes.has((change.after as { sceneId?: string }).sceneId ?? '')), '个跨章延续的场景段'],
+    [count('stateChanges'), '条状态变化'], [count('cards', added), '张画布卡片'], [count('canvasLinks', added), '条画布连线'],
   ].filter(([value]) => value).map(([value, label]) => `${value} ${label}`);
   return { text: parts.join('、'), prose };
 }
@@ -144,7 +160,7 @@ export function CandidateReview({ candidate, run, onDecide, busy, workspace, com
       {candidate.changes.map((change, index) => {
         const Icon = change.before === undefined ? FilePlus2 : change.after === undefined ? FileMinus2 : FilePen;
         return <details className="agent-change" key={`${change.collection}:${change.key}:${index}`} open={index === 0 && candidate.changes.length <= 6}>
-          <summary><Icon aria-hidden="true"/><span>{change.before === undefined ? '新增' : change.after === undefined ? '删除' : '修改'}</span>{changeTitle(change)}</summary>
+          <summary><Icon aria-hidden="true"/><span>{change.before === undefined ? '新增' : change.after === undefined ? '删除' : '修改'}</span>{changeTitle(change, resolve)}</summary>
           {changeFields(change).map(field => <FieldDiff key={field.key} name={field.key} before={field.before} after={field.after} resolve={resolve}/>)}
         </details>;
       })}

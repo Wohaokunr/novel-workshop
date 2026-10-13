@@ -3,8 +3,9 @@ import { BookMarked, Check, FlaskConical, Pin, PinOff, Plus, RefreshCw, Sparkles
 import type { OperationBatch, Workspace } from '../../shared/types';
 import { originNames, personNames, scaleNames, STYLE_LIMITS, STYLE_SCALES, styleProfile, type StyleLearningStatus, type StylePerson, type StyleProfile, type StyleScale, type StyleSuggestion } from '../../shared/style-types';
 import { AI_CLICHES, styleBaseline, styleFingerprint, styleLint, type StyleFingerprint } from '../../shared/style-metrics';
-import { authoredScenes } from '../../shared/style-provenance';
-import { Dialog, Field, characters, fire, orderedScenes, uid, type Commit } from '../ui';
+import { authoredPassages } from '../../shared/style-provenance';
+import { passageLabel } from '../../shared/structure';
+import { Dialog, Field, characters, fire, orderedPassages, uid, type Commit } from '../ui';
 import { useCompanion } from '../Companion';
 
 /** Fingerprints over the last part of a long book stay cheap and still describe the current voice. */
@@ -13,9 +14,10 @@ const count = (text: string) => text.replace(/\s/g, '').length;
 
 type Patch = (style: StyleProfile) => Partial<StyleProfile>;
 
-export function Style({ workspace: w, commit, history, sceneId, onOpenScene }: {
-  workspace: Workspace; commit: Commit; history: OperationBatch[]; sceneId?: string; onOpenScene: (id: string) => void;
+export function Style({ workspace: w, commit, history, passageId, onOpenPassage }: {
+  workspace: Workspace; commit: Commit; history: OperationBatch[]; passageId?: string; onOpenPassage: (id: string) => void;
 }) {
+  const passage = w.passages.find(item => item.id === passageId);
   const style = styleProfile(w);
   const companion = useCompanion();
   const update = (patch: Patch, label: string) => commit(current => [{ type: 'updateStyle', patch: patch(styleProfile(current)) }], label);
@@ -23,7 +25,7 @@ export function Style({ workspace: w, commit, history, sceneId, onOpenScene }: {
     const rect = event.currentTarget.getBoundingClientRect();
     const own = style.samples.some(sample => sample.source === 'own');
     companion.summon({ mode: 'style', screen: { x: rect.left, y: rect.bottom }, label: focus === 'distill' ? '提炼文风' : '文风盲测',
-      anchor: { surface: 'style', references: [], focus, ...(focus === 'blindtest' && sceneId ? { sceneId } : {}) },
+      anchor: { surface: 'style', references: [], focus, ...(focus === 'blindtest' && passage ? { sceneId: passage.sceneId, passageId: passage.id } : {}) },
       message: focus === 'blindtest' ? '用几种不同的笔法写同一段，让我挑最像我的。' : own ? '读读我的范文，帮我把文风说清楚。' : '我还没有范文，先问我几个问题，帮我找到自己的文风。' });
   };
   const done = [!!style.summary.trim(), style.samples.some(sample => sample.source === 'own'),
@@ -45,7 +47,7 @@ export function Style({ workspace: w, commit, history, sceneId, onOpenScene }: {
     <div className="style-grid">
       <div className="style-main">
         <Dials style={style} update={update}/>
-        <Samples workspace={w} style={style} update={update} onOpenScene={onOpenScene}/>
+        <Samples workspace={w} style={style} update={update} onOpenPassage={onOpenPassage}/>
         <Fingerprints workspace={w} history={history}/>
       </div>
       <div className="style-side">
@@ -84,7 +86,7 @@ function Dials({ style, update }: { style: StyleProfile; update: Update }) {
   </section>;
 }
 
-function Samples({ workspace: w, style, update, onOpenScene }: { workspace: Workspace; style: StyleProfile; update: Update; onOpenScene: (id: string) => void }) {
+function Samples({ workspace: w, style, update, onOpenPassage }: { workspace: Workspace; style: StyleProfile; update: Update; onOpenPassage: (id: string) => void }) {
   const [adding, setAdding] = useState(false);
   const total = style.samples.reduce((sum, sample) => sum + sample.text.length, 0);
   const sorted = [...style.samples].sort((a, b) => Number(!!b.pinned) - Number(!!a.pinned) || Number(b.source === 'own') - Number(a.source === 'own'));
@@ -105,7 +107,7 @@ function Samples({ workspace: w, style, update, onOpenScene }: { workspace: Work
         </span>
       </header>
       <p className="style-passage">{sample.text}</p>
-      {sample.sceneId && w.scenes.some(scene => scene.id === sample.sceneId) && <button className="link-button" onClick={() => onOpenScene(sample.sceneId!)}>来自「{w.scenes.find(scene => scene.id === sample.sceneId)!.title}」</button>}
+      {(() => { const from = w.passages.find(item => item.id === sample.passageId); return from && <button className="link-button" onClick={() => onOpenPassage(from.id)}>来自「{passageLabel(w, from)}」</button>; })()}
     </article>)}</div>
     {!!style.samples.length && <p className="muted style-quota">{style.samples.length} / {STYLE_LIMITS.samples} 段 · 共 {total.toLocaleString()} / {STYLE_LIMITS.samplesTotal.toLocaleString()} 字</p>}
     {adding && <SampleDialog remaining={STYLE_LIMITS.samplesTotal - total} onClose={() => setAdding(false)}
@@ -148,10 +150,10 @@ const metrics: Array<{ label: string; value: (f: StyleFingerprint) => number; un
 
 function Fingerprints({ workspace: w, history }: { workspace: Workspace; history: OperationBatch[] }) {
   const { columns, fit } = useMemo(() => {
-    const style = styleProfile(w), authored = authoredScenes(w, history), scenes = orderedScenes(w).filter(scene => scene.text.trim());
-    const join = (items: typeof scenes) => items.map(scene => scene.text).join('\n').slice(-SAMPLE_TAIL);
+    const style = styleProfile(w), authored = authoredPassages(w, history), passages = orderedPassages(w).filter(passage => passage.text.trim());
+    const join = (items: typeof passages) => items.map(passage => passage.text).join('\n').slice(-SAMPLE_TAIL);
     const own = style.samples.filter(sample => sample.source === 'own').map(sample => sample.text).join('\n');
-    const mine = join(scenes.filter(scene => authored.has(scene.id))), ai = join(scenes.filter(scene => !authored.has(scene.id)));
+    const mine = join(passages.filter(passage => authored.has(passage.id))), ai = join(passages.filter(passage => !authored.has(passage.id)));
     const columns = [
       { label: '亲笔范文', fingerprint: count(own) >= 100 ? styleFingerprint(own) : null },
       { label: '你写的正文', fingerprint: count(mine) >= 100 ? styleFingerprint(mine) : null },

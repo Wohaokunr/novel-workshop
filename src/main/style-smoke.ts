@@ -99,8 +99,9 @@ export async function runStyleSmoke(window: BrowserWindow, store: NovelStore) {
 
   // 7. Prose candidates get a style review; a rejection reason is kept for learning.
   const chapterId = store.getProject(project.id).chapters[0]!.id;
-  store.execute({ projectId: project.id, actor: 'human', commands: [{ type: 'putScene', value: { id: 'style-scene', chapterId, order: 1, title: '桥头', povId: null, eventIds: [], outline: '林舟在桥头等一辆白色的车', text: '' } }] });
-  const request = { projectId: project.id, stage: 'chapter' as const, objective: '写这一场', sceneId: 'style-scene', chapterId };
+  store.execute({ projectId: project.id, actor: 'human', commands: [{ type: 'putScene', value: { id: 'style-scene', title: '桥头', povId: null, eventIds: [], outline: '林舟在桥头等一辆白色的车' } },
+    { type: 'putPassage', value: { id: 'style-scene', sceneId: 'style-scene', chapterId, order: 1, text: '' } }] });
+  const request = { projectId: project.id, stage: 'chapter' as const, objective: '写这一场', passageId: 'style-scene', chapterId };
   const first = await ui<AgentRun>(`window.novel.startRun(${JSON.stringify(request)})`);
   const pending = await run(first.id);
   assert.equal(pending.status, 'awaitingApproval', pending.error ?? pending.runtime?.pauseReason ?? '');
@@ -114,9 +115,9 @@ export async function runStyleSmoke(window: BrowserWindow, store: NovelStore) {
   const ready = await run(second.id);
   const draft = ready.runtime!.candidates.find(item => item.status === 'awaitingApproval')!;
   await ui(`window.novel.decideCandidate(${JSON.stringify({ runId: second.id, candidateId: draft.id, candidateHash: draft.hash, approve: true })})`);
-  await until(() => store.getProject(project.id).scenes.find(scene => scene.id === 'style-scene')?.text.trim(), '批准后写入正文');
-  const scene = store.getProject(project.id).scenes.find(item => item.id === 'style-scene')!;
-  store.execute({ projectId: project.id, actor: 'human', commands: [{ type: 'putScene', value: { ...scene, text: `${scene.text.slice(0, Math.floor(scene.text.length / 2))}他没动。` } }] });
+  await until(() => store.getProject(project.id).passages.find(passage => passage.id === 'style-scene')?.text.trim(), '批准后写入正文');
+  const passage = store.getProject(project.id).passages.find(item => item.id === 'style-scene')!;
+  store.execute({ projectId: project.id, actor: 'human', commands: [{ type: 'putPassage', value: { ...passage, text: `${passage.text.slice(0, Math.floor(passage.text.length / 2))}他没动。` } }] });
   await click('nav-home'); await click('nav-style');
   await click('style-learn');
   await until(() => ui<number>(`document.querySelectorAll('[data-testid="style-suggestion"]').length`), '学到的偏好');

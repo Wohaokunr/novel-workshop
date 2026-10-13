@@ -1,6 +1,7 @@
 import type { OperationBatch, Workspace } from './types.js';
 import type { StyleEditPair } from './style-types.js';
 import { AI_CLICHES } from './style-metrics.js';
+import { passageLabel } from './structure.js';
 import { diffText } from './text-diff.js';
 
 const HUNK_CHARS = 300;
@@ -28,7 +29,7 @@ export function editHunks(before: string, after: string): Array<{ before: string
 }
 
 /**
- * AI-written scene text the author later edited by hand, from the operation history: zero tokens.
+ * AI-written prose the author later edited by hand, from the operation history: zero tokens.
  * history is newest first, as NovelStore.history returns it.
  */
 export function editPairs(project: Workspace, history: OperationBatch[]): StyleEditPair[] {
@@ -36,30 +37,30 @@ export function editPairs(project: Workspace, history: OperationBatch[]): StyleE
   for (const batch of [...history].reverse()) {
     if (batch.undone) continue;
     for (const change of batch.changes) {
-      if (change.collection !== 'scenes' || textOf(change.before) === textOf(change.after)) continue;
+      if (change.collection !== 'passages' || textOf(change.before) === textOf(change.after)) continue;
       if (change.after === undefined) { drafts.delete(change.key); continue; }
       if (batch.actor === 'ai') drafts.set(change.key, { batchId: batch.id, text: textOf(change.after), at: batch.at, edited: false });
       else { const draft = drafts.get(change.key); if (draft) draft.edited = true; }
     }
   }
   const pairs: StyleEditPair[] = [];
-  for (const [sceneId, draft] of drafts) {
-    const scene = project.scenes.find(item => item.id === sceneId);
-    if (!draft.edited || !scene || !draft.text.trim() || scene.text === draft.text) continue;
-    const hunks = editHunks(draft.text, scene.text);
-    if (hunks.length) pairs.push({ key: `edit:${draft.batchId}:${sceneId}`, sceneId, sceneTitle: scene.title, hunks, at: draft.at });
+  for (const [passageId, draft] of drafts) {
+    const passage = project.passages.find(item => item.id === passageId);
+    if (!draft.edited || !passage || !draft.text.trim() || passage.text === draft.text) continue;
+    const hunks = editHunks(draft.text, passage.text);
+    if (hunks.length) pairs.push({ key: `edit:${draft.batchId}:${passageId}`, passageId, title: passageLabel(project, passage), hunks, at: draft.at });
   }
   return pairs.sort((a, b) => a.at.localeCompare(b.at));
 }
 
-/** Scenes whose current text the author wrote rather than accepted from AI. */
-export function authoredScenes(project: Workspace, history: OperationBatch[]): Set<string> {
+/** Passages whose current text the author wrote rather than accepted from AI. */
+export function authoredPassages(project: Workspace, history: OperationBatch[]): Set<string> {
   const last = new Map<string, 'human' | 'ai'>();
   for (const batch of [...history].reverse()) {
     if (batch.undone) continue;
-    for (const change of batch.changes) if (change.collection === 'scenes' && change.after !== undefined && textOf(change.before) !== textOf(change.after)) last.set(change.key, batch.actor);
+    for (const change of batch.changes) if (change.collection === 'passages' && change.after !== undefined && textOf(change.before) !== textOf(change.after)) last.set(change.key, batch.actor);
   }
-  return new Set(project.scenes.filter(scene => scene.text.trim() && last.get(scene.id) !== 'ai').map(scene => scene.id));
+  return new Set(project.passages.filter(passage => passage.text.trim() && last.get(passage.id) !== 'ai').map(passage => passage.id));
 }
 
 /** Clichés, "X地" adverbs and speech tags the author keeps deleting. */

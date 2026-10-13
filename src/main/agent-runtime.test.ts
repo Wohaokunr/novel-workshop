@@ -20,9 +20,9 @@ import { MAX_EXPERIENCES, MAX_OUTPUT_REPAIRS } from './agent/runtime.js';
 const provider: ProviderSecret = { name: 'fixture', mode: 'mock', baseURL: 'https://example.invalid/v1', model: 'fixture', apiKey: '' };
 const waitingStates = ['awaitingApproval', 'awaitingInput', 'paused', 'failed', 'cancelled', 'completed'];
 const issue = (problem: string) => ({ quote: '', problem, fix: '补一句交代', severity: 'must' });
-/** A patch writer's answer: the whole current scene as the quote, with a line added at its end. */
+/** A patch writer's answer: the whole current passage as the quote, with a line added at its end. */
 function patch(request: ModelRequest, addition: string): ModelResponse {
-  const text = String(restoreProse(request.input).scene.text);
+  const text = String(restoreProse(request.input).passage.text);
   return reply({ edits: [{ quote: text, replacement: `${text}${addition}` }], note: '' });
 }
 function reply(value: unknown): ModelResponse {
@@ -54,9 +54,12 @@ async function approve(store: NovelStore, scheduler: NovelAgentScheduler, run: A
   await scheduler.decide({ runId: run.id, candidateId: candidate.id, candidateHash: candidate.hash, approve: approved, reason: approved ? undefined : '保留作者原稿' });
   return until(store, run.id, value => !!value.finishedAt || value.status === 'paused' || value.status === 'awaitingInput');
 }
+/** Scenes read one after another in the first chapter, each with its one passage (sharing the scene's id). */
 function scenes(store: NovelStore, texts = ['', '']) {
   const initial = store.createProject('范围测试');
-  return store.execute({ projectId: initial.id, actor: 'human', commands: texts.map((text, i) => ({ type: 'putScene', value: { id: `scene-${i}`, chapterId: initial.chapters[0]!.id, order: i, title: `场景${i}`, text, outline: '人物面对当场线索作出选择', povId: null, eventIds: [] } })) });
+  return store.execute({ projectId: initial.id, actor: 'human', commands: texts.flatMap((text, i): Command[] => [
+    { type: 'putScene', value: { id: `scene-${i}`, title: `场景${i}`, outline: '人物面对当场线索作出选择', povId: null, eventIds: [] } },
+    { type: 'putPassage', value: { id: `scene-${i}`, sceneId: `scene-${i}`, chapterId: initial.chapters[0]!.id, order: i, text } }]) });
 }
 
 test('每个角色的请求发给该角色指定的模型，未指定的角色用主模型；修改角色模型后旧任务不会发给新配置', { timeout: 15000 }, async () => {
@@ -86,7 +89,7 @@ for (const stage of ['chapter', 'rewrite'] as const) test(`${stage === 'chapter'
   try {
     const project = scenes(store, stage === 'chapter' ? ['', ''] : ['已有的开头。', '']);
     const h = harness(store);
-    const run = h.start({ projectId: project.id, stage, sceneId: 'scene-0', objective: '写这一场', references: [{ kind: 'scene', id: 'scene-0' }],
+    const run = h.start({ projectId: project.id, stage, passageId: 'scene-0', objective: '写这一场', references: [{ kind: 'scene', id: 'scene-0' }],
       ...(stage === 'rewrite' ? { selection: { start: 6, end: 6 } } : {}) });
     const pending = await wait(store, run);
     assert.equal(pending.status, 'awaitingApproval', pending.error ?? pending.runtime?.pauseReason ?? '');
@@ -96,7 +99,7 @@ for (const stage of ['chapter', 'rewrite'] as const) test(`${stage === 'chapter'
     const done = await until(store, run.id, value => value.status === 'completed' || value.status === 'paused' || value.status === 'failed');
     assert.equal(done.status, 'completed', done.runtime?.pauseReason ?? done.error ?? '');
     assert.ok(!h.requests.some(request => request.agentId === 'coordinator'), '协调模型一次都没有被调用');
-    const text = store.getProject(project.id).scenes[0]!.text;
+    const text = store.getProject(project.id).passages[0]!.text;
     if (stage === 'rewrite') assert.ok(text.startsWith('已有的开头。') && text.length > '已有的开头。'.length, text);
     else assert.ok(text.trim());
   } finally { store.close(); }
@@ -185,28 +188,28 @@ test('单场景正文与短选区改写保持其余原稿，任务撤销保持�
   const store = new NovelStore(':memory:');
   try {
     const project = scenes(store, ['', '人工保留正文']), h = harness(store);
-    const written = await approve(store, h.scheduler, h.start({ projectId: project.id, stage: 'chapter', sceneId: 'scene-0', objective: '只写这个场景' }));
-    assert.equal(written.status, 'completed'); const generated = store.getProject(project.id); assert.equal(generated.scenes[1]!.text, '人工保留正文');
-    const original = generated.scenes[0]!.text, selection = { start: 4, end: 18 };
-    const rewritten = await approve(store, h.scheduler, h.start({ projectId: project.id, stage: 'rewrite', sceneId: 'scene-0', selection, objective: '只改选区' }));
-    assert.equal(rewritten.status, 'completed'); const after = store.getProject(project.id).scenes[0]!.text;
+    const written = await approve(store, h.scheduler, h.start({ projectId: project.id, stage: 'chapter', passageId: 'scene-0', objective: '只写这个场景' }));
+    assert.equal(written.status, 'completed'); const generated = store.getProject(project.id); assert.equal(generated.passages[1]!.text, '人工保留正文');
+    const original = generated.passages[0]!.text, selection = { start: 4, end: 18 };
+    const rewritten = await approve(store, h.scheduler, h.start({ projectId: project.id, stage: 'rewrite', passageId: 'scene-0', selection, objective: '只改选区' }));
+    assert.equal(rewritten.status, 'completed'); const after = store.getProject(project.id).passages[0]!.text;
     assert.ok(after.startsWith(original.slice(0, selection.start))); assert.ok(after.endsWith(original.slice(selection.end)));
-    const current = store.getProject(project.id); store.execute({ projectId: project.id, actor: 'human', commands: [{ type: 'putScene', value: { ...current.scenes[1]!, text: '之后的人工修改' } }] });
-    const restored = store.undo(project.id, rewritten.id); assert.equal(restored.scenes[0]!.text, original); assert.equal(restored.scenes[1]!.text, '之后的人工修改');
+    const current = store.getProject(project.id); store.execute({ projectId: project.id, actor: 'human', commands: [{ type: 'putPassage', value: { ...current.passages[1]!, text: '之后的人工修改' } }] });
+    const restored = store.undo(project.id, rewritten.id); assert.equal(restored.passages[0]!.text, original); assert.equal(restored.passages[1]!.text, '之后的人工修改');
   } finally { store.close(); }
 });
 
 test('作者编辑与目标删除拒绝陈旧候选，不覆盖或扩大范围', { timeout: 10000 }, async () => {
   const store = new NovelStore(':memory:');
   try {
-    const project = scenes(store), h = harness(store), run = h.start({ projectId: project.id, stage: 'chapter', sceneId: 'scene-0', objective: '只写目标' });
+    const project = scenes(store), h = harness(store), run = h.start({ projectId: project.id, stage: 'chapter', passageId: 'scene-0', objective: '只写目标' });
     const pending = await wait(store, run), candidate = pending.runtime!.candidates.at(-1)!;
-    const current = store.getProject(project.id); const edited = store.execute({ projectId: project.id, actor: 'human', commands: [{ type: 'putScene', value: { ...current.scenes[0]!, text: '人工最新正文' } }] });
+    const current = store.getProject(project.id); const edited = store.execute({ projectId: project.id, actor: 'human', commands: [{ type: 'putPassage', value: { ...current.passages[0]!, text: '人工最新正文' } }] });
     const history = store.history(project.id);
     await assert.rejects(h.scheduler.decide({ runId: run.id, candidateId: candidate.id, candidateHash: candidate.hash, approve: true }), /REVISION_CONFLICT/);
     assert.deepEqual(store.getProject(project.id), edited); assert.deepEqual(store.history(project.id), history);
     await h.scheduler.cancel(run.id);
-    assert.throws(() => h.start({ projectId: project.id, stage: 'chapter', sceneId: 'deleted', objective: '不能扩大' }), /删除/);
+    assert.throws(() => h.start({ projectId: project.id, stage: 'chapter', passageId: 'deleted', objective: '不能扩大' }), /删除/);
   } finally { store.close(); }
 });
 
@@ -280,7 +283,7 @@ test('重规划额度耗尽后恢复同一检查点，追加额度并保留累�
       if (planCalls.length === 1) return stream(tool('set_plan', { summary: '无效重规划不消耗额度', nodes: [] }));
       if (plans < 6) return stream(tool('set_plan', { summary: `计划 ${plans + 1}`, nodes: [{
         id: 'analysis', role: 'continuity', objective: '检查已有作品', dependsOn: [], acceptance: '提供分析报告',
-        sceneId: null, chapterId: null, characterId: null, eventId: null,
+        passageId: null, sceneId: null, chapterId: null, characterId: null, eventId: null,
       }] }));
       return demo.stream(input, signal);
     };
@@ -345,14 +348,14 @@ for (const stillRevise of [false, true]) test(`自动审查直接驱动写作者
       if (request.agentId === 'patch') {
         const context = restoreProse(request.input);
         assert.match(JSON.parse((request.input[0] as { content: string }).content).objective, /局部修订/);
-        assert.ok(context.scene.text.trim(), '修订必须读取当前候选正文');
+        assert.ok(context.passage.text.trim(), '修订必须读取当前候选正文');
         assert.ok(context.candidateReviews.some((review: { issues: string[] }) => review.issues.some(text => text.includes('【必须】说明谁在岸上接绳'))));
         revisions++;
         return stream(patch(request, `\n\n第${revisions}次修订：少年站在岸上接住了绳子。`));
       }
       return demo.stream(request, signal);
     });
-    const run = h.start({ projectId: project.id, stage: 'chapter', sceneId: 'scene-0', objective: '生成正文，保留其他场景' });
+    const run = h.start({ projectId: project.id, stage: 'chapter', passageId: 'scene-0', objective: '生成正文，保留其他场景' });
     const pending = await wait(store, run);
     assert.equal(pending.status, 'awaitingApproval', pending.error ?? pending.runtime?.pauseReason ?? '');
     const candidate = pending.runtime!.candidates.at(-1)!;
@@ -366,8 +369,8 @@ for (const stillRevise of [false, true]) test(`自动审查直接驱动写作者
     await h.scheduler.decide({ runId: run.id, candidateId: candidate.id, candidateHash: candidate.hash, approve: true });
     const done = await until(store, run.id, value => value.status === 'completed' || value.status === 'paused' || value.status === 'failed');
     assert.equal(done.status, 'completed', done.runtime?.pauseReason ?? done.error ?? '');
-    assert.match(store.getProject(project.id).scenes[0]!.text, new RegExp(`第${revisions}次修订`));
-    assert.equal(store.getProject(project.id).scenes[1]!.text, '作者保留的正文');
+    assert.match(store.getProject(project.id).passages[0]!.text, new RegExp(`第${revisions}次修订`));
+    assert.equal(store.getProject(project.id).passages[1]!.text, '作者保留的正文');
     assert.equal(store.history(project.id).filter(batch => batch.taskId === run.id).length, 1);
   } finally { store.close(); }
 });
@@ -385,7 +388,7 @@ for (const ending of ['finish_run', 'text'] as const) test(`审查后${ending ==
       }
       return demo.stream(request, signal);
     });
-    const run = h.start({ projectId: project.id, stage: 'chapter', sceneId: 'scene-0', objective: '生成正文' });
+    const run = h.start({ projectId: project.id, stage: 'chapter', passageId: 'scene-0', objective: '生成正文' });
     const pending = await wait(store, run);
     assert.equal(pending.status, 'awaitingApproval', pending.runtime?.pauseReason ?? pending.error ?? '');
     assert.equal(pending.runtime!.budget.revisions, 1, '先自动修订一轮，再交给作者');
@@ -423,11 +426,11 @@ test('自动审查修订变长的选区候选仍只替换选区，作者批准�
       }
       return demo.stream(request, signal);
     });
-    const run = h.start({ projectId: project.id, stage: 'rewrite', sceneId: 'scene-0', selection: { start: 2, end: 6 }, objective: '改写选区' });
+    const run = h.start({ projectId: project.id, stage: 'rewrite', passageId: 'scene-0', selection: { start: 2, end: 6 }, objective: '改写选区' });
     const done = await approve(store, h.scheduler, run);
     assert.equal(done.status, 'completed', done.runtime?.pauseReason ?? done.error ?? '');
-    assert.equal(store.getProject(project.id).scenes[0]!.text, '前缀最终动作后缀');
-    assert.equal(store.getProject(project.id).scenes[1]!.text, '其他场景');
+    assert.equal(store.getProject(project.id).passages[0]!.text, '前缀最终动作后缀');
+    assert.equal(store.getProject(project.id).passages[1]!.text, '其他场景');
   } finally { store.close(); }
 });
 
@@ -436,7 +439,7 @@ test('自动修订中暂停并重开，恢复当前轮次而不重复已生成�
   let store = new NovelStore(filename), rewrites = 0, block = true;
   try {
     const project = scenes(store, ['', '原有正文']);
-    const request: RunRequest = { projectId: project.id, stage: 'chapter', sceneId: 'scene-0', objective: '生成场景正文' };
+    const request: RunRequest = { projectId: project.id, stage: 'chapter', passageId: 'scene-0', objective: '生成场景正文' };
     const intercept = (input: ModelRequest, signal: AbortSignal, demo: DemoAgentTransport) => {
       if (input.agentId === 'continuity' || input.agentId === 'reader') return stream(reply({ verdict: 'revise', issues: [issue('救援站位应更明确')], recommendation: '明确站位' }));
       if (input.agentId === 'patch') {
@@ -546,7 +549,7 @@ function planningCoordinator(results: unknown[], retries = 0) {
   return (request: ModelRequest) => {
     const outputs = request.input.filter(item => item.type === 'function_call_output');
     if (!outputs.length) return stream(tool('set_plan', { summary: '编排', nodes: [{ id: 'n1', role: 'planner', objective: '补一个人物', dependsOn: [], acceptance: '人物候选',
-      sceneId: null, chapterId: null, characterId: null, eventId: null }] }));
+      passageId: null, sceneId: null, chapterId: null, characterId: null, eventId: null }] }));
     const last = JSON.parse(String((outputs.at(-1) as { output: string }).output));
     results.push(last);
     if (last.ok === false && delegated++ < retries) return stream(tool('delegate_tasks', { nodeIds: ['n1'] }));
@@ -554,7 +557,7 @@ function planningCoordinator(results: unknown[], retries = 0) {
     return stream(tool('finish_run', { summary: '已完成。', artifactIds: [] }));
   };
 }
-const rewritesProse = (project: Workspace) => reply({ summary: '改写正文', opsJson: '[]', commandsJson: JSON.stringify([{ type: 'putScene', value: { ...project.scenes[0]!, text: '覆盖作者正文' } }]) });
+const rewritesProse = (project: Workspace) => reply({ summary: '改写正文', opsJson: '[]', commandsJson: JSON.stringify([{ type: 'putPassage', value: { ...project.passages[0]!, text: '覆盖作者正文' } }]) });
 const addsCharacter = reply({ summary: '补人物', commandsJson: '[]', opsJson: JSON.stringify([{ op: 'addCharacter', ref: 'c1', title: '许砚', content: '修钟学徒' }]) });
 const proposedCommands = (store: NovelStore, run: AgentRun) => store.getAgentState(run.id)!.candidates.at(-1)!.commands;
 
@@ -655,20 +658,21 @@ test('依赖节点读到前置结论：角色代入进入写作上下文，后�
     const project = store.execute({ projectId: initial.id, actor: 'human', commands: [
       { type: 'putObject', value: { id: 'hero', typeId: 'character', name: '林舟', fields: { selfKnowledge: '修钟学徒' } } },
       { type: 'putObject', value: { id: 'ev', typeId: 'event', name: '钟声', fields: {}, event: { worldOrder: 1, timeLabel: '', thread: '主线', participants: ['hero'], causes: [], critical: true, observations: { hero: '听见第十三声钟响' } } } },
-      ...[0, 1].map(order => ({ type: 'putScene' as const, value: { id: `s${order}`, chapterId, order, title: `场景${order}`, text: '', outline: '林舟追查钟声', povId: 'hero', eventIds: ['ev'] } })),
+      ...[0, 1].flatMap((order): Command[] => [{ type: 'putScene', value: { id: `s${order}`, title: `场景${order}`, outline: '林舟追查钟声', povId: 'hero', eventIds: ['ev'] } },
+        { type: 'putPassage', value: { id: `s${order}`, sceneId: `s${order}`, chapterId, order, text: '' } }]),
     ] });
     const writers = new Map<string, Record<string, any>>(), order: string[] = [];
     const h = harness(store, (request, signal, demo) => {
       if (request.agentId === 'writer') {
         const { context } = JSON.parse(String((request.input[0] as { content: string }).content));
-        writers.set(context.scene.id, context); order.push(context.scene.id);
-        return stream(reply(context.scene.id === 's0' ? '铜钟响了第十三下，林舟攥紧了扳手。' : '他沿着钟楼的台阶往上走。'));
+        writers.set(context.passage.id, context); order.push(context.passage.id);
+        return stream(reply(context.passage.id === 's0' ? '铜钟响了第十三下，林舟攥紧了扳手。' : '他沿着钟楼的台阶往上走。'));
       }
       if (request.agentId !== 'coordinator') return demo.stream(request, signal);
       const node = (id: string, role: PlanNode['role'], patch: Partial<Record<string, string | string[] | null>>) => ({ id, role, objective: '写本章', acceptance: '完成', dependsOn: [],
-        sceneId: null, chapterId: null, characterId: null, eventId: null, ...patch });
+        passageId: null, sceneId: null, chapterId: null, characterId: null, eventId: null, ...patch });
       return stream(tool('set_plan', { summary: '先代入再写', nodes: [node('p', 'character', { sceneId: 's0', characterId: 'hero', eventId: 'ev' }),
-        node('w1', 'writer', { sceneId: 's1' }), node('w0', 'writer', { sceneId: 's0', dependsOn: ['p'] })] }));
+        node('w1', 'writer', { passageId: 's1' }), node('w0', 'writer', { passageId: 's0', dependsOn: ['p'] })] }));
     });
     const run = h.start({ projectId: project.id, stage: 'chapter', chapterId, objective: '写完本章' });
     const pending = await wait(store, run);
@@ -682,7 +686,7 @@ test('依赖节点读到前置结论：角色代入进入写作上下文，后�
     assert.ok(perspective?.result.conclusion.perspective, '角色代入结论进入写作上下文');
     assert.ok(second.recentText.some((item: { text: string }) => item.text.includes('铜钟响了第十三下')), '后一场读到前一场新写的正文');
     assert.ok(second.upstream.results.some((item: UpstreamResult) => item.nodeId === 'w0' && (item.result as { changesInWorkspace?: boolean }).changesInWorkspace));
-    assert.equal(store.getProject(project.id).scenes.find(scene => scene.id === 's0')!.text, '', '正式作品零写入');
+    assert.equal(store.getProject(project.id).passages.find(passage => passage.id === 's0')!.text, '', '正式作品零写入');
   } finally { store.close(); }
 });
 
@@ -697,7 +701,7 @@ test('部分节点失败后协调者只用文字作答：已完成部分照常�
       }
       if (request.agentId !== 'coordinator') return demo.stream(request, signal);
       coordinator.push(request);
-      const node = (id: string, objective: string) => ({ id, role: 'planner', objective, acceptance: '人物', dependsOn: [], sceneId: null, chapterId: null, characterId: null, eventId: null });
+      const node = (id: string, objective: string) => ({ id, role: 'planner', objective, acceptance: '人物', dependsOn: [], passageId: null, sceneId: null, chapterId: null, characterId: null, eventId: null });
       if (coordinator.length === 1) return stream(tool('set_plan', { summary: '两个人物', nodes: [node('n1', '许砚'), node('n2', '沈照')] }));
       return stream(reply(coordinator.length === 2 ? '沈照没能设计出来，先交许砚。' : '许砚已加入，沈照未完成。'));
     });
@@ -910,7 +914,7 @@ test('重新规划时未改动的已完成节点保留结果，只重做失败�
   const store = new NovelStore(':memory:');
   try {
     const project = scenes(store, ['人工正文']), coordinator: ModelRequest[] = [], planner: string[] = [];
-    const node = (id: string, objective: string) => ({ id, role: 'planner', objective, acceptance: '人物', dependsOn: [], sceneId: null, chapterId: null, characterId: null, eventId: null });
+    const node = (id: string, objective: string) => ({ id, role: 'planner', objective, acceptance: '人物', dependsOn: [], passageId: null, sceneId: null, chapterId: null, characterId: null, eventId: null });
     const h = harness(store, (request, signal, demo) => {
       if (request.agentId === 'planner') {
         const { objective } = JSON.parse(String((request.input[0] as { content: string }).content));
@@ -946,7 +950,7 @@ test('finish_run 可以在节点失败后结束任务，运行时把未完成的
   const store = new NovelStore(':memory:');
   try {
     const project = scenes(store, ['人工正文']);
-    const node = (id: string, role: string, objective: string) => ({ id, role, objective, acceptance: '完成', dependsOn: [], sceneId: null, chapterId: null, characterId: null, eventId: null });
+    const node = (id: string, role: string, objective: string) => ({ id, role, objective, acceptance: '完成', dependsOn: [], passageId: null, sceneId: null, chapterId: null, characterId: null, eventId: null });
     let turn = 0;
     const h = harness(store, (request, signal, demo) => {
       if (request.agentId === 'planner') return stream(rewritesProse(project));
@@ -996,7 +1000,7 @@ test('运行时不重复已失败的步骤：作者中途修改作品使候选�
       if (request.agentId !== 'coordinator') return demo.stream(request, signal);
       coordinator.push(request);
       if (coordinator.length === 1) return stream(tool('set_plan', { summary: '补人物', nodes: [{ id: 'n1', role: 'planner', objective: '补一个人物', acceptance: '人物', dependsOn: [],
-        sceneId: null, chapterId: null, characterId: null, eventId: null }] }));
+        passageId: null, sceneId: null, chapterId: null, characterId: null, eventId: null }] }));
       return stream(reply('作品在任务进行中被修改，候选没有组成，请重新发起。'));
     });
     const run = h.start({ projectId: project.id, stage: 'agent', objective: '补一个人物' });
@@ -1015,8 +1019,10 @@ test('协调者的 search_context 在有语义索引时按意思召回原文；�
     try {
       const initial = store.createProject('语义检索'), chapterId = initial.chapters[0]!.id;
       const project = store.execute({ projectId: initial.id, actor: 'human', commands: [
-        { type: 'putScene', value: { id: 'key', chapterId, order: 0, title: '旧灯塔', povId: null, eventIds: [], outline: '', text: '沈卿在旧灯塔下摸到一枚冰凉的铜钥匙。' } },
-        { type: 'putScene', value: { id: 'tea', chapterId, order: 1, title: '茶馆', povId: null, eventIds: [], outline: '', text: '账房先生在茶馆里拨着算盘。' } }] });
+        { type: 'putScene', value: { id: 'key', title: '旧灯塔', povId: null, eventIds: [], outline: '' } },
+        { type: 'putPassage', value: { id: 'key', sceneId: 'key', chapterId, order: 0, text: '沈卿在旧灯塔下摸到一枚冰凉的铜钥匙。' } },
+        { type: 'putScene', value: { id: 'tea', title: '茶馆', povId: null, eventIds: [], outline: '' } },
+        { type: 'putPassage', value: { id: 'tea', sceneId: 'tea', chapterId, order: 1, text: '账房先生在茶馆里拨着算盘。' } }] });
       const embedder: EmbeddingTransport = { embed: async texts => ({ vectors: texts.map(text => [/钥匙|锁孔/.test(text) ? 1 : 0, 0.05]), tokens: 0 }) };
       await indexVectors(store, project.id, embedder, 'meaning', new AbortController().signal, () => {});
       const request: RunRequest = { projectId: project.id, stage: 'agent', objective: '找到能打开锁孔的东西在哪一场出现' };
@@ -1032,7 +1038,7 @@ test('协调者的 search_context 在有语义索引时按意思召回原文；�
       const run = scheduler.start(request);
       assert.equal((await wait(store, run)).status, 'completed');
       const hits = results[0] as Array<{ source: { kind: string; id: string } }>;
-      const prose = hits.filter(hit => hit.source.kind === 'scene:text').map(hit => hit.source.id);
+      const prose = hits.filter(hit => hit.source.kind === 'passage:text').map(hit => hit.source.id);
       assert.deepEqual(prose, embeddingModel ? ['key'] : []);
     } finally { store.close(); }
   }
@@ -1043,7 +1049,7 @@ test('失败的任务从检查点重试：已完成的节点直接沿用，只�
   try {
     const project = scenes(store, ['人工正文']), planner: string[] = [];
     let coordinatorTurns = 0, broken = true, runId = '';
-    const node = (id: string, objective: string, dependsOn: string[]) => ({ id, role: 'planner', objective, acceptance: '人物', dependsOn, sceneId: null, chapterId: null, characterId: null, eventId: null });
+    const node = (id: string, objective: string, dependsOn: string[]) => ({ id, role: 'planner', objective, acceptance: '人物', dependsOn, passageId: null, sceneId: null, chapterId: null, characterId: null, eventId: null });
     const h = harness(store, (request, signal, demo) => {
       if (request.agentId === 'planner') {
         const { objective } = JSON.parse(String((request.input[0] as { content: string }).content));

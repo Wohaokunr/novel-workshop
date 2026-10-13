@@ -1,20 +1,22 @@
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import type { AgentMemory, AgentRole, EvidenceSource, SearchChunk } from '../../shared/agent-types.js';
-import type { Change, RunRequest, Workspace } from '../../shared/types.js';
+import type { Change, NarrativeScene, Passage, RunRequest, Workspace } from '../../shared/types.js';
 import { diffText } from '../../shared/text-diff.js';
 import { styleProfile } from '../../shared/style-types.js';
+import { chapterPassages, chapterTarget, orderedChapters, orderedPassages, proseChars } from '../../shared/structure.js';
+import { labelledAspects, storyTimeline } from '../../shared/story-state.js';
 import { buildCharacterContext, buildReaderContext, resolveReferences } from '../context.js';
 import { cardContent, DomainValidationError } from '../domain.js';
 import { canReadAuthor, isRole } from './policy.js';
 import type { SemanticHit } from './semantic.js';
-import { searchChunks, sceneMentions } from './story-index.js';
+import { passageMentions, searchChunks } from './story-index.js';
 import { storyOverview, StoryView } from './story-view.js';
 
 export const MAX_CONTEXT_CHARS = 32_000;
 export const MAX_SEARCH_RESULTS = 12;
 export const MAX_SEARCH_CHUNK_CHARS = 1200;
-export interface ContextAnchor { sceneId?: string; chapterId?: string; characterId?: string; eventId?: string }
+export interface ContextAnchor { passageId?: string; chapterId?: string; characterId?: string; eventId?: string }
 
 /** Canonical JSON-compatible data; object key order is immaterial, array order is meaningful.
  * Unsupported values and cycles fail closed rather than producing ambiguous evidence hashes. */
@@ -43,17 +45,17 @@ function canonical(value: unknown, parents = new Set<object>()): string {
 export function fingerprint(value: unknown): string { return createHash('sha256').update(canonical(value), 'utf8').digest('hex'); }
 
 const entities = {
-  objectType: 'objectTypes', object: 'objects', act: 'acts', chapter: 'chapters', scene: 'scenes', fact: 'facts',
-  knowledge: 'knowledge', characterState: 'characterStates', card: 'cards', canvasLink: 'canvasLinks',
+  objectType: 'objectTypes', object: 'objects', act: 'acts', chapter: 'chapters', scene: 'scenes', passage: 'passages', fact: 'facts',
+  knowledge: 'knowledge', stateChange: 'stateChanges', card: 'cards', canvasLink: 'canvasLinks',
 } as const;
 function novel(workspace: Workspace) {
   return { title: workspace.title, brief: workspace.brief, genre: workspace.genre, audience: workspace.audience, theme: workspace.theme ?? '',
     logline: workspace.logline ?? '', structureTemplate: workspace.structureTemplate ?? '' };
 }
 function semanticProject(workspace: Workspace) {
-  return { ...novel(workspace), objectTypes: workspace.objectTypes, objects: workspace.objects, acts: workspace.acts ?? [], chapters: workspace.chapters,
-    scenes: workspace.scenes, facts: workspace.facts, knowledge: workspace.knowledge, characterStates: workspace.characterStates ?? [],
-    cards: workspace.cards.map(cardContent), canvasLinks: workspace.canvasLinks, style: styleProfile(workspace) };
+  return { ...novel(workspace), chapterTarget: workspace.chapterTarget ?? null, objectTypes: workspace.objectTypes, objects: workspace.objects, acts: workspace.acts ?? [],
+    chapters: workspace.chapters, scenes: workspace.scenes, passages: workspace.passages, facts: workspace.facts, knowledge: workspace.knowledge,
+    stateChanges: workspace.stateChanges, cards: workspace.cards.map(cardContent), canvasLinks: workspace.canvasLinks, style: styleProfile(workspace) };
 }
 function sourceValue(workspace: Workspace, kind: string, id: string): unknown {
   if (kind === 'project') return id === workspace.id ? semanticProject(workspace) : undefined;
@@ -61,7 +63,8 @@ function sourceValue(workspace: Workspace, kind: string, id: string): unknown {
   if (kind === 'novel:title') return id === workspace.id ? workspace.title : undefined;
   if (kind === 'novel:theme') return id === workspace.id ? workspace.theme ?? '' : undefined;
   if (kind === 'style') return id === workspace.id ? styleProfile(workspace) : undefined;
-  if (kind === 'scene:text' || kind === 'scene:outline') return workspace.scenes.find(item => item.id === id)?.[kind === 'scene:text' ? 'text' : 'outline'];
+  if (kind === 'passage:text') return workspace.passages.find(item => item.id === id)?.text;
+  if (kind === 'scene:outline') return workspace.scenes.find(item => item.id === id)?.outline;
   if (kind === 'knowledge:content') return workspace.knowledge.find(item => item.id === id)?.content;
   if (kind === 'chapter:title') return workspace.chapters.find(item => item.id === id)?.title;
   if (kind === 'object:selfKnowledge') {
@@ -76,9 +79,12 @@ function sourceValue(workspace: Workspace, kind: string, id: string): unknown {
     const event = workspace.objects.find(item => item.id === id && item.typeId === 'event');
     return event?.event ? { id: event.id, name: event.name, worldOrder: event.event.worldOrder } : undefined;
   }
-  if (kind === 'characterState:character') {
-    const state = workspace.characterStates?.find(item => item.id === id);
-    return state ? { ...state, evidence: '', sceneIds: [] } : undefined;
+  if (kind === 'stateChange:character') {
+    // The change as the character lives it: the author's note explains it and is left out.
+    const change = workspace.stateChanges.find(item => item.id === id);
+    if (!change) return undefined;
+    const { note: _note, ...rest } = change;
+    return rest;
   }
   if (Object.hasOwn(entities, kind)) {
     const collection = entities[kind as keyof typeof entities];
@@ -99,7 +105,7 @@ export function sourcesForWorkspace(workspace: Workspace): EvidenceSource[] {
 }
 const bookSourceCache = new WeakMap<Workspace, EvidenceSource[]>();
 /** Whole-book provenance in two fingerprints (the semantic project and the novel fields): any edit to the book invalidates it.
- * Memoized per snapshot object, since hashing the project reads every scene. */
+ * Memoized per snapshot object, since hashing the project reads all the prose. */
 export function bookSources(workspace: Workspace): EvidenceSource[] {
   let sources = bookSourceCache.get(workspace);
   if (!sources) bookSourceCache.set(workspace, sources = [sourceFor(workspace, 'project', workspace.id)!, sourceFor(workspace, 'novel', workspace.id)!]);
@@ -136,9 +142,10 @@ export function sourcesForLabels(workspace: Workspace, labels: string[], role: A
   };
   if (canReadAuthor(role)) { add('novel:theme', 'novel:theme', workspace.id); add(`project:${workspace.id}@${workspace.revision}`, 'project', workspace.id); }
   add('style', 'style', workspace.id);
-  for (const scene of workspace.scenes) {
-    if (canReadAuthor(role)) { add(`scene:${scene.id}`, 'scene', scene.id); add(`scene:${scene.id}:outline`, 'scene:outline', scene.id); }
-    if (role !== 'character') add(`scene:${scene.id}:text`, 'scene:text', scene.id);
+  if (canReadAuthor(role)) for (const scene of workspace.scenes) { add(`scene:${scene.id}`, 'scene', scene.id); add(`scene:${scene.id}:outline`, 'scene:outline', scene.id); }
+  for (const passage of workspace.passages) {
+    if (canReadAuthor(role)) add(`passage:${passage.id}`, 'passage', passage.id);
+    if (role !== 'character') add(`passage:${passage.id}:text`, 'passage:text', passage.id);
   }
   for (const object of workspace.objects) {
     if (canReadAuthor(role)) add(`object:${object.id}`, 'object', object.id);
@@ -148,7 +155,7 @@ export function sourcesForLabels(workspace: Workspace, labels: string[], role: A
     }
   }
   if (role !== 'reader') for (const item of workspace.knowledge) add(`knowledge:${item.id}`, 'knowledge', item.id);
-  if (role !== 'reader') for (const state of workspace.characterStates ?? []) add(`characterState:${state.id}`, role === 'character' ? 'characterState:character' : 'characterState', state.id);
+  if (role !== 'reader') for (const change of workspace.stateChanges) add(`stateChange:${change.id}`, role === 'character' ? 'stateChange:character' : 'stateChange', change.id);
   if (canReadAuthor(role)) {
     for (const fact of workspace.facts) add(`fact:${fact.id}`, 'fact', fact.id);
     for (const card of workspace.cards) add(`card:${card.id}`, 'card', card.id);
@@ -158,13 +165,13 @@ export function sourcesForLabels(workspace: Workspace, labels: string[], role: A
 
 interface SearchDocument { source: EvidenceSource; title: string; text: string }
 export interface SearchFilter { chapterFrom?: string | null; chapterTo?: string | null; entityId?: string | null }
-function readerScenes(workspace: Workspace, anchor: ContextAnchor): Set<string> {
-  const scene = anchor.sceneId ? workspace.scenes.find(item => item.id === anchor.sceneId) : undefined;
-  if (anchor.sceneId && !scene) throw new DomainValidationError('阅读目标场景不存在');
-  const chapterId = anchor.chapterId ?? scene?.chapterId ?? [...workspace.chapters].sort((a, b) => b.order - a.order)[0]?.id;
+function readerPassages(workspace: Workspace, anchor: ContextAnchor): Set<string> {
+  const passage = anchor.passageId ? workspace.passages.find(item => item.id === anchor.passageId) : undefined;
+  if (anchor.passageId && !passage) throw new DomainValidationError('阅读目标场景段不存在');
+  const chapterId = anchor.chapterId ?? passage?.chapterId ?? orderedChapters(workspace).at(-1)?.id;
   if (!chapterId) return new Set();
-  const visible = new Set(buildReaderContext(workspace, chapterId, anchor.sceneId).sources);
-  return new Set(workspace.scenes.filter(item => visible.has(`scene:${item.id}:text`)).map(item => item.id));
+  const visible = new Set(buildReaderContext(workspace, chapterId, anchor.passageId).sources);
+  return new Set(workspace.passages.filter(item => visible.has(`passage:${item.id}:text`)).map(item => item.id));
 }
 function characterDocuments(workspace: Workspace, anchor: ContextAnchor): SearchDocument[] {
   if (!anchor.characterId || !anchor.eventId) throw new DomainValidationError('人物检索需要明确人物和当前事件，不能退回作者上下文');
@@ -173,34 +180,51 @@ function characterDocuments(workspace: Workspace, anchor: ContextAnchor): Search
     text: canonical(sourceValue(workspace, 'object:selfKnowledge', context.characterId)) },
   { source: sourceFor(workspace, `event:observation:${context.characterId}`, context.eventId)!, title: '当场亲见亲闻', text: context.perception },
   ...context.memories.map(memory => ({ source: sourceFor(workspace, 'knowledge:content', memory.id)!, title: `${context.name}的已获知记忆`, text: memory.content }))];
-  if (context.state) result.push({ source: sourceFor(workspace, 'characterState:character', context.state.id)!, title: '此前的理解、心理与动机', text: canonical(context.state) });
+  // The state the plot has left the character in, one document per change it comes from.
+  const held = new Map<string, Record<string, string>>();
+  for (const item of storyTimeline(workspace).stateAt(context.characterId, { eventId: context.eventId }).values()) {
+    held.set(item.change.id, { ...held.get(item.change.id), [item.label]: item.value });
+  }
+  for (const [id, state] of held) result.push({ source: sourceFor(workspace, 'stateChange:character', id)!, title: '此前的心理、视角与认知', text: canonical(state) });
   return result;
 }
-/** Author records except scene prose, which the story index serves chunk-wise. A scene filter keeps only those scenes' outlines. */
-function authorDocuments(workspace: Workspace, scenes?: Set<string>): SearchDocument[] {
-  const result: SearchDocument[] = scenes ? [] : [{ source: sourceFor(workspace, 'novel', workspace.id)!, title: workspace.title, text: canonical(novel(workspace)) }];
+/** Author records except prose, which the story index serves chunk-wise. A passage filter keeps only the outlines of their scenes. */
+function authorDocuments(workspace: Workspace, passages?: Set<string>): SearchDocument[] {
+  const result: SearchDocument[] = passages ? [] : [{ source: sourceFor(workspace, 'novel', workspace.id)!, title: workspace.title, text: canonical(novel(workspace)) }];
+  const scenes = passages && new Set(workspace.passages.filter(passage => passages.has(passage.id)).map(passage => passage.sceneId));
   for (const [kind, collection] of Object.entries(entities)) for (const item of workspace[collection] ?? []) {
     if (kind === 'scene') {
-      const scene = item as Workspace['scenes'][number];
+      const scene = item as NarrativeScene;
       if (!scenes || scenes.has(scene.id)) result.push({ source: sourceFor(workspace, 'scene:outline', scene.id)!, title: scene.title, text: scene.outline });
-    } else if (!scenes) {
+    } else if (kind === 'stateChange') {
+      const change = item as Workspace['stateChanges'][number];
+      if (!scenes || (change.sceneId && scenes.has(change.sceneId))) result.push({ source: sourceFor(workspace, kind, change.id)!,
+        title: `${workspace.objects.find(object => object.id === change.subjectId)?.name ?? ''}的变化`, text: canonical({ ...labelledAspects(change.aspects), ...(change.note ? { note: change.note } : {}) }) });
+    } else if (!scenes && kind !== 'passage') {
       const fields = item as unknown as { name?: string; title?: string; key?: string; content?: string };
       result.push({ source: sourceFor(workspace, kind, item.id)!, title: fields.name ?? fields.title ?? fields.key ?? kind, text: canonical(sourceValue(workspace, kind, item.id)) });
     }
   }
   return result;
 }
-export function filteredScenes(workspace: Workspace, filter: SearchFilter): Set<string> | undefined {
+/** Passages in a chapter range, and when an entity is given, those that mention it or whose scene puts it on stage or changes it. */
+export function filteredPassages(workspace: Workspace, filter: SearchFilter): Set<string> | undefined {
   if (!filter.chapterFrom && !filter.chapterTo && !filter.entityId) return undefined;
-  const chapters = [...workspace.chapters].sort((a, b) => a.order - b.order);
+  const chapters = orderedChapters(workspace);
   const from = filter.chapterFrom ? chapters.findIndex(chapter => chapter.id === filter.chapterFrom) : 0;
   const to = filter.chapterTo ? chapters.findIndex(chapter => chapter.id === filter.chapterTo) : chapters.length - 1;
   if (from < 0 || to < 0) throw new DomainValidationError('检索章节范围不存在');
-  if (filter.entityId && !workspace.objects.some(object => object.id === filter.entityId)) throw new DomainValidationError('检索对象不存在');
+  const entityId = filter.entityId;
+  if (entityId && !workspace.objects.some(object => object.id === entityId)) throw new DomainValidationError('检索对象不存在');
   const range = new Set(chapters.slice(Math.min(from, to), Math.max(from, to) + 1).map(chapter => chapter.id));
-  const index = new StoryView(workspace).index;
-  return new Set(workspace.scenes.filter(scene => range.has(scene.chapterId) && (!filter.entityId || sceneMentions(index, scene.id).has(filter.entityId)
-    || scene.povId === filter.entityId || scene.eventIds.includes(filter.entityId))).map(scene => scene.id));
+  const index = new StoryView(workspace).index, scenes = new Map(workspace.scenes.map(scene => [scene.id, scene]));
+  const onStage = (passage: Passage) => {
+    const scene = scenes.get(passage.sceneId);
+    return !!scene && (scene.povId === entityId || scene.eventIds.includes(entityId!) || !!scene.castIds?.includes(entityId!) || !!scene.settingIds?.includes(entityId!)
+      || workspace.stateChanges.some(change => change.subjectId === entityId && change.sceneId === scene.id && (!change.passageId || change.passageId === passage.id)));
+  };
+  return new Set(workspace.passages.filter(passage => range.has(passage.chapterId) && (!entityId || passageMentions(index, passage.id).has(entityId) || onStage(passage)))
+    .map(passage => passage.id));
 }
 function queryTerms(query: string): string[] {
   const terms = new Set(query.match(/[\p{L}\p{N}_]+/gu) ?? []);
@@ -213,13 +237,13 @@ function queryTerms(query: string): string[] {
 }
 
 /** Filter the corpus before matching. Query words never grant access to an author or future document.
- * Scene prose comes from the paragraph-chunk index (BM25, at most two chunks per scene); small records are scored directly.
+ * Prose comes from the paragraph-chunk index (BM25, at most two chunks per passage); small records are scored directly.
  * `semantic`: chunks nearest in meaning (optional vector index); they join the prose results and lift keyword hits they overlap. */
 export function searchContext(workspace: Workspace, query: string, limit = 6, role: AgentRole = 'coordinator', anchor: ContextAnchor = {}, filter: SearchFilter = {},
   semantic: SemanticHit[] = []): SearchChunk[] {
   if (!isRole(role)) throw new DomainValidationError('检索角色无效');
-  const scoped = role === 'reader' || role === 'character' ? undefined : filteredScenes(workspace, filter);
-  const allowed = role === 'reader' ? readerScenes(workspace, anchor) : role === 'character' ? new Set<string>() : scoped;
+  const scoped = role === 'reader' || role === 'character' ? undefined : filteredPassages(workspace, filter);
+  const allowed = role === 'reader' ? readerPassages(workspace, anchor) : role === 'character' ? new Set<string>() : scoped;
   const documents = role === 'reader' ? [] : role === 'character' ? characterDocuments(workspace, anchor) : authorDocuments(workspace, scoped);
   if (typeof query !== 'string' || !query.trim()) return [];
   const requested = Number.isFinite(limit) ? Math.max(0, Math.min(MAX_SEARCH_RESULTS, Math.floor(limit))) : 6;
@@ -245,25 +269,26 @@ export function searchContext(workspace: Workspace, query: string, limit = 6, ro
   }
   if (!allowed || allowed.size) {
     const view = new StoryView(workspace), chapterTitles = new Map(workspace.chapters.map(chapter => [chapter.id, chapter.title]));
-    for (const hit of searchChunks(view.index, workspace, needle, { allowed, limit: requested * 3, perScene: 2 })) {
-      const scene = view.scene(hit.sceneId)!;
-      // Scene titles are author material; readers see the chapter heading instead.
-      const title = role === 'reader' ? chapterTitles.get(scene.chapterId) ?? '' : scene.title, lower = title.toLowerCase();
+    // Scene titles are author material; readers see the chapter heading instead.
+    const titleOf = (passage: Passage) => role === 'reader' ? chapterTitles.get(passage.chapterId) ?? '' : view.label(passage.id);
+    for (const hit of searchChunks(view.index, workspace, needle, { allowed, limit: requested * 3, perPassage: 2 })) {
+      const passage = view.passage(hit.passageId)!;
+      const title = titleOf(passage), lower = title.toLowerCase();
       if (strictPhrase && !lower.includes(needle) && !hit.containsNeedle && hit.matchedTerms < 2) continue;
       const score = (lower.includes(needle) ? 20 : 0) + (hit.containsNeedle ? 12 : 0) + terms.filter(term => lower.includes(term)).length * 4 + hit.matchedTerms + hit.score * 2;
       const end = Math.min(hit.end, hit.start + MAX_SEARCH_CHUNK_CHARS);
-      matches.push({ source: { ...sourceFor(workspace, 'scene:text', scene.id)!, start: hit.start, end }, title: title.slice(0, 160),
-        text: scene.text.slice(hit.start, end), score, index: documents.length + view.positionOf(scene.id) });
+      matches.push({ source: { ...sourceFor(workspace, 'passage:text', passage.id)!, start: hit.start, end }, title: title.slice(0, 160),
+        text: passage.text.slice(hit.start, end), score, index: documents.length + view.positionOf(passage.id) });
     }
     for (const hit of semantic) {
-      const scene = view.scene(hit.sceneId);
-      if (!scene || (allowed && !allowed.has(scene.id))) continue;
-      const source = sourceFor(workspace, 'scene:text', scene.id)!;
-      const overlapping = matches.find(match => match.source.kind === source.kind && match.source.id === scene.id && match.source.start! < hit.end && hit.start < match.source.end!);
+      const passage = view.passage(hit.passageId);
+      if (!passage || (allowed && !allowed.has(passage.id))) continue;
+      const source = sourceFor(workspace, 'passage:text', passage.id)!;
+      const overlapping = matches.find(match => match.source.kind === source.kind && match.source.id === passage.id && match.source.start! < hit.end && hit.start < match.source.end!);
       if (overlapping) { overlapping.score += hit.similarity * 10; continue; }
-      const title = role === 'reader' ? chapterTitles.get(scene.chapterId) ?? '' : scene.title, end = Math.min(hit.end, hit.start + MAX_SEARCH_CHUNK_CHARS);
-      matches.push({ source: { ...source, start: hit.start, end }, title: title.slice(0, 160), text: scene.text.slice(hit.start, end), score: hit.similarity * 30,
-        index: documents.length + view.positionOf(scene.id) });
+      const title = titleOf(passage), end = Math.min(hit.end, hit.start + MAX_SEARCH_CHUNK_CHARS);
+      matches.push({ source: { ...source, start: hit.start, end }, title: title.slice(0, 160), text: passage.text.slice(hit.start, end), score: hit.similarity * 30,
+        index: documents.length + view.positionOf(passage.id) });
     }
   }
   return matches.sort((a, b) => b.score - a.score || a.index - b.index).slice(0, requested).map(({ index: _index, ...chunk }) => chunk);
@@ -361,48 +386,63 @@ export function collectContext(workspace: Workspace, request: RunRequest, memori
   const active = refreshMemories(workspace, memories).filter(memory => memory.projectId === workspace.id && memory.status === 'active');
   const take = <T>(items: T[], limit: number) => items.slice(0, limit);
   const authorRules = selectAuthorRules(active);
-  const briefScene = (scene: Workspace['scenes'][number]) => ({ id: scene.id, chapterId: scene.chapterId, title: scene.title,
-    order: scene.order, povId: scene.povId, castIds: scene.castIds ?? [], settingIds: scene.settingIds ?? [], eventIds: scene.eventIds, outline: scene.outline.slice(0, 1000), text: scene.text.slice(0, 1800),
-    omitted: { outlineChars: Math.max(0, scene.outline.length - 1000), textChars: Math.max(0, scene.text.length - 1800) } });
-  const selectedScene = request.sceneId ? workspace.scenes.find(scene => scene.id === request.sceneId) : undefined;
-  const scoped = selectedScene ? [selectedScene] : request.chapterId ? workspace.scenes.filter(scene => scene.chapterId === request.chapterId) : [];
   const view = story ?? new StoryView(workspace);
-  const anchorChapter = selectedScene?.chapterId ?? request.chapterId ?? materials.scenes[0]?.chapterId;
+  const passagesOf = (scene: NarrativeScene) => view.scenePassages(scene.id);
+  const briefPassage = (passage: Passage) => ({ id: passage.id, chapterId: passage.chapterId, order: passage.order, ...(passage.beat ? { beat: passage.beat.slice(0, 300) } : {}), writtenChars: proseChars(passage.text) });
+  const briefScene = (scene: NarrativeScene) => ({ id: scene.id, title: scene.title, povId: scene.povId, castIds: scene.castIds ?? [], settingIds: scene.settingIds ?? [],
+    eventIds: scene.eventIds, outline: scene.outline.slice(0, 1000), passages: passagesOf(scene).map(briefPassage),
+    omitted: { outlineChars: Math.max(0, scene.outline.length - 1000) } });
+  const targetPassage = (passage: Passage) => ({ id: passage.id, sceneId: passage.sceneId, scene: view.label(passage.id), chapterId: passage.chapterId, order: passage.order,
+    beat: passage.beat ?? '', text: passage.text.slice(0, 1800), omitted: { textChars: Math.max(0, passage.text.length - 1800) } });
+  const selected = request.passageId ? workspace.passages.find(passage => passage.id === request.passageId) : undefined;
+  const scoped = selected ? [selected] : request.chapterId ? chapterPassages(workspace, request.chapterId) : [];
+  const firstPassage = (scene: NarrativeScene) => passagesOf(scene)[0];
+  const anchorChapter = selected?.chapterId ?? request.chapterId ?? materials.scenes.map(firstPassage).find(Boolean)?.chapterId;
   const focus = view.focusChapters(anchorChapter, 10);
   const near = new Set(focus.near.map(chapter => chapter.id));
-  const nearScenes = view.order.filter(scene => near.has(scene.chapterId));
+  // Scenes read in the chapters around the target, then scenes not placed in any chapter yet.
+  const placed = new Set(workspace.passages.map(passage => passage.sceneId));
+  const nearScenes = [...new Set(view.order.filter(passage => near.has(passage.chapterId)).map(passage => passage.sceneId))]
+    .flatMap(id => { const scene = view.scene(id); return scene ? [scene] : []; });
+  const unplaced = workspace.scenes.filter(scene => !placed.has(scene.id));
   // Objects tied to the target first, then those the prose mentions most: a long book's cast is not "the first 60 created".
   const counts = view.mentionCounts(), focusIds = new Set<string>();
-  for (const scene of [...scoped, ...materials.scenes]) {
+  const targetScenes = [...new Set(scoped.map(passage => passage.sceneId))].flatMap(id => { const scene = view.scene(id); return scene ? [scene] : []; });
+  for (const scene of [...targetScenes, ...materials.scenes]) {
     if (scene.povId) focusIds.add(scene.povId);
     for (const id of [...scene.eventIds, ...(scene.castIds ?? []), ...(scene.settingIds ?? [])]) focusIds.add(id);
-    for (const id of sceneMentions(view.index, scene.id).keys()) focusIds.add(id);
+    for (const passage of passagesOf(scene)) for (const id of passageMentions(view.index, passage.id).keys()) focusIds.add(id);
   }
   for (const object of materials.objects) focusIds.add(object.id);
   const objects = [...workspace.objects].sort((a, b) => Number(focusIds.has(b.id)) - Number(focusIds.has(a.id)) || (counts.get(b.id) ?? 0) - (counts.get(a.id) ?? 0));
-  const chapterBrief = (chapter: Workspace['chapters'][number]) => ({ ...chapter, ...(chapter.summary ? { summary: chapter.summary.slice(0, 200) } : {}) });
+  const chapterBrief = (chapter: Workspace['chapters'][number]) => ({ ...chapter, ...(chapter.summary ? { summary: chapter.summary.slice(0, 200) } : {}), writtenChars: chapterPassages(workspace, chapter.id).reduce((sum, passage) => sum + proseChars(passage.text), 0) });
+  const catalogScenes = [...nearScenes, ...unplaced];
   return boundedContext({
-    project: { id: workspace.id, revision: workspace.revision, ...novel(workspace) },
-    scope: { stage: request.stage, tool: request.tool, sceneId: request.sceneId, chapterId: request.chapterId, selection: request.selection,
+    project: { id: workspace.id, revision: workspace.revision, ...novel(workspace), chapterTarget: chapterTarget(workspace) },
+    scope: { stage: request.stage, tool: request.tool, passageId: request.passageId, chapterId: request.chapterId, selection: request.selection,
       references: request.references ?? [], referencesAreWriteAuthorization: false,
-      writeRule: request.stage === 'rewrite' ? '只允许目标正文选区；保护前后缀，不附带任何设定修改。' : request.stage === 'chapter' ? '只写目标场景/章节空白场景；保护正式正文，人物状态仅用同范围的合法场景证据。' : '可提出项目领域修改候选；必须经校验/审阅/作者批准，AI 不移动人工布局。' },
+      writeRule: request.stage === 'rewrite' ? '只允许目标场景段的正文选区；保护前后缀，不附带任何设定修改。' : request.stage === 'chapter' ? '只写目标章节/场景段中空白的场景段；保护正式正文；状态变化只能记在目标场景段所属的场景上。' : '可提出项目领域修改候选；必须经校验/审阅/作者批准，AI 不移动人工布局。',
+      structure: '卷（acts）由连续的章组成；章（chapters）是一次连载更新，约 chapterTarget 字；场景（scenes）独立于章，一个场景可以跨越几章；场景段（passages）是一个场景在一章里的正文，正文按章、再按场景段的顺序阅读；状态变化（stateChanges）记录人物与环境在某个场景（段）里的变化。' },
     confirmedAuthorRules: authorRules.rules.map(memory => ({ id: memory.id, kind: memory.kind, content: memory.content, sourceMessageId: memory.sourceMessageId, sources: memory.sources.slice(0, 8) })),
     storyMemory: storyOverview(view, anchorChapter),
-    targetScenes: take(scoped, 12).map(briefScene),
+    targetPassages: take(scoped, 12).map(targetPassage),
+    targetScenes: take(targetScenes, 12).map(briefScene),
     materials: { cards: take(materials.cards, 12).map(card => ({ ...cardContent(card), content: card.content.slice(0, 1200) })),
       objects: take(materials.objects, 12), scenes: take(materials.scenes, 12).map(briefScene) },
     catalog: { objectTypes: take(workspace.objectTypes, 12), objects: take(objects, 60).map(object => ({ id: object.id, typeId: object.typeId, name: object.name, worldOrder: object.event?.worldOrder, mentions: counts.get(object.id) ?? 0 })),
-      chapters: focus.near.map(chapterBrief), chapterSkeleton: focus.skeleton.map(chapter => ({ id: chapter.id, title: chapter.title, order: chapter.order })),
-      scenes: take(nearScenes, 60).map(scene => ({ id: scene.id, chapterId: scene.chapterId, title: scene.title, order: scene.order, povId: scene.povId, castIds: scene.castIds ?? [], settingIds: scene.settingIds ?? [], eventIds: scene.eventIds, writtenChars: scene.text.length })),
+      acts: take(workspace.acts ?? [], 20).map(act => ({ id: act.id, title: act.title, order: act.order, purpose: act.purpose.slice(0, 200) })),
+      chapters: focus.near.map(chapterBrief), chapterSkeleton: focus.skeleton.map(chapter => ({ id: chapter.id, title: chapter.title, order: chapter.order, ...(chapter.actId ? { actId: chapter.actId } : {}) })),
+      scenes: take(catalogScenes, 60).map(scene => ({ id: scene.id, title: scene.title, povId: scene.povId, castIds: scene.castIds ?? [], settingIds: scene.settingIds ?? [], eventIds: scene.eventIds,
+        passages: passagesOf(scene).filter(passage => near.has(passage.chapterId)).map(briefPassage), ...(placed.has(scene.id) ? {} : { unplaced: true }) })),
       cards: take(workspace.cards, 40).map(card => ({ id: card.id, kind: card.kind, refId: card.refId, title: card.title })) },
     advisoryMemories: take(active.filter(memory => memory.kind === 'summary' || memory.kind === 'experience'), 6).map(memory => ({
       id: memory.id, kind: memory.kind, content: memory.content.slice(0, 700), formalTruth: false, notice: '摘要/经验仅是辅助，正式事实以仍有效的原始正文与领域记录为准。' })),
     omitted: { materialCards: Math.max(0, materials.cards.length - 12), materialObjects: Math.max(0, materials.objects.length - 12), materialScenes: Math.max(0, materials.scenes.length - 12),
-      catalogObjects: Math.max(0, workspace.objects.length - 60), catalogScenes: Math.max(0, workspace.scenes.length - Math.min(60, nearScenes.length)),
+      catalogObjects: Math.max(0, workspace.objects.length - 60), catalogScenes: Math.max(0, workspace.scenes.length - Math.min(60, catalogScenes.length)),
       catalogChapters: focus.omitted, authorRules: authorRules.omitted,
-      unselectedSceneBodies: workspace.scenes.filter(scene => !scoped.includes(scene) && !materials.scenes.some(item => item.id === scene.id)).length,
-      notice: '非选定场景正文未载入；目录以目标章节为中心，其余章节只给骨架。逐层放大：read_story_memory 看章节/场景摘要或人物时间线，search_context 检索片段，read_text 读原文窗口。' },
-  }, MAX_CONTEXT_CHARS, ['project', 'scope', 'confirmedAuthorRules', 'targetScenes', 'materials', 'storyMemory']);
+      unselectedPassageBodies: workspace.passages.filter(passage => !scoped.includes(passage)).length,
+      notice: '非选定场景段的正文未载入；目录以目标章节为中心，其余章节只给骨架。逐层放大：read_story_memory 看章节/场景段摘要或人物时间线，search_context 检索片段，read_text 读原文窗口，read_entities 读 stateChanges 等记录。' },
+  }, MAX_CONTEXT_CHARS, ['project', 'scope', 'confirmedAuthorRules', 'targetPassages', 'targetScenes', 'materials', 'storyMemory']);
 }
 
 const DIFF_EXCERPT_CHARS = 1500, FIELD_CHARS = 300;

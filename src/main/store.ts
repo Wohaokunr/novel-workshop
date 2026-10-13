@@ -5,13 +5,16 @@ import type { AgentRun, CanvasCard, Change, Command, CommandRequest, OperationBa
 import type { AgentDecision, AgentMemory, AgentReceipt, AgentSession, AgentState, EvidenceSource, StoredAgentState } from '../shared/agent-types.js';
 import { applyCommands, cardContent, createWorkspace, hasSemanticChanges, NOVEL_FIELDS, validateWorkspace } from './domain.js';
 import { migrateDatabase } from './migrations.js';
+import { upgradeWorkspace } from './upgrade.js';
 import { STYLE_KEYS, styleProfile, type StyleKey } from '../shared/style-types.js';
 import { touchesProse } from './agent/policy.js';
 import type { CompanionThread } from '../shared/companion-types.js';
 import type { StoryDigest } from '../shared/story-types.js';
 
-const collections = ['objectTypes', 'objects', 'acts', 'chapters', 'scenes', 'facts', 'knowledge', 'characterStates', 'cards', 'canvasLinks'] as const;
+const collections = ['objectTypes', 'objects', 'acts', 'chapters', 'scenes', 'passages', 'facts', 'knowledge', 'stateChanges', 'cards', 'canvasLinks'] as const;
 const metadata = NOVEL_FIELDS;
+/** The one numeric project setting; null in history means "the default". */
+const CHAPTER_TARGET = 'chapterTarget';
 type Row = { data: string };
 type ScopedRow = Row & { project_id: string };
 type PreparedCommands = { workspace: Workspace; commands: Command[]; changes: Change[] };
@@ -55,6 +58,7 @@ function diff(before: Workspace, after: Workspace): Change[] {
     if (!isDeepStrictEqual(previous, next)) changes.push({ collection, key, before: structuredClone(previous), after: structuredClone(next) });
   }
   for (const key of metadata) add('metadata', key, before[key] ?? '', after[key] ?? '');
+  add('metadata', CHAPTER_TARGET, before.chapterTarget ?? null, after.chapterTarget ?? null);
   // Per-field so undoing one adoption does not conflict with a later, unrelated style edit.
   const styleBefore = styleProfile(before), styleAfter = styleProfile(after);
   for (const key of STYLE_KEYS) add('style', key, styleBefore[key], styleAfter[key]);
@@ -70,6 +74,7 @@ function diff(before: Workspace, after: Workspace): Change[] {
 
 function changeValue(workspace: Workspace, collection: string, key: string): unknown {
   if (collection === 'metadata' && metadata.includes(key as typeof metadata[number])) return workspace[key as typeof metadata[number]] ?? '';
+  if (collection === 'metadata' && key === CHAPTER_TARGET) return workspace.chapterTarget ?? null;
   if (collection === 'layouts') return workspace.layouts[key];
   if (collection === 'style' && STYLE_KEYS.includes(key as StyleKey)) return styleProfile(workspace)[key as StyleKey];
   if (collections.includes(collection as typeof collections[number])) return (workspace[collection as typeof collections[number]] ?? []).find(item => item.id === key);
@@ -84,6 +89,12 @@ function keepCardLayout(value: CanvasCard, current: CanvasCard): CanvasCard {
 }
 
 function restore(workspace: Workspace, change: Change, preserveCardLayout: boolean): void {
+  if (change.collection === 'metadata' && change.key === CHAPTER_TARGET) {
+    if (change.before === null) delete workspace.chapterTarget;
+    else if (typeof change.before === 'number') workspace.chapterTarget = change.before;
+    else throw new Error('历史每章目标字数无效');
+    return;
+  }
   if (change.collection === 'metadata') {
     if (!metadata.includes(change.key as typeof metadata[number]) || typeof change.before !== 'string') throw new Error('历史项目字段无效');
     workspace[change.key as typeof metadata[number]] = change.before; return;
@@ -107,6 +118,13 @@ function restore(workspace: Workspace, change: Change, preserveCardLayout: boole
     if (preserveCardLayout && change.collection === 'cards' && index >= 0) previous = keepCardLayout(previous as CanvasCard, items[index] as CanvasCard);
     if (index >= 0) items[index] = previous; else items.push(previous);
   }
+}
+
+/** Optional fields older saves may lack, filled with their defaults. */
+function normalized(workspace: Workspace): Workspace {
+  workspace.passages ??= []; workspace.stateChanges ??= [];
+  workspace.theme ??= ''; workspace.logline ??= ''; workspace.structureTemplate ??= ''; workspace.acts ??= [];
+  return workspace;
 }
 
 /** Finished runs whose base snapshots are kept; older ones are deleted by pruneAgentSnapshots. */
@@ -162,9 +180,7 @@ export class NovelStore {
   getProject(id: string): Workspace {
     const row = this.db.prepare('SELECT data FROM projects WHERE id=?').get(id) as Row | undefined;
     if (!row) throw new Error('项目不存在');
-    const workspace = JSON.parse(row.data) as Workspace;
-    workspace.characterStates ??= []; workspace.theme ??= ''; workspace.logline ??= ''; workspace.structureTemplate ??= ''; workspace.acts ??= [];
-    return workspace;
+    return normalized(upgradeWorkspace(JSON.parse(row.data)) as Workspace);
   }
 
   private prepareCommands(before: Workspace, commands: Command[], actor: CommandRequest['actor']): PreparedCommands {
@@ -218,10 +234,13 @@ export class NovelStore {
   deleteImpact(projectId: string, command: Command): string[] {
     if (!command.type.startsWith('delete')) throw new Error('这里只能预览删除操作');
     const before = this.getProject(projectId), next = applyCommands(before, [command]);
-    const labels: Record<string, string> = { objectTypes: '对象类型', objects: '对象', acts: '幕/卷', chapters: '章节', scenes: '叙述场景', facts: '世界事实', knowledge: '角色知识', characterStates: '人物演进状态', cards: '画布卡片', canvasLinks: '画布关联', layouts: '图位置' };
+    const labels: Record<string, string> = { objectTypes: '对象类型', objects: '对象', acts: '卷', chapters: '章节', scenes: '场景', passages: '场景段', facts: '世界事实', knowledge: '角色知识', stateChanges: '状态变化', cards: '画布卡片', canvasLinks: '画布关联', layouts: '图位置' };
     return diff(before, next).map(change => {
-      const item = (change.before ?? change.after) as { name?: string; title?: string; content?: string } | undefined;
-      return `${labels[change.collection] ?? change.collection}「${item?.name ?? item?.title ?? item?.content?.slice(0, 30) ?? change.key}」：${change.after === undefined ? '删除' : '清理关联'}`;
+      const item = (change.before ?? change.after) as { name?: string; title?: string; content?: string; text?: string; sceneId?: string; subjectId?: string } | undefined;
+      const scene = (id?: string) => before.scenes.find(value => value.id === id)?.title;
+      const name = change.collection === 'passages' ? `${scene(item?.sceneId) ?? ''}${item?.text?.trim() ? `（${item.text.replace(/\s/g, '').length} 字）` : ''}`
+        : change.collection === 'stateChanges' ? before.objects.find(object => object.id === item?.subjectId)?.name : undefined;
+      return `${labels[change.collection] ?? change.collection}「${name || (item?.name ?? item?.title ?? item?.content?.slice(0, 30) ?? change.key)}」：${change.after === undefined ? '删除' : '清理关联'}`;
     });
   }
 
@@ -373,7 +392,7 @@ export class NovelStore {
     if (!base) {
       const snapshot = this.db.prepare('SELECT data FROM agent_snapshots WHERE run_id=?').get(runId) as Row | undefined;
       if (!snapshot) throw new Error('这条已结束任务的基础快照已清理，只能查看记录');
-      base = JSON.parse(snapshot.data) as Workspace;
+      base = normalized(upgradeWorkspace(JSON.parse(snapshot.data)) as Workspace);
       this.persistedBases.set(base, runId);
     }
     const candidates = state.candidates.map(candidate => ({ ...candidate,
@@ -571,16 +590,16 @@ export class NovelStore {
       this.requireProject(projectId);
       const statement = this.db.prepare('INSERT INTO story_digests(project_id,kind,target_id,updated_at,data) VALUES(?,?,?,?,?) ON CONFLICT(project_id,kind,target_id) DO UPDATE SET updated_at=excluded.updated_at,data=excluded.data');
       for (const digest of digests) {
-        const target = digest.kind === 'scene' ? digest.sceneId : digest.targetId;
-        if (!['scene', 'chapter', 'volume', 'book'].includes(digest.kind)) throw new Error('故事记忆类别无效');
+        const target = digest.kind === 'passage' ? digest.passageId : digest.targetId;
+        if (!['passage', 'chapter', 'volume', 'book'].includes(digest.kind)) throw new Error('故事记忆类别无效');
         requireId(target, '故事记忆目标');
         statement.run(projectId, digest.kind, target, digest.updatedAt, json(digest));
       }
     });
   }
 
-  /** Remove digests whose scene / chapter / volume no longer exists. */
-  pruneStoryDigests(projectId: string, live: Record<'scene' | 'chapter' | 'volume' | 'book', Set<string>>): void {
+  /** Remove digests whose passage / chapter / volume no longer exists. */
+  pruneStoryDigests(projectId: string, live: Record<'passage' | 'chapter' | 'volume' | 'book', Set<string>>): void {
     this.transaction(() => {
       const rows = this.db.prepare('SELECT kind,target_id FROM story_digests WHERE project_id=?').all(projectId) as Array<{ kind: keyof typeof live; target_id: string }>;
       const remove = this.db.prepare('DELETE FROM story_digests WHERE project_id=? AND kind=? AND target_id=?');
@@ -589,25 +608,25 @@ export class NovelStore {
   }
 
   /** Optional semantic index over paragraph chunks: derived and local like story digests, keyed by chunk start. */
-  getStoryVectors(projectId: string, model: string): Array<{ sceneId: string; start: number; end: number; textHash: string; vector: Float32Array }> {
-    const rows = this.db.prepare('SELECT scene_id,start,end,text_hash,vector FROM story_vectors WHERE project_id=? AND model=?').all(projectId, model) as Array<{ scene_id: string; start: number; end: number; text_hash: string; vector: Uint8Array }>;
+  getStoryVectors(projectId: string, model: string): Array<{ passageId: string; start: number; end: number; textHash: string; vector: Float32Array }> {
+    const rows = this.db.prepare('SELECT passage_id,start,end,text_hash,vector FROM story_vectors WHERE project_id=? AND model=?').all(projectId, model) as Array<{ passage_id: string; start: number; end: number; text_hash: string; vector: Uint8Array }>;
     // Copy into an aligned buffer: SQLite hands back blobs at arbitrary offsets.
-    return rows.map(row => ({ sceneId: row.scene_id, start: row.start, end: row.end, textHash: row.text_hash, vector: new Float32Array(Uint8Array.from(row.vector).buffer) }));
+    return rows.map(row => ({ passageId: row.passage_id, start: row.start, end: row.end, textHash: row.text_hash, vector: new Float32Array(Uint8Array.from(row.vector).buffer) }));
   }
-  putStoryVectors(projectId: string, model: string, rows: Array<{ sceneId: string; start: number; end: number; textHash: string; vector: Float32Array }>): void {
+  putStoryVectors(projectId: string, model: string, rows: Array<{ passageId: string; start: number; end: number; textHash: string; vector: Float32Array }>): void {
     if (!rows.length) return;
     this.transaction(() => {
       this.requireProject(projectId);
-      const statement = this.db.prepare('INSERT INTO story_vectors(project_id,scene_id,start,end,text_hash,model,vector) VALUES(?,?,?,?,?,?,?) ON CONFLICT(project_id,scene_id,start) DO UPDATE SET end=excluded.end,text_hash=excluded.text_hash,model=excluded.model,vector=excluded.vector');
-      for (const row of rows) statement.run(projectId, row.sceneId, row.start, row.end, row.textHash, model, new Uint8Array(row.vector.buffer, row.vector.byteOffset, row.vector.byteLength));
+      const statement = this.db.prepare('INSERT INTO story_vectors(project_id,passage_id,start,end,text_hash,model,vector) VALUES(?,?,?,?,?,?,?) ON CONFLICT(project_id,passage_id,start) DO UPDATE SET end=excluded.end,text_hash=excluded.text_hash,model=excluded.model,vector=excluded.vector');
+      for (const row of rows) statement.run(projectId, row.passageId, row.start, row.end, row.textHash, model, new Uint8Array(row.vector.buffer, row.vector.byteOffset, row.vector.byteLength));
     });
   }
-  /** Keep only the given chunks (`sceneId:start`) of the current model. */
+  /** Keep only the given chunks (`passageId:start`) of the current model. */
   pruneStoryVectors(projectId: string, model: string, live: Set<string>): void {
     this.transaction(() => {
-      const rows = this.db.prepare('SELECT scene_id,start,model FROM story_vectors WHERE project_id=?').all(projectId) as Array<{ scene_id: string; start: number; model: string }>;
-      const remove = this.db.prepare('DELETE FROM story_vectors WHERE project_id=? AND scene_id=? AND start=?');
-      for (const row of rows) if (row.model !== model || !live.has(`${row.scene_id}:${row.start}`)) remove.run(projectId, row.scene_id, row.start);
+      const rows = this.db.prepare('SELECT passage_id,start,model FROM story_vectors WHERE project_id=?').all(projectId) as Array<{ passage_id: string; start: number; model: string }>;
+      const remove = this.db.prepare('DELETE FROM story_vectors WHERE project_id=? AND passage_id=? AND start=?');
+      for (const row of rows) if (row.model !== model || !live.has(`${row.passage_id}:${row.start}`)) remove.run(projectId, row.passage_id, row.start);
     });
   }
 
@@ -701,9 +720,10 @@ export class NovelStore {
     if (!parsed || typeof parsed !== 'object') throw new Error('备份格式无效');
     if ('history' in parsed || 'runs' in parsed) throw new Error('项目备份只包含创作数据，不导入操作历史或运行记录');
     const backup: Backup = 'workspace' in parsed ? parsed : { workspace: parsed };
-    validateWorkspace(backup.workspace);
-    const workspace = structuredClone(backup.workspace); workspace.id = randomUUID();
-    workspace.characterStates ??= []; workspace.theme ??= ''; workspace.logline ??= ''; workspace.structureTemplate ??= ''; workspace.acts ??= [];
+    // Backups made before scenes and chapters were separated are upgraded first.
+    const workspace = normalized(structuredClone(upgradeWorkspace(backup.workspace) as Workspace));
+    validateWorkspace(workspace);
+    workspace.id = randomUUID();
     this.save(workspace); return workspace;
   }
 

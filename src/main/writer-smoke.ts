@@ -6,7 +6,7 @@ import type { BrowserWindow } from 'electron';
 import type { NovelStore } from './store.js';
 
 /** Desktop acceptance for writing from the writer page: one click writes the empty scene, 续写 continues at the cursor, the prose
- * streams in place, and nothing reaches the scene before the author approves. */
+ * streams in place, and nothing reaches the passage before the author approves. */
 export async function runWriterSmoke(window: BrowserWindow, store: NovelStore) {
   const output = process.env.NOVEL_SMOKE_OUTPUT!; mkdirSync(output, { recursive: true });
   const errors: string[] = [];
@@ -37,7 +37,7 @@ export async function runWriterSmoke(window: BrowserWindow, store: NovelStore) {
   const reportPath = join(output, 'writer-result.json');
   if (process.env.NOVEL_SMOKE_REOPEN) {
     const report = JSON.parse(readFileSync(reportPath, 'utf8')) as { projectId: string; text: string };
-    await until(() => store.getProject(report.projectId).scenes[0]?.text === report.text, '重开后正文保留');
+    await until(() => store.getProject(report.projectId).passages[0]?.text === report.text, '重开后正文保留');
     assert.deepEqual(errors, []);
     await closed(); return;
   }
@@ -56,11 +56,11 @@ export async function runWriterSmoke(window: BrowserWindow, store: NovelStore) {
   await click('prepare-chapter');
   const streaming = `(() => { const e=document.querySelector('.live-draft-text'); return !!e && !e.querySelector('.live-draft-wait') && e.textContent.length > 30; })()`;
   await until(() => ui<boolean>(streaming), '生成过程显示在编辑区');
-  assert.equal(store.getProject(project.id).scenes[0]!.text, '', '批准前不写入');
+  assert.equal(store.getProject(project.id).passages[0]!.text, '', '批准前不写入');
   await capture('writer-01-live-draft.png');
   await click('approve-candidate');
   await settled(project.id, 1);
-  const first = await until(() => store.getProject(project.id).scenes[0]!.text || undefined, '批准后写入正文');
+  const first = await until(() => store.getProject(project.id).passages[0]!.text || undefined, '批准后写入正文');
   const writes = store.getRuns(project.id)[0]!;
   assert.ok(writes.steps.filter(step => step.agentId === 'coordinator').every(step => !step.responseIds.length), '单场景写作不向协调模型发请求');
   await until(() => ui<boolean>(`!(${el('live-draft')})`), '预览在结束后消失');
@@ -76,7 +76,7 @@ export async function runWriterSmoke(window: BrowserWindow, store: NovelStore) {
   await ui(`document.documentElement.dataset.theme='light'`);
   await click('approve-candidate');
   await settled(project.id, 2);
-  const text = await until(() => { const value = store.getProject(project.id).scenes[0]!.text; return value.length > first.length ? value : undefined; }, '续写写入');
+  const text = await until(() => { const value = store.getProject(project.id).passages[0]!.text; return value.length > first.length ? value : undefined; }, '续写写入');
   assert.ok(text.startsWith(first), '续写保留原有正文');
   assert.equal(store.getRuns(project.id).find(run => run.id !== writes.id)?.selection?.start, first.length, '从光标处续写');
   await capture('writer-03-done.png');

@@ -1,7 +1,7 @@
 import { useCallback, useContext, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { ArrowDown, ArrowUp, ArrowRight, ArrowLeft, BookOpen, Check, ChevronRight, CircleAlert, Download, FileText, FolderPlus, History, LayoutDashboard, Lightbulb, ListTree, PanelLeftClose, PanelLeftOpen, Plus, Settings2, Sparkles, Trash2, Undo2, Upload, X, Moon, Sun } from 'lucide-react';
-import { ActionCancelled, ActionMenu, Dialog, Toast, SaveFeedbackContext, Field, Select, Empty, MultiPicker, uid, fire, colors, stageNames, statuses, assistTools, taskLabel, taskObjective, canResumeRun, characters, orderedChapters, orderedScenes, sceneFor, events, showValue, isAgentRun, isRunActive, runStatus, type Commit, type TaskDraft } from '../ui';
+import { ActionCancelled, ActionMenu, Dialog, Toast, SaveFeedbackContext, Field, Select, Empty, MultiPicker, uid, fire, colors, stageNames, statuses, assistTools, taskLabel, taskObjective, canResumeRun, characters, orderedChapters, orderedScenes, passageFor, events, showValue, isAgentRun, isRunActive, runStatus, type Commit, type TaskDraft } from '../ui';
 import type { Workspace, Command, ProjectSummary, NovelObject, ObjectType, NarrativeScene, AgentRun, ProviderSettings, ProviderInput, OperationBatch, RunRequest, FieldValue, SourceReference, AssistTool } from '../../shared/types';
 import { canvasAction, type View, type AskAction, type RegisterFlush, type AssistAction, type OpenCanvas, type AskDelete } from '../types';
 import type { StoryMemoryStatus } from '../../shared/story-types';
@@ -44,17 +44,17 @@ function StoryMemoryPanel({workspace,provider,setMode}:{workspace:Workspace|null
   },[projectId,provider?.storyMemory,provider?.mode]);
   const act=(action:(id:string)=>Promise<StoryMemoryStatus>)=>{if(!projectId)return;setError('');fire(action(projectId).then(setStatus).catch(e=>setError(e instanceof Error?e.message:String(e))));};
   const auto=(provider?.storyMemory??'auto')==='auto';
-  const done=status?status.scenesWithText-status.pending:0;
-  return <section className="panel story-memory"><div className="section-heading"><div><h2>故事记忆</h2></div><span className="pill">{!status?'—':status.running?'整理中…':status.pending?`待整理 ${status.pending} 场`:'已是最新'}</span></div>
-    <p className="muted">根据正文为每个场景、章节、分卷和全书整理摘要，并记录尚未回收的伏笔与人物出场位置。写作、读者审阅和创作伙伴用它理解前文，不必每次重读全书。摘要保存在本机，不进入作品备份，也不会改动作品。{provider?.mode==='mock'?'演示模式下摘要是从正文机械摘取的示例。':'整理会调用上面的摘要模型（留空则用主模型）。'}</p>
+  const done=status?status.passagesWithText-status.pending:0;
+  return <section className="panel story-memory"><div className="section-heading"><div><h2>故事记忆</h2></div><span className="pill">{!status?'—':status.running?'整理中…':status.pending?`待整理 ${status.pending} 段`:'已是最新'}</span></div>
+    <p className="muted">根据正文为每个场景段、章节、分卷和全书整理摘要，并记录尚未回收的伏笔与人物出场位置。写作、读者审阅和创作伙伴用它理解前文，不必每次重读全书。摘要保存在本机，不进入作品备份，也不会改动作品。{provider?.mode==='mock'?'演示模式下摘要是从正文机械摘取的示例。':'整理会调用上面的摘要模型（留空则用主模型）。'}</p>
     {!workspace?<p className="muted">打开一部作品后查看整理进度。</p>:status&&<dl className="story-memory-stats">
-      <div><dt>已整理</dt><dd>{done} / {status.scenesWithText} 场</dd></div>
-      <div><dt>待整理</dt><dd>{status.pending?`${status.pending} 场 · 约 ${wan(status.pendingChars)}`:'无'}</dd></div>
+      <div><dt>已整理</dt><dd>{done} / {status.passagesWithText} 段</dd></div>
+      <div><dt>待整理</dt><dd>{status.pending?`${status.pending} 段 · 约 ${wan(status.pendingChars)}`:'无'}</dd></div>
       {status.vectors&&<div><dt>语义索引</dt><dd>{status.vectors.indexed} / {status.vectors.total} 段</dd></div>}
       <div><dt>本次启动用量</dt><dd>{status.usage.provided?`${status.usage.total.toLocaleString()} tokens`:provider?.mode==='mock'?'演示不计费':'尚无'}</dd></div>
     </dl>}
     {status?.awaitingConfirmation&&!status.running&&<p className="story-memory-note" role="status">待整理内容较多（约 {wan(status.pendingChars)}），自动模式不会自行开始。点击「立即整理」后按批次进行，可随时停止，已完成的部分会保留。</p>}
-    {!!status?.drifted&&<p className="muted">{status.drifted} 场正文有小幅修改，暂用旧摘要，稍后自动更新。</p>}
+    {!!status?.drifted&&<p className="muted">{status.drifted} 段正文有小幅修改，暂用旧摘要，稍后自动更新。</p>}
     <div className="button-row"><div className="segmented" role="group" aria-label="故事记忆整理方式"><button className={auto?'active':''} aria-pressed={auto} onClick={()=>fire(setMode('auto'))}>修改后自动整理</button><button className={!auto?'active':''} aria-pressed={!auto} onClick={()=>fire(setMode('manual'))}>仅手动整理</button></div>
       {status?.running?<button onClick={()=>act(id=>window.novel.stopStoryMemory(id))}>停止</button>:<button className="primary" disabled={!workspace||!status} onClick={()=>act(id=>window.novel.runStoryMemory(id))}>立即整理</button>}</div>
     {(error||status?.lastError)&&<p className="field-error" role="alert">{error||status?.lastError}</p>}

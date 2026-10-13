@@ -34,11 +34,11 @@ export function storyGaps(workspace: Workspace): StoryGaps {
     acts: workspace.acts?.length ?? 0,
     scenes: workspace.scenes.length,
     outlinedScenes: workspace.scenes.filter(scene => scene.outline.trim()).length,
-    writtenChars: workspace.scenes.reduce((sum, scene) => sum + chars(scene.text), 0),
+    writtenChars: workspace.passages.reduce((sum, passage) => sum + chars(passage.text), 0),
     notes: notes.length,
     unlinkedNotes: notes.filter(card => !linked.has(card.id)).length,
     sceneElementGaps,
-    sparse: brief < 30 && !characters && !notes.length && !chars(workspace.theme) && !workspace.scenes.some(scene => scene.outline.trim() || scene.text.trim()),
+    sparse: brief < 30 && !characters && !notes.length && !chars(workspace.theme) && !workspace.scenes.some(scene => scene.outline.trim()) && !workspace.passages.some(passage => passage.text.trim()),
   };
 }
 

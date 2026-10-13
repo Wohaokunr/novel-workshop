@@ -1,12 +1,14 @@
 import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { ArrowDown, ArrowRight, ArrowUp, Check, ChevronRight, CornerDownRight, GitBranch, GripHorizontal, Layers, Lightbulb, ListTree, LoaderCircle, MapPin, MessageCircleQuestion, MessagesSquare, PanelRight, PenLine, RefreshCw, Sparkles, Square, StickyNote, Trash2, Undo2, UserPlus, Workflow, X, type LucideIcon } from 'lucide-react';
-import type { Workspace } from '../shared/types';
+import type { Passage, Workspace } from '../shared/types';
 import type { CompanionAnchor, CompanionAskOptions, CompanionIntensity, CompanionMode, CompanionNovelField, CompanionOp, CompanionProposal, CompanionThread, CompanionTurn } from '../shared/companion-types';
 import { companionModeNames, focusNames, ideaKindNames, intensityNames, novelFieldNames } from '../shared/companion-types';
 import { nextStage } from '../shared/story-flow';
 import { companionCommands, selectCompanionItems } from '../shared/companion';
 import { personNames, scaleNames } from '../shared/style-types';
+import { passageLabel } from '../shared/structure';
+import { aspectKey, aspectLabel } from '../shared/story-state';
 import { fire, relativeTime, uid } from './ui';
 import { usePresence } from './interaction';
 import Markdown from './Markdown';
@@ -43,7 +45,7 @@ export function useCompanion(): CompanionApi {
 export function useOptionalCompanion() { return useContext(CompanionContext); }
 
 const surfaceNames = { canvas: '灵感画布', world: '世界因果', story: '叙述顺序', outline: '大纲', writer: '正文写作', panel: '对话', style: '文风' } as const;
-const opNames: Record<CompanionOp['op'], string> = { addAct: '新增幕/卷', updateAct: '调整幕/卷', addChapter: '新增章节', updateChapter: '调整章节', addScene: '新增场景', updateScene: '调整场景', moveScene: '移动场景', addEvent: '新增事件', addCard: '画布便笺',
+const opNames: Record<CompanionOp['op'], string> = { addAct: '新增卷', updateAct: '调整卷', addChapter: '新增章节', updateChapter: '调整章节', addScene: '新增场景', updateScene: '调整场景', moveScene: '移动场景', continueScene: '跨章延续', changeState: '状态变化', addEvent: '新增事件', addCard: '画布便笺',
   updateNovel: '作品信息', addCharacter: '新增人物', updateCharacter: '丰富人物', addSetting: '新增环境', updateSetting: '丰富环境', link: '画布连线', addCause: '补充因果', updateStyle: '文风' };
 const placeholders: Record<CompanionMode, string> = {
   diverge: '说说你在想什么，或者直接让我发散…', causality: '想推演哪一步因果？', structure: '你对现在的节奏哪里不满意？',
@@ -362,11 +364,12 @@ function ProposalCard({ index, workspace, thread, turn, proposal, onAct }: { ind
   const pending = proposal.ops.filter(op => !isAdopted(op));
   const [selected, setSelected] = useState<Set<string>>(() => new Set(pending.map(op => op.id)));
   const tree = useMemo(() => opTree(proposal), [proposal]);
+  const passageName = (id: string) => { const passage = workspace.passages.find(item => item.id === id); return passage && passageLabel(workspace, passage); };
   const nameOf = (id: string | null) => {
     if (!id) return '';
     const card = workspace.cards.find(item => item.id === id);
     return proposal.ops.find(op => op.ref === id)?.title ?? workspace.acts?.find(item => item.id === id)?.title ?? workspace.chapters.find(item => item.id === id || item.title.trim() === id)?.title
-      ?? workspace.scenes.find(item => item.id === id)?.title ?? workspace.objects.find(item => item.id === id)?.name
+      ?? workspace.scenes.find(item => item.id === id)?.title ?? passageName(id) ?? workspace.objects.find(item => item.id === id)?.name
       ?? (card && (card.kind === 'object' ? workspace.objects.find(item => item.id === card.refId)?.name : card.kind === 'scene' ? workspace.scenes.find(item => item.id === card.refId)?.title : card.title)) ?? '（已不存在）';
   };
   const fieldOf = (op: CompanionOp) => (op.field ?? op.purpose ?? '') as CompanionNovelField;
@@ -403,20 +406,29 @@ function ProposalCard({ index, workspace, thread, turn, proposal, onAct }: { ind
       </li>;
     }
     const sceneOp = op.op === 'addScene' || op.op === 'updateScene';
+    const placing = op.op === 'moveScene' || op.op === 'continueScene';
     const parent = op.parentRef ?? op.parentId;
-    const opensChapter = (op.op === 'addScene' || op.op === 'moveScene') && !knownChapter(parent) && (!!parent || (op.op === 'addScene' && !thread.anchor.sceneId));
-    const detail = [op.content, op.purpose && `${op.op === 'addSetting' || op.op === 'updateSetting' ? '规则' : '作用'}：${op.purpose}`, op.povName && `视角：${op.povName}`,
+    // Without a chapter handle a new scene opens where the author is writing; with none placed, adoption opens a chapter for it.
+    const anchorScene = workspace.passages.find(item => item.id === thread.anchor.passageId)?.sceneId ?? thread.anchor.sceneId ?? thread.anchor.references.find(item => item.kind === 'scene')?.id;
+    const opensChapter = (op.op === 'addScene' || placing) && !knownChapter(parent)
+      && (!!parent || (op.op === 'addScene' && !workspace.passages.some(item => item.sceneId === anchorScene)));
+    const detail = op.op === 'changeState'
+      ? [op.content, parent ? `在「${nameOf(parent)}」` : !op.events?.length && '在当前这一场', op.events?.length && `随事件「${names(op.events)}」`, op.purpose && `缘由：${op.purpose}`].filter(Boolean).join(' · ')
+      : [op.content, op.purpose && `${op.op === 'addSetting' || op.op === 'updateSetting' ? '规则' : '作用'}：${op.purpose}`, op.povName && `视角：${op.povName}`,
       sceneOp && op.people.length && `出场：${names(op.people)}`, sceneOp && op.places?.length && `地点：${names(op.places)}`, sceneOp && op.events?.length && `事件：${names(op.events)}`,
       opensChapter && `将新建章节「${parent && /\p{Script=Han}/u.test(parent) ? parent : op.title || nameOf(op.targetId)}」`,
-      op.op === 'moveScene' && !opensChapter && `移到${parent ? `「${nameOf(parent)}」` : '本章'}${op.order === null || op.order > workspace.scenes.length ? '末尾' : `第 ${op.order} 位`}`,
+      op.op === 'moveScene' && !opensChapter && `移到${parent ? `「${nameOf(parent)}」` : '本章'}${op.order === null || op.order > workspace.passages.length ? '末尾' : `第 ${op.order} 位`}`,
+      op.op === 'continueScene' && !opensChapter && `延续到${parent ? `「${nameOf(parent)}」` : '下一章'}`,
       op.op === 'addChapter' && op.targetId && `插在「${nameOf(op.targetId)}」之后`,
-      op.targetId && op.op !== 'moveScene' && op.op !== 'addChapter' && (op.op === 'addEvent' ? `引发「${nameOf(op.targetId)}」` : `「${nameOf(op.targetId)}」`),
-      op.parentId && !op.parentRef && op.op !== 'moveScene' && !opensChapter && `归入「${nameOf(op.parentId)}」`,
+      op.targetId && !placing && op.op !== 'addChapter' && (op.op === 'addEvent' ? `引发「${nameOf(op.targetId)}」` : `「${nameOf(op.targetId)}」`),
+      op.parentId && !op.parentRef && !placing && !opensChapter && `归入「${nameOf(op.parentId)}」`,
       op.causes.length && `起因：${op.causes.map(id => proposal.ops.find(item => item.ref === id)?.title ?? nameOf(id)).join('、')}`].filter(Boolean).join(' · ');
+    // A state change is headed by who changes and in what; a scene carried on by the scene itself.
+    const heading = op.op === 'changeState' ? `${nameOf(op.targetId)} · ${aspectLabel(aspectKey(op.field ?? ''))}` : op.op === 'continueScene' ? nameOf(op.targetId) : op.title || nameOf(op.targetId);
     const skip = proposal.check?.skipped.find(item => item.opId === op.id);
     return <li key={op.id} className={`op-node depth-${Math.min(depth, 3)} ${done ? 'adopted' : ''} ${skip && !done ? 'will-skip' : ''}`}>
       <label><input type="checkbox" disabled={done} checked={done || selected.has(op.id)} onChange={event => toggle(node, event.target.checked)}/>
-        <span className="op-kind">{opNames[op.op]}</span><strong>{op.title || nameOf(op.targetId)}</strong>{done && <Check className="op-done" aria-label="已采纳"/>}</label>
+        <span className="op-kind">{opNames[op.op]}</span><strong>{heading}</strong>{done && <Check className="op-done" aria-label="已采纳"/>}</label>
       {detail && <p>{detail}</p>}
       {skip && !done && <p className="op-skip" role="note">采纳时会跳过：{skip.reason}</p>}
       {!!node.children.length && <ul>{node.children.map(child => renderNode(child, depth + 1))}</ul>}
@@ -465,15 +477,25 @@ function structurePreview(workspace: Workspace, proposal: CompanionProposal, anc
   try {
     const { commands } = companionCommands(workspace, selectCompanionItems({ reply: '', questions: [], ideas: [], proposals: [proposal], followUps: [] }, [proposal.id]),
       { mode: 'structure', anchor, newId: uid });
-    const changed = new Map(commands.flatMap(command => command.type === 'putScene' ? [[command.value.id, command.value]] : []));
+    // Chapters are read as their passages: a scene that goes on from an earlier chapter is marked 「（续）」.
+    const changed = new Map(commands.flatMap(command => command.type === 'putPassage' ? [[command.value.id, command.value]] : []));
+    const named = new Map(commands.flatMap(command => command.type === 'putScene' ? [[command.value.id, command.value.title]] : []));
     const opened = new Map(commands.flatMap(command => command.type === 'putChapter' && !workspace.chapters.some(chapter => chapter.id === command.value.id) ? [[command.value.id, command.value]] : []));
     if (!changed.size && !opened.size) return [];
-    const after = [...workspace.scenes.filter(scene => !changed.has(scene.id)), ...changed.values()];
-    const touched = new Set([...[...changed.values()].map(scene => scene.chapterId), ...opened.keys()]);
-    for (const scene of changed.values()) { const old = workspace.scenes.find(item => item.id === scene.id); if (old) touched.add(old.chapterId); }
-    const titles = (scenes: Workspace['scenes'], chapterId: string) => scenes.filter(scene => scene.chapterId === chapterId).sort((a, b) => a.order - b.order).map(scene => scene.title);
-    return [...workspace.chapters.filter(chapter => !opened.has(chapter.id)), ...opened.values()].sort((a, b) => a.order - b.order).filter(chapter => touched.has(chapter.id))
-      .map(chapter => ({ id: chapter.id, chapter: chapter.title, fresh: opened.has(chapter.id), before: titles(workspace.scenes, chapter.id), after: titles(after, chapter.id) }));
+    const chapters = [...workspace.chapters.filter(chapter => !opened.has(chapter.id)), ...opened.values()].sort((a, b) => a.order - b.order);
+    const rank = new Map(chapters.map((chapter, index) => [chapter.id, index]));
+    const after = [...workspace.passages.filter(passage => !changed.has(passage.id)), ...changed.values()];
+    const touched = new Set([...[...changed.values()].map(passage => passage.chapterId), ...opened.keys()]);
+    for (const passage of changed.values()) { const old = workspace.passages.find(item => item.id === passage.id); if (old) touched.add(old.chapterId); }
+    const titles = (passages: Passage[], chapterId: string, title: (sceneId: string) => string) => {
+      const opens = new Map<string, string>();
+      for (const passage of [...passages].sort((a, b) => (rank.get(a.chapterId) ?? Infinity) - (rank.get(b.chapterId) ?? Infinity) || a.order - b.order)) if (!opens.has(passage.sceneId)) opens.set(passage.sceneId, passage.id);
+      return passages.filter(passage => passage.chapterId === chapterId).sort((a, b) => a.order - b.order)
+        .map(passage => opens.get(passage.sceneId) === passage.id ? title(passage.sceneId) : `${title(passage.sceneId)}（续）`);
+    };
+    const titleOf = (sceneId: string) => workspace.scenes.find(scene => scene.id === sceneId)?.title ?? '场景';
+    return chapters.filter(chapter => touched.has(chapter.id))
+      .map(chapter => ({ id: chapter.id, chapter: chapter.title, fresh: opened.has(chapter.id), before: titles(workspace.passages, chapter.id, titleOf), after: titles(after, chapter.id, sceneId => named.get(sceneId) ?? titleOf(sceneId)) }));
   } catch { return []; }
 }
 

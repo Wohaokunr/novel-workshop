@@ -12,7 +12,8 @@ export interface BenchSecret { label: string; markers: string[] }
 export interface BenchRule { content: string; markers: string[] }
 export interface BenchTask {
   id: string; label: string; role: 'writer' | 'character' | 'reader';
-  objective: string; sceneId?: string; chapterId?: string; characterId?: string; eventId?: string;
+  /** passageId: the prose a writer writes or a reader reads. */
+  objective: string; passageId?: string; chapterId?: string; characterId?: string; eventId?: string;
   secrets: BenchSecret[];
   /** Prose length bounds in characters (writer only). */
   length?: [number, number];
@@ -67,7 +68,7 @@ export const BENCHMARK: BenchCase[] = [
       dials: { ...emptyStyle().dials, person: 'third-limited', sentence: 2, ornament: 2, dialogue: 3, interiority: 2 },
       avoidWords: ['不禁', '缓缓地', '嘴角上扬'],
       rules: [{ id: 'r1', kind: 'avoid', content: '不用“仿佛”“宛如”堆叠比喻', origin: 'author' }, { id: 'r2', kind: 'do', content: '用动作和物件写情绪，不直接说人物的感受', origin: 'author' }],
-      samples: [{ id: 'own-theft', label: '失窃', text: theft, source: 'own', sceneId: 's-theft' }],
+      samples: [{ id: 'own-theft', label: '失窃', text: theft, source: 'own', passageId: 'p-theft' }],
       voices: [{ characterId: 'shen', voice: '说话客气周到，爱用反问把话题岔开' }],
     }, chapterId => [
       character('xu', '许砚', '锁匠铺的少东家，心细，嘴紧。', '我是许家锁匠铺的少东家，三号仓库的锁是我家配的。'),
@@ -80,20 +81,22 @@ export const BENCHMARK: BenchCase[] = [
       { type: 'putKnowledge', value: { id: 'k-shen', characterId: 'shen', content: '自己是巡捕房的线人', learnedAt: null, source: 'initial' } },
       { type: 'putKnowledge', value: { id: 'k-xu-theft', characterId: 'xu', content: '三号仓库的钥匙失踪，门锁没有撬痕，锁孔有新机油味', learnedAt: 'theft', source: 'witness' } },
       { type: 'putKnowledge', value: { id: 'k-xu-question', characterId: 'xu', content: '沈照问过三号仓库的锁是不是许家配的', learnedAt: null, source: 'initial' } },
-      { type: 'putScene', value: { id: 's-theft', chapterId, order: 0, title: '失窃', povId: 'xu', castIds: ['lin'], eventIds: ['theft'], outline: '清晨，许砚在码头发现三号仓库失窃，门锁完好。', text: theft } },
-      { type: 'putScene', value: { id: 's-teahouse', chapterId, order: 1, title: '茶馆', povId: 'xu', castIds: ['shen'], eventIds: ['teahouse'],
-        outline: '午后，许砚约沈照在茶馆见面，试探他是否知道钥匙的下落；沈照岔开话题，反问巡捕房来过没有。许砚没有得到答案，离开时注意到沈照袖口沾着机油。', text: '' } },
+      { type: 'putScene', value: { id: 's-theft', title: '失窃', povId: 'xu', castIds: ['lin'], eventIds: ['theft'], outline: '清晨，许砚在码头发现三号仓库失窃，门锁完好。' } },
+      { type: 'putPassage', value: { id: 'p-theft', sceneId: 's-theft', chapterId, order: 0, text: theft } },
+      { type: 'putScene', value: { id: 's-teahouse', title: '茶馆', povId: 'xu', castIds: ['shen'], eventIds: ['teahouse'],
+        outline: '午后，许砚约沈照在茶馆见面，试探他是否知道钥匙的下落；沈照岔开话题，反问巡捕房来过没有。许砚没有得到答案，离开时注意到沈照袖口沾着机油。' } },
+      { type: 'putPassage', value: { id: 'p-teahouse', sceneId: 's-teahouse', chapterId, order: 1, text: '' } },
     ]),
     rules: [
       { content: '不写鬼神、法术等超自然元素', markers: ['鬼魂', '闹鬼', '法术', '妖怪', '咒语', '显灵', '魂魄'] },
       { content: '林舟在第一卷不能死', markers: ['林舟死', '林舟的尸', '林舟断了气', '林舟没了气息'] },
     ],
     tasks: [
-      { id: 'write-teahouse', label: '写作：茶馆（许砚视角）', role: 'writer', sceneId: 's-teahouse', objective: '按大纲写出这一场正文。', length: [400, 5000],
+      { id: 'write-teahouse', label: '写作：茶馆（许砚视角）', role: 'writer', passageId: 'p-teahouse', objective: '按大纲写出这一场正文。', length: [400, 5000],
         secrets: [{ label: '许砚不知道沈照是巡捕房线人', markers: ['线人', '密报', '告密'] }] },
       { id: 'character-xu', label: '角色代入：许砚在茶馆对质时', role: 'character', characterId: 'xu', eventId: 'teahouse', objective: '面对茶馆里的沈照，你会怎么想、怎么做？',
         secrets: [{ label: '许砚不知道沈照是巡捕房线人', markers: ['线人', '密报', '告密'] }] },
-      { id: 'reader-theft', label: '读者审阅：失窃', role: 'reader', sceneId: 's-theft', objective: '从读者视角审阅可见正文。',
+      { id: 'reader-theft', label: '读者审阅：失窃', role: 'reader', passageId: 'p-theft', objective: '从读者视角审阅可见正文。',
         secrets: [{ label: '读者还不知道沈照是巡捕房线人', markers: ['线人', '密报', '告密'] }],
         contextMustNot: ['袖口沾着机油', '巡捕房的线人', '林舟在第一卷不能死'] },
     ],
@@ -113,12 +116,13 @@ export const BENCHMARK: BenchCase[] = [
       event('visitor', '深夜的西装客人', 1, '某个周五凌晨两点', ['su', 'zhou'], [], { su: '穿西装的客人对老周鞠躬，叫他“少爷”，老周把人请了出去', zhou: '父亲的秘书又来劝我回去' }, '董事长的秘书深夜来店里劝老周回家。'),
       { type: 'putFact', value: { id: 'fact-heir', subjectId: 'zhou', key: '身份', value: '星屑集团董事长的儿子、继承人', fromEventId: null } },
       { type: 'putKnowledge', value: { id: 'k-zhou', characterId: 'zhou', content: '自己是星屑集团董事长的儿子', learnedAt: null, source: 'initial' } },
-      { type: 'putScene', value: { id: 's-night', chapterId, order: 0, title: '少爷', povId: 'su', castIds: ['zhou'], eventIds: ['visitor'],
-        outline: '凌晨两点，苏晚值夜班，一个穿西装的客人进店找老周，叫他“少爷”。老周把人请了出去，回来后若无其事地教苏晚摆关东煮。苏晚满肚子疑问，最后决定先不问。', text: '' } },
+      { type: 'putScene', value: { id: 's-night', title: '少爷', povId: 'su', castIds: ['zhou'], eventIds: ['visitor'],
+        outline: '凌晨两点，苏晚值夜班，一个穿西装的客人进店找老周，叫他“少爷”。老周把人请了出去，回来后若无其事地教苏晚摆关东煮。苏晚满肚子疑问，最后决定先不问。' } },
+      { type: 'putPassage', value: { id: 'p-night', sceneId: 's-night', chapterId, order: 0, text: '' } },
     ]),
     rules: [{ content: '不写恋爱情节', markers: ['心动', '告白', '脸红心跳', '喜欢上他', '喜欢上了'] }],
     tasks: [
-      { id: 'write-night', label: '写作：少爷（苏晚第一人称）', role: 'writer', sceneId: 's-night', objective: '按大纲写出这一场正文。', length: [400, 5000],
+      { id: 'write-night', label: '写作：少爷（苏晚第一人称）', role: 'writer', passageId: 'p-night', objective: '按大纲写出这一场正文。', length: [400, 5000],
         secrets: [{ label: '苏晚不知道老周是集团继承人', markers: ['继承人', '董事长', '集团'] }] },
       { id: 'character-su', label: '角色代入：苏晚看到西装客人时', role: 'character', characterId: 'su', eventId: 'visitor', objective: '看到有人叫老周“少爷”，你怎么想、怎么做？',
         secrets: [{ label: '苏晚不知道老周是集团继承人', markers: ['继承人', '董事长', '集团'] }] },

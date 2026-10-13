@@ -658,7 +658,45 @@ button.empty-brief:hover:not(:disabled) { color: var(--accent-text); background:
 .type-field-row > .field { flex: 1; margin: 0; }
 .type-field-row > select { max-width: 120px; }
 .type-fields { margin: 6px 0 14px; }
-.character-evolution summary { color: var(--text); }
+
+/* 人物与环境的状态：进入一场时的状态、这一场的变化、按故事时间排列的演进 */
+.state-subject { display: flex; flex-direction: column; gap: 6px; padding: 10px 0; border-top: 1px dashed var(--border); }
+.state-subject:first-of-type { border-top: 0; padding-top: 2px; }
+.state-subject > strong { color: var(--text); font-size: 12.5px; font-weight: 600; }
+.state-aspects { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 10px; margin: 0; font-size: 12px; line-height: 1.6; }
+.state-aspects > div { display: contents; }
+.state-aspects dt { color: var(--muted); font-weight: 600; }
+.state-aspects dd { margin: 0; color: var(--text-2); overflow-wrap: anywhere; white-space: pre-wrap; }
+.state-subject .state-empty, .state-now .state-empty { margin: 0; font-size: 12px; }
+.state-change { display: flex; flex-direction: column; gap: 2px; }
+.state-change .field { margin-bottom: 8px; }
+.state-change .button-row { justify-content: flex-end; }
+.state-change-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 8px; color: var(--text); font-size: 12.5px; }
+.state-change-head .link-button { padding: 0; font-size: 12.5px; font-weight: 600; text-align: left; }
+.state-change-head .pill { min-height: 20px; color: var(--accent-text); background: var(--accent-soft); border-color: var(--accent-line); font-size: 11px; }
+.aspect-adder { display: grid; grid-template-columns: minmax(84px, 120px) minmax(0, 1fr) auto; align-items: start; gap: 6px; margin: 4px 0 10px; }
+.aspect-adder input, .aspect-adder textarea { min-height: 32px; font-size: 12.5px; }
+.aspect-adder textarea { min-height: 52px; resize: vertical; }
+.aspect-adder button { min-height: 32px; white-space: nowrap; }
+.new-change { margin-top: 12px; padding: 12px; background: var(--subtle); border: 1px dashed var(--border-strong); border-radius: var(--radius); }
+.new-change .form-grid { margin-bottom: 4px; }
+.new-change .aspect-adder { margin-bottom: 0; }
+.new-change > .muted { margin: 4px 0 0; font-size: 12px; }
+.state-now { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; margin-bottom: 4px; background: var(--accent-soft); border: 1px solid var(--accent-line); border-radius: var(--radius); }
+.state-history { display: flex; flex-direction: column; gap: 0; margin: 0; padding: 0 0 0 14px; list-style: none; border-left: 2px solid var(--border); }
+.state-history > li { position: relative; }
+.state-history > li::before { content: ""; position: absolute; left: -19px; top: 22px; width: 8px; height: 8px; background: var(--surface); border: 2px solid var(--accent); border-radius: 50%; }
+.passage-card { display: flex; flex-direction: column; gap: 6px; }
+.passage-card.current { border-color: var(--accent-line); box-shadow: inset 3px 0 0 var(--accent); }
+.passage-card .field { margin-bottom: 0; }
+.passage-card-head { display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
+.passage-card-head strong { flex: 1; min-width: 0; color: var(--text); font-weight: 600; overflow-wrap: anywhere; }
+.passage-card-head small { color: var(--faint); font-size: 11px; font-variant-numeric: tabular-nums; }
+.passage-card-head small.empty { color: var(--warning); }
+.passage-card-head .link-button { padding: 0; }
+.scene-passages > .button-row { margin-top: 10px; align-items: center; }
+.scene-passages > .button-row .field { margin: 0; }
+.scene-passages > .button-row select { min-height: 30px; font-size: 12px; }
 
 /* ==========================================================================
    Boards (canvas / world / story)
@@ -815,6 +853,35 @@ button.empty-brief:hover:not(:disabled) { color: var(--accent-text); background:
 .add-scene { justify-content: flex-start; width: 100%; min-height: 28px; padding: 0 8px 0 14px; color: var(--faint); background: transparent; border-color: transparent; box-shadow: none; font-size: 12px; font-weight: 400; }
 .add-scene:hover:not(:disabled) { color: var(--accent-text); background: transparent; border-color: transparent; }
 .add-scene svg { width: 13px; height: 13px; }
+/* 卷 → 章 → 场景段：一卷是一段剧情，一章是一次更新（约 3500 字），一场可以跨章 */
+.volume-block { display: flex; flex-direction: column; }
+.volume-block + .volume-block { margin-top: 6px; padding-top: 10px; border-top: 1px solid var(--border); }
+.volume-title { display: flex; align-items: center; gap: 6px; padding: 2px 8px 8px; color: var(--text); font-size: 12px; }
+.volume-title strong { flex: 1; min-width: 0; overflow: hidden; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.volume-title small { flex: none; color: var(--faint); font-size: 11px; font-variant-numeric: tabular-nums; }
+.volume-mark { flex: none; display: inline-grid; place-items: center; width: 18px; height: 18px; color: var(--accent-text); background: var(--accent-soft); border: 1px solid var(--accent-line); border-radius: 4px; font-size: 10.5px; font-weight: 700; }
+.chapter-count.over { color: var(--warning); }
+.chapter-progress { height: 2px; margin: 0 8px 4px; overflow: hidden; background: var(--subtle); border-radius: 2px; }
+.chapter-progress > i { display: block; height: 100%; background: var(--accent-line); border-radius: inherit; transition: width var(--motion-content) var(--ease-out); }
+.chapter-progress.full > i { background: var(--success); }
+.chapter-progress.over > i { background: var(--warning); }
+.scene-row.continued > button { padding-left: 22px; }
+.scene-row.continued > button strong { color: var(--muted); }
+.scene-row.continued.selected > button strong { color: var(--text); }
+.chapter-adds { display: flex; }
+.chapter-adds .add-scene { width: auto; flex: 1; }
+.chapter-adds .add-scene.join-scene { flex: none; padding: 0 8px; }
+.unplaced-scenes { margin-top: 6px; padding-top: 10px; border-top: 1px dashed var(--border-strong); }
+.unplaced-scenes > .eyebrow { margin: 0 8px 4px; }
+.unplaced-scenes .scene-row small { color: var(--accent-text); }
+.join-scene-dialog { display: flex; flex-direction: column; gap: 12px; }
+.join-scene-dialog > .muted { margin: 0; font-size: 12.5px; line-height: 1.7; }
+.join-list { display: flex; flex-direction: column; gap: 2px; max-height: 320px; overflow: auto; padding: 4px; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius); }
+.join-option { justify-content: space-between; gap: 12px; min-height: 34px; padding: 0 10px; color: var(--text-2); background: transparent; border-color: transparent; box-shadow: none; font-weight: 400; text-align: left; }
+.join-option:hover:not(:disabled) { color: var(--text); background: var(--hover); border-color: transparent; }
+.join-option strong { flex: 1; min-width: 0; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.join-option small { flex: none; color: var(--faint); font-size: 11.5px; }
+.join-scene-dialog > .button-row { justify-content: flex-end; }
 .writing-area { display: flex; flex-direction: column; min-width: 0; min-height: 0; padding: 0 32px; overflow: auto; background: var(--surface); }
 .writer-toolbar { position: sticky; top: 0; z-index: 5; display: flex; align-items: center; gap: 12px; flex: none; min-height: 56px; margin: 0 -32px 24px; padding: 8px 16px; background: color-mix(in srgb, var(--surface) 92%, transparent); border-bottom: 1px solid var(--border); backdrop-filter: blur(8px); }
 .writer-title { flex: 1; min-width: 72px; }
@@ -1366,6 +1433,7 @@ button.empty-brief:hover:not(:disabled) { color: var(--accent-text); background:
 .outline-node-head { display: flex; align-items: center; gap: 8px; }
 .outline-node-head .outline-title { flex: 1; min-width: 0; }
 .outline-node-head select { width: auto; max-width: 180px; min-height: 28px; font-size: 12px; }
+.outline-chapter-size { flex: none; color: var(--faint); font-size: 11.5px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .outline-title input { font-weight: 600; font-size: 14px; border-color: transparent; background: transparent; box-shadow: none; padding-inline: 4px; }
 .outline-title input:hover, .outline-title input:focus { border-color: var(--border); background: var(--surface); }
 .outline-act > .outline-node-head .outline-title input { font-size: 16px; }

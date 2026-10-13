@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { AgentMemory, AgentRole, PlanNode, SpecialistRequest, UpstreamResult } from '../shared/agent-types.js';
-import type { AgentStep, CharacterState, Command, NovelObject, RunRequest, Workspace } from '../shared/types.js';
+import type { AgentStep, Command, NarrativeScene, NovelObject, RunRequest, StateChange, Workspace } from '../shared/types.js';
 import { applyCommands, createWorkspace } from './domain.js';
 import { emptyUsage } from './responses.js';
 import { boundedContext, collectContext, fingerprint, MAX_CONTEXT_CHARS, refreshMemories, searchContext, selectAuthorRules, sourceFor, sourceValid, sourcesForWorkspace } from './agent/memory.js';
@@ -10,6 +10,11 @@ import { toolDefinitions } from './agent/tools.js';
 import { applyEdits, reviewOutcome, reviewSchema, specialistDefinition } from './agent/specialists.js';
 import { keepCompleted } from './agent/runtime.js';
 
+/** A scene read in one chapter: the scene and its one passage, sharing the id. */
+function scene(id: string, chapterId: string, order: number, patch: Partial<NarrativeScene> & { text?: string } = {}): Command[] {
+  const { text = '', ...rest } = patch;
+  return [{ type: 'putScene', value: { id, title: id, povId: null, eventIds: [], outline: '', ...rest } }, { type: 'putPassage', value: { id, sceneId: id, chapterId, order, text } }];
+}
 function fixture(id = 'project-a'): Workspace {
   const original = createWorkspace('雾港小说', id);
   const character: NovelObject = { id: 'person', typeId: 'character', name: '林舟', fields: {
@@ -17,7 +22,8 @@ function fixture(id = 'project-a'): Workspace {
   } };
   const event = (id: string, worldOrder: number): NovelObject => ({ id, typeId: 'event', name: `作者事件${id}`, fields: { description: '隐藏计划不能进入角色' },
     event: { worldOrder, timeLabel: '', thread: '主线', participants: ['person'], causes: [], critical: true, observations: { person: id === 'now' ? '听见钟声，看见钥匙。' : `${id}的亲见线索` } } });
-  const state: CharacterState = { id: 'prior-state', characterId: 'person', eventId: 'past', perspective: '仍不确定信使的来意', psychology: '谨慎', motivation: '先修钟', evidence: '作者秘密：真正的幕后凶手', sceneIds: ['old'] };
+  const state: StateChange = { id: 'prior-state', subjectId: 'person', sceneId: 'old', eventId: 'past',
+    aspects: { perspective: '仍不确定信使的来意', psychology: '谨慎', motivation: '先修钟' }, note: '作者秘密：真正的幕后凶手' };
   return applyCommands(original, [
     { type: 'putChapter', value: { ...original.chapters[0]!, id: 'chapter', title: '第一章', order: 0 } },
     { type: 'deleteChapter', id: original.chapters[0]!.id },
@@ -28,13 +34,14 @@ function fixture(id = 'project-a'): Workspace {
     { type: 'putKnowledge', value: { id: 'known', characterId: 'person', content: '先前获得铜片线索', learnedAt: 'past', source: 'witness' } },
     { type: 'putKnowledge', value: { id: 'same-time', characterId: 'person', content: '本幕结束才获知信使姓名', learnedAt: 'now', source: 'told' } },
     { type: 'putKnowledge', value: { id: 'future-known', characterId: 'person', content: '未来秘密潜伏者', learnedAt: 'future', source: 'witness', factId: 'future-fact' } },
-    { type: 'putScene', value: { id: 'old', chapterId: 'chapter', title: '铜片初现', order: 0, povId: 'person', eventIds: ['past'], outline: '作者隐藏大纲', text: '雾港钟楼中，他拾起一块铜片。' } },
-    { type: 'putScene', value: { id: 'target', chapterId: 'chapter', title: '作者秘密场景标题', order: 1, povId: 'person', eventIds: ['now'], outline: '作者计划揭露幕后凶手', text: '前文甲【旧选区】后文乙' } },
-    { type: 'putScene', value: { id: 'future-scene', chapterId: 'chapter', title: '未来的秘密', order: 2, povId: 'person', eventIds: ['future'], outline: '未来秘密潜伏者', text: '未来正文秘密潜伏者' } },
-    { type: 'putScene', value: { id: 'mixed', chapterId: 'chapter', title: '混合未来事件', order: 3, povId: 'person', eventIds: ['now', 'future'], outline: '未来大纲不可用于此刻状态', text: '混合未来正文不可用于此刻状态' } },
-    { type: 'putScene', value: { id: 'blank', chapterId: 'chapter', title: '空白场景', order: 4, povId: 'person', eventIds: ['now'], outline: '计划：站在门前犹豫', text: '' } },
-    { type: 'putScene', value: { id: 'later-scene', chapterId: 'later', title: '未读章节', order: 0, povId: 'person', eventIds: ['future'], outline: '未来计划', text: '尚未读到的后文' } },
-    { type: 'putCharacterState', value: state },
+    ...scene('old', 'chapter', 0, { title: '铜片初现', povId: 'person', eventIds: ['past'], outline: '作者隐藏大纲', text: '雾港钟楼中，他拾起一块铜片。' }),
+    ...scene('target', 'chapter', 1, { title: '作者秘密场景标题', povId: 'person', eventIds: ['now'], outline: '作者计划揭露幕后凶手', text: '前文甲【旧选区】后文乙' }),
+    ...scene('future-scene', 'chapter', 2, { title: '未来的秘密', povId: 'person', eventIds: ['future'], outline: '未来秘密潜伏者', text: '未来正文秘密潜伏者' }),
+    ...scene('mixed', 'chapter', 3, { title: '混合未来事件', povId: 'person', eventIds: ['now', 'future'], outline: '未来大纲不可用于此刻状态', text: '混合未来正文不可用于此刻状态' }),
+    ...scene('blank', 'chapter', 4, { title: '空白场景', povId: 'person', eventIds: ['now'], outline: '计划：站在门前犹豫' }),
+    ...scene('later-scene', 'later', 0, { title: '未读章节', povId: 'person', eventIds: ['future'], outline: '未来计划', text: '尚未读到的后文' }),
+    { type: 'putStateChange', value: state },
+    { type: 'putStateChange', value: { id: 'future-state', subjectId: 'person', sceneId: 'future-scene', eventId: 'future', aspects: { cognition: '识破未来秘密潜伏者' } } },
     { type: 'putCard', value: { id: 'note', kind: 'note', title: '铜片灵感', content: '作者秘密画布备注', x: 10, y: 20 } },
   ]);
 }
@@ -52,7 +59,7 @@ function step(output = '', structured?: unknown): AgentStep {
 }
 function memory(project: Workspace, patch: Partial<AgentMemory> = {}): AgentMemory {
   return { id: 'memory', projectId: project.id, kind: 'summary', content: '铜片摘要', confirmed: false,
-    sources: [sourceFor(project, 'scene:text', 'old')!], status: 'active', createdAt: '2026-10-10T00:00:00Z', updatedAt: '2026-10-10T00:00:00Z', ...patch };
+    sources: [sourceFor(project, 'passage:text', 'old')!], status: 'active', createdAt: '2026-10-10T00:00:00Z', updatedAt: '2026-10-10T00:00:00Z', ...patch };
 }
 
 test('canonical SHA256 is stable across key order, sensitive to array order, and namespaced to the project', () => {
@@ -63,10 +70,10 @@ test('canonical SHA256 is stable across key order, sensitive to array order, and
   const cycle: Record<string, unknown> = {}; cycle.self = cycle;
   assert.throws(() => fingerprint(cycle), /循环/);
   const a = fixture(), b = fixture('project-b');
-  const source = sourceFor(a, 'scene:text', 'old')!;
-  assert.notEqual(source.hash, sourceFor(b, 'scene:text', 'old')!.hash);
+  const source = sourceFor(a, 'passage:text', 'old')!;
+  assert.notEqual(source.hash, sourceFor(b, 'passage:text', 'old')!.hash);
   assert.equal(sourceValid(b, source), false);
-  assert.equal(sourceValid(a, { ...source, start: 0, end: a.scenes.find(scene => scene.id === 'old')!.text.length + 1 }), false);
+  assert.equal(sourceValid(a, { ...source, start: 0, end: a.passages.find(passage => passage.id === 'old')!.text.length + 1 }), false);
 });
 
 test('evidence ignores reading and layout, including card positioning; original content changes invalidate it', () => {
@@ -86,12 +93,12 @@ test('Chinese substring/bigram search boosts titles and returns bounded, hash-va
   const chunks = searchContext(workspace, '铜片', 6);
   assert.ok(chunks.length > 0);
   assert.equal(chunks[0]!.title.includes('铜片'), true);
-  const bodies = searchContext(workspace, '雾港钟楼', 1000).filter(chunk => chunk.source.kind === 'scene:text');
+  const bodies = searchContext(workspace, '雾港钟楼', 1000).filter(chunk => chunk.source.kind === 'passage:text');
   assert.ok(bodies.length > 0);
   assert.ok(searchContext(workspace, '铜片', 1000).length <= 12);
   assert.ok(searchContext(workspace, '获得线索').some(chunk => chunk.text.includes('铜片线索')), '中文无空格文本按双字召回');
   for (const chunk of bodies) {
-    assert.equal(chunk.text, workspace.scenes.find(scene => scene.id === chunk.source.id)!.text.slice(chunk.source.start, chunk.source.end));
+    assert.equal(chunk.text, workspace.passages.find(passage => passage.id === chunk.source.id)!.text.slice(chunk.source.start, chunk.source.end));
     assert.equal(sourceValid(workspace, chunk.source), true);
     assert.ok(chunk.text.length <= 1200);
   }
@@ -100,17 +107,18 @@ test('Chinese substring/bigram search boosts titles and returns bounded, hash-va
 
 test('search filters restricted roles before matching: reader sees only visible text, character refuses future facts', () => {
   const workspace = fixture();
-  const anchor = { sceneId: 'target', chapterId: 'chapter', characterId: 'person', eventId: 'now' };
+  const anchor = { passageId: 'target', chapterId: 'chapter', characterId: 'person', eventId: 'now' };
   for (const query of ['作者秘密', '作者计划', '未来秘密潜伏者', '尚未读到', '作者秘密场景标题']) {
     assert.deepEqual(searchContext(workspace, query, 6, 'reader', anchor), [], query);
   }
-  assert.ok(searchContext(workspace, '铜片', 6, 'reader', anchor).every(chunk => chunk.source.kind === 'scene:text'));
-  for (const query of ['幕后凶手', '作者预设', '未来秘密潜伏者', '本幕结束才获知', '未来正文']) {
+  assert.ok(searchContext(workspace, '铜片', 6, 'reader', anchor).every(chunk => chunk.source.kind === 'passage:text'));
+  for (const query of ['幕后凶手', '作者预设', '未来秘密潜伏者', '本幕结束才获知', '未来正文', '识破']) {
     assert.deepEqual(searchContext(workspace, query, 6, 'character', anchor), [], query);
   }
   assert.ok(searchContext(workspace, '铜片', 6, 'character', anchor).length);
+  assert.ok(searchContext(workspace, '信使的来意', 6, 'character', anchor).some(chunk => chunk.source.kind === 'stateChange:character' && chunk.source.id === 'prior-state'), '人物检索得到此前的状态');
   assert.throws(() => searchContext(workspace, '铜片', 6, 'character'), /需要明确/);
-  assert.throws(() => searchContext(workspace, '铜片', 6, 'reader', { sceneId: 'target', chapterId: 'later' }), /不属于/);
+  assert.throws(() => searchContext(workspace, '铜片', 6, 'reader', { passageId: 'target', chapterId: 'later' }), /不属于/);
   assert.equal(canReadAuthor('character'), false); assert.equal(canReadAuthor('reader'), false); assert.equal(canReadAuthor('continuity'), true);
 });
 
@@ -128,41 +136,64 @@ test('reader and character specialists have fixed backend goals, safe inputs, an
   assert.ok(character.sources.every(source => sourceValid(workspace, source)));
 });
 
-test('evolution filters future-bound/mixed scenes, keeps actual text authoritative, and marks unwritten evidence as plan', () => {
+test('evolution reads one scene: the state entering it, knowledge up to its time, its prose over its outline; unwritten scenes are planned', () => {
   const workspace = fixture();
-  const evolution = specialist(workspace, 'evolution', { characterId: 'person', eventId: 'now' });
-  assert.doesNotMatch(JSON.stringify(evolution.context), /未来正文|混合未来正文|未来秘密|未来大纲|作者计划揭露/);
-  assert.match(JSON.stringify(evolution.context), /前文甲/);
-  const fields = { perspective: '不确定门后情况', psychology: '迟疑', motivation: '先询问', evidence: '门前犹豫的线索' };
-  const commands = evolution.toCommands!(step('', fields));
-  assert.equal(commands[0]!.type, 'putCharacterState');
-  const value = (commands[0] as Extract<Command, { type: 'putCharacterState' }>).value;
-  assert.deepEqual(value.sceneIds, ['target']);
-  const plan = specialist(workspace, 'evolution', { characterId: 'person', eventId: 'now', sceneId: 'blank' }, { stage: 'chapter', sceneId: 'blank' });
-  assert.match(JSON.stringify(plan.context), /"isPlan":true/);
-  const planned = (plan.toCommands!(step('', fields))[0] as Extract<Command, { type: 'putCharacterState' }>).value;
-  assert.match(planned.evidence, /^计划：/); assert.deepEqual(planned.sceneIds, ['blank']);
+  const evolution = specialist(workspace, 'evolution', { sceneId: 'target', characterId: 'person' });
+  const context = JSON.stringify(evolution.context);
+  assert.doesNotMatch(context, /未来正文|混合未来正文|未来秘密|未来大纲|作者计划揭露|识破/);
+  assert.match(context, /前文甲/); assert.match(context, /仍不确定信使的来意/); assert.match(context, /本幕结束才获知信使姓名/);
+  const output = { changes: [{ subjectId: 'person', eventId: 'now', note: '门前犹豫的线索',
+    aspects: [{ aspect: '视角', value: '不确定门后情况' }, { aspect: '心理', value: '迟疑' }, { aspect: '动机', value: '先询问' }, { aspect: '心理', value: ' ' }] }] };
+  const commands = evolution.toCommands!(step('', output));
+  assert.equal(commands.length, 1); assert.equal(commands[0]!.type, 'putStateChange');
+  const value = (commands[0] as Extract<Command, { type: 'putStateChange' }>).value;
+  assert.deepEqual({ ...value, id: '' }, { id: '', subjectId: 'person', sceneId: 'target', eventId: 'now', note: '门前犹豫的线索',
+    aspects: { perspective: '不确定门后情况', psychology: '迟疑', motivation: '先询问' } });
+  assert.throws(() => evolution.toCommands!(step('', { changes: [{ ...output.changes[0]!, subjectId: 'stranger' }] })), /subjects/);
+  const plan = specialist(workspace, 'evolution', { sceneId: 'blank', characterId: 'person' }, { stage: 'chapter', passageId: 'blank' });
+  assert.match(JSON.stringify(plan.context), /"isPlan":true/); assert.match(JSON.stringify(plan.context), /站在门前犹豫/);
+  const planned = (plan.toCommands!(step('', output))[0] as Extract<Command, { type: 'putStateChange' }>).value;
+  assert.match(planned.note!, /^计划：/); assert.equal(planned.sceneId, 'blank'); assert.equal(planned.passageId, undefined);
 });
 
-test('writer commands only replace the designated scene text and splice rewrite selections', () => {
-  const workspace = fixture(), scene = workspace.scenes.find(item => item.id === 'target')!;
-  const start = scene.text.indexOf('【'), end = scene.text.indexOf('】') + 1;
-  const writer = specialist(workspace, 'writer', { sceneId: 'target' }, { stage: 'rewrite', sceneId: 'target', selection: { start, end } });
+test('a scene running across chapters records its change on the passage being written; recording the same place again updates it', () => {
+  const workspace = applyCommands(fixture(), [{ type: 'putPassage', value: { id: 'blank-2', sceneId: 'blank', chapterId: 'later', order: 1, text: '', beat: '推门而入' } }]);
+  const output = { changes: [{ subjectId: 'person', eventId: '', note: '推门', aspects: [{ aspect: '状态', value: '站在门内' }] }] };
+  const evolution = specialist(workspace, 'evolution', { sceneId: 'blank' }, { stage: 'chapter', passageId: 'blank-2' });
+  assert.deepEqual((evolution.context as { scene: { passage: unknown } }).scene.passage, { chapter: '第二章', part: '2/2', beat: '推门而入' });
+  const first = (evolution.toCommands!(step('', output))[0] as Extract<Command, { type: 'putStateChange' }>).value;
+  assert.deepEqual([first.sceneId, first.passageId, first.eventId], ['blank', 'blank-2', undefined]);
+  const recorded = applyCommands(workspace, [{ type: 'putStateChange', value: first }]);
+  const again = specialist(recorded, 'evolution', { sceneId: 'blank' }, { stage: 'chapter', passageId: 'blank-2' });
+  assert.match(JSON.stringify(again.context), /"recorded":\[\{"eventId":"","becomes":\{"状态":"站在门内"\}/);
+  const second = (again.toCommands!(step('', { changes: [{ ...output.changes[0]!, aspects: [{ aspect: '状态', value: '退回门外' }] }] }))[0] as Extract<Command, { type: 'putStateChange' }>).value;
+  assert.equal(second.id, first.id);
+  // A chapter task writes only its own chapter's part, so it cannot record a change for the scene as a whole.
+  assert.throws(() => specialist(workspace, 'evolution', { sceneId: 'blank' }, { stage: 'chapter', chapterId: 'chapter' }), /超出章节写作范围/);
+});
+
+test('writer commands only replace the designated passage text and splice rewrite selections', () => {
+  const workspace = fixture(), passage = workspace.passages.find(item => item.id === 'target')!;
+  const start = passage.text.indexOf('【'), end = passage.text.indexOf('】') + 1;
+  const writer = specialist(workspace, 'writer', { passageId: 'target' }, { stage: 'rewrite', passageId: 'target', selection: { start, end } });
   const commands = writer.toCommands!(step('新段落'));
-  assert.equal(commands.length, 1); assert.equal(commands[0]!.type, 'putScene');
-  const next = (commands[0] as Extract<Command, { type: 'putScene' }>).value;
+  assert.equal(commands.length, 1); assert.equal(commands[0]!.type, 'putPassage');
+  const next = (commands[0] as Extract<Command, { type: 'putPassage' }>).value;
   assert.equal(next.id, 'target'); assert.equal(next.text, '前文甲新段落后文乙');
-  const { text: _old, ...oldFields } = scene, { text: _new, ...newFields } = next;
+  const { text: _old, ...oldFields } = passage, { text: _new, ...newFields } = next;
   assert.deepEqual(oldFields, newFields);
   assert.throws(() => writer.toCommands!(step('')), /没有生成/);
-  assert.equal(workspace.scenes.find(item => item.id === 'target')!.text, scene.text, '纯转换不写项目');
+  assert.equal(workspace.passages.find(item => item.id === 'target')!.text, passage.text, '纯转换不写项目');
 });
 
 test('proposals are validated pure domain candidates and cannot overwrite formal text or smuggle direct-write commands', () => {
   const workspace = fixture(), original = structuredClone(workspace);
   const narrative = specialist(workspace, 'narrative');
   assert.throws(() => narrative.toCommands!(step('', { summary: '错误', opsJson: '[]', commandsJson: JSON.stringify([{ type: 'setReading', value: workspace.reading }]) })), /候选能力/);
+  assert.throws(() => narrative.toCommands!(step('', { summary: '错误', opsJson: '[]', commandsJson: JSON.stringify([{ type: 'putPassage', value: { ...workspace.passages[0]!, text: '覆盖正文' } }]) })), /正式正文/);
+  // The old shape of a scene still carries prose: it is caught the same way.
   assert.throws(() => narrative.toCommands!(step('', { summary: '错误', opsJson: '[]', commandsJson: JSON.stringify([{ type: 'putScene', value: { ...workspace.scenes[0]!, text: '覆盖正文' } }]) })), /正式正文/);
+  assert.throws(() => narrative.toCommands!(step('', { summary: '错误', opsJson: '[]', commandsJson: JSON.stringify([{ type: 'putPassage', value: { id: 'new-part', sceneId: 'blank', chapterId: 'later', order: 5, text: '新正文' } }]) })), /必须为空/);
   assert.throws(() => narrative.toCommands!(step('', { summary: '错误', opsJson: '[]', commandsJson: JSON.stringify([{ type: 'deleteChapter', id: 'chapter' }]) })), /正式正文/);
   const commands = narrative.toCommands!(step('', { summary: '调整空白场景大纲', opsJson: '[]', commandsJson: JSON.stringify([{ type: 'putScene', value: { ...workspace.scenes.find(item => item.id === 'blank')!, outline: '新的大纲' } }]) }));
   assert.equal(commands.length, 1); assert.deepEqual(workspace, original);
@@ -173,7 +204,7 @@ test('proposals are validated pure domain candidates and cannot overwrite formal
 
 test('memory refresh marks changed-source and cross-project entries stale; author rules require explicit confirmation provenance', () => {
   const workspace = fixture(), original = memory(workspace);
-  const changed = applyCommands(workspace, [{ type: 'putScene', value: { ...workspace.scenes.find(item => item.id === 'old')!, text: '原文已经修改' } }]);
+  const changed = applyCommands(workspace, [{ type: 'putPassage', value: { ...workspace.passages.find(item => item.id === 'old')!, text: '原文已经修改' } }]);
   assert.equal(refreshMemories(changed, [original])[0]!.status, 'stale');
   assert.equal(original.status, 'active', '不修改调用者记忆');
   assert.equal(refreshMemories(fixture('other-project'), [original])[0]!.status, 'stale');
@@ -188,7 +219,8 @@ test('memory refresh marks changed-source and cross-project entries stale; autho
 
 test('coordinator context has a catalog/scope/explicit omissions and never dumps unselected book bodies', () => {
   const workspace = fixture();
-  workspace.scenes.push(...Array.from({ length: 100 }, (_, index) => ({ id: `large-${index}`, chapterId: 'later', title: `场景${index}`, order: index + 10, povId: null, eventIds: [], outline: '大量大纲', text: '未选定整书正文禁止载入'.repeat(1000) })));
+  workspace.scenes.push(...Array.from({ length: 100 }, (_, index) => ({ id: `large-${index}`, title: `场景${index}`, povId: null, eventIds: [], outline: '大量大纲' })));
+  workspace.passages.push(...Array.from({ length: 100 }, (_, index) => ({ id: `large-${index}`, sceneId: `large-${index}`, chapterId: 'later', order: index + 10, text: '未选定整书正文禁止载入'.repeat(1000) })));
   const context = collectContext(workspace, request(workspace), []) as Record<string, unknown>;
   const serialized = JSON.stringify(context);
   assert.ok(serialized.length <= MAX_CONTEXT_CHARS);
@@ -199,43 +231,58 @@ test('coordinator context has a catalog/scope/explicit omissions and never dumps
   assert.ok(JSON.stringify(large).length <= MAX_CONTEXT_CHARS); assert.match(JSON.stringify(large), /"limited":true/);
 });
 
-test('rewrite scope guards before snapshots and exact prefix/suffix, and references never authorize other scenes', () => {
-  const workspace = fixture(), scene = workspace.scenes.find(item => item.id === 'target')!;
-  const rewrite = request(workspace, { stage: 'rewrite', sceneId: 'target', selection: { start: 3, end: 8 }, references: [{ kind: 'scene', id: 'future-scene' }] });
-  const changed = applyCommands(workspace, [{ type: 'putScene', value: { ...scene, text: '前文甲新内容后文乙' } }]);
-  assert.doesNotThrow(() => assertWriteScope(rewrite, workspace, changed, [{ collection: 'scenes', key: 'target', before: scene, after: changed.scenes.find(item => item.id === 'target') }]));
-  assert.throws(() => assertWriteScope(rewrite, workspace, changed, [{ collection: 'scenes', key: 'target', before: { ...scene, text: '假守护快照' }, after: changed.scenes.find(item => item.id === 'target') }]), /变更前值/);
+test('rewrite scope guards before snapshots and exact prefix/suffix, and references never authorize other passages', () => {
+  const workspace = fixture(), passage = workspace.passages.find(item => item.id === 'target')!;
+  const rewrite = request(workspace, { stage: 'rewrite', passageId: 'target', selection: { start: 3, end: 8 }, references: [{ kind: 'scene', id: 'future-scene' }] });
+  const changed = applyCommands(workspace, [{ type: 'putPassage', value: { ...passage, text: '前文甲新内容后文乙' } }]);
+  assert.doesNotThrow(() => assertWriteScope(rewrite, workspace, changed, [{ collection: 'passages', key: 'target', before: passage, after: changed.passages.find(item => item.id === 'target') }]));
+  assert.throws(() => assertWriteScope(rewrite, workspace, changed, [{ collection: 'passages', key: 'target', before: { ...passage, text: '假守护快照' }, after: changed.passages.find(item => item.id === 'target') }]), /变更前值/);
   for (const text of ['改了前文新内容后文乙', '前文甲新内容改了后文', '甲乙']) {
-    const bad = applyCommands(workspace, [{ type: 'putScene', value: { ...scene, text } }]);
+    const bad = applyCommands(workspace, [{ type: 'putPassage', value: { ...passage, text } }]);
     assert.throws(() => assertWriteScope(rewrite, workspace, bad, []), /前缀和后缀/);
   }
-  const outside = applyCommands(changed, [{ type: 'putScene', value: { ...workspace.scenes.find(item => item.id === 'future-scene')!, text: '也修改参考正文' } }]);
+  const outside = applyCommands(changed, [{ type: 'putPassage', value: { ...workspace.passages.find(item => item.id === 'future-scene')!, text: '也修改参考正文' } }]);
   assert.throws(() => assertWriteScope(rewrite, workspace, outside, []), /目标以外/);
+  const moved = applyCommands(changed, [{ type: 'putPassage', value: { ...changed.passages.find(item => item.id === 'target')!, order: 9 } }]);
+  assert.throws(() => assertWriteScope(rewrite, workspace, moved, []), /只能修改场景段的正文/);
+  const outline = applyCommands(changed, [{ type: 'putScene', value: { ...workspace.scenes.find(item => item.id === 'target')!, outline: '顺手改大纲' } }]);
+  assert.throws(() => assertWriteScope(rewrite, workspace, outline, []), /不能修改 scenes/);
   const metadata = applyCommands(changed, [{ type: 'updateNovel', patch: { theme: '附带主题修改' } }]);
   assert.throws(() => assertWriteScope(rewrite, workspace, metadata, []), /作品设定/);
 });
 
-test('chapter scope permits only blank target prose and legal same-scene states, guarding all formal scene text', () => {
-  const workspace = fixture(), scene = workspace.scenes.find(item => item.id === 'blank')!;
-  const chapter = request(workspace, { stage: 'chapter', sceneId: 'blank' });
-  const written = applyCommands(workspace, [{ type: 'putScene', value: { ...scene, text: '新正文' } }]);
+test('chapter scope permits only blank target prose and state changes where it writes, guarding all formal passage text', () => {
+  const workspace = fixture(), passage = workspace.passages.find(item => item.id === 'blank')!;
+  const chapter = request(workspace, { stage: 'chapter', passageId: 'blank' });
+  const written = applyCommands(workspace, [{ type: 'putPassage', value: { ...passage, text: '新正文' } }]);
   assert.doesNotThrow(() => assertWriteScope(chapter, workspace, written, []));
-  const state: CharacterState = { id: 'current-state', characterId: 'person', eventId: 'now', perspective: '迟疑', psychology: '紧张', motivation: '询问', evidence: '门前行动', sceneIds: ['blank'] };
-  const evolved = applyCommands(written, [{ type: 'putCharacterState', value: state }]);
+  const change: StateChange = { id: 'current-state', subjectId: 'person', sceneId: 'blank', eventId: 'now', aspects: { perspective: '迟疑', psychology: '紧张', motivation: '询问' }, note: '门前行动' };
+  const evolved = applyCommands(written, [{ type: 'putStateChange', value: change }]);
   assert.doesNotThrow(() => assertWriteScope(chapter, workspace, evolved, []));
-  const outsideState = applyCommands(written, [{ type: 'putCharacterState', value: { ...state, sceneIds: ['target'] } }]);
+  const outsideState = applyCommands(written, [{ type: 'putStateChange', value: { ...change, sceneId: 'target' } }]);
   assert.throws(() => assertWriteScope(chapter, workspace, outsideState, []), /目标场景/);
-  const overwrite = applyCommands(written, [{ type: 'putScene', value: { ...workspace.scenes.find(item => item.id === 'target')!, text: '重写正式正文' } }]);
+  const editedPrior = applyCommands(written, [{ type: 'putStateChange', value: { ...workspace.stateChanges.find(item => item.id === 'prior-state')!, aspects: { psychology: '改写过去' } } }]);
+  assert.throws(() => assertWriteScope(chapter, workspace, editedPrior, []), /目标场景/);
+  assert.throws(() => assertWriteScope(chapter, workspace, applyCommands(written, [{ type: 'deleteStateChange', id: 'prior-state' }]), []), /不能删除状态变化/);
+  // Once the scene continues in another chapter, a task writing only this part records its changes on this passage.
+  const split = applyCommands(written, [{ type: 'putPassage', value: { id: 'blank-2', sceneId: 'blank', chapterId: 'later', order: 1, text: '' } }]);
+  const before = applyCommands(workspace, [{ type: 'putPassage', value: { id: 'blank-2', sceneId: 'blank', chapterId: 'later', order: 1, text: '' } }]);
+  assert.throws(() => assertWriteScope(chapter, before, applyCommands(split, [{ type: 'putStateChange', value: change }]), []), /目标场景/);
+  assert.doesNotThrow(() => assertWriteScope(chapter, before, applyCommands(split, [{ type: 'putStateChange', value: { ...change, passageId: 'blank' } }]), []));
+  const overwrite = applyCommands(written, [{ type: 'putPassage', value: { ...workspace.passages.find(item => item.id === 'target')!, text: '重写正式正文' } }]);
   assert.throws(() => assertWriteScope(request(workspace, { stage: 'chapter', chapterId: 'chapter' }), workspace, overwrite, []), /正式正文/);
 });
 
 test('plan validation enforces real role targets, acceptance, bounded node count, and a dependency DAG', () => {
-  const workspace = fixture(), run = request(workspace, { stage: 'rewrite', sceneId: 'target' });
+  const workspace = fixture(), run = request(workspace, { stage: 'rewrite', passageId: 'target' });
   const roles: AgentRole[] = ['theme', 'planner', 'world', 'narrative', 'canvas', 'continuity'];
   const nodes = roles.map(role => node(role as PlanNode['role']));
   assert.doesNotThrow(() => validatePlan(nodes, workspace, run));
   assert.throws(() => validatePlan([{ ...nodes[0]!, acceptance: ' ' }], workspace, run), /验收标准/);
   assert.throws(() => validatePlan([node('writer', { sceneId: 'missing' })], workspace, run), /不存在/);
+  assert.throws(() => validatePlan([node('writer', { passageId: 'missing' })], workspace, run), /不存在/);
+  assert.throws(() => validatePlan([node('writer', { passageId: 'target', sceneId: 'blank' })], workspace, run), /不属于目标场景/);
+  assert.throws(() => validatePlan([node('evolution', { characterId: 'person' })], workspace, request(workspace)), /明确场景/);
   assert.throws(() => validatePlan([node('writer', { sceneId: 'future-scene' })], workspace, run), /超出任务范围/);
   assert.throws(() => validatePlan([node('character', { characterId: 'person' })], workspace, run), /明确人物和事件/);
   assert.throws(() => validatePlan([{ ...nodes[0]!, dependsOn: [nodes[1]!.id] }, { ...nodes[1]!, dependsOn: [nodes[0]!.id] }], workspace, run), /成环/);
@@ -247,13 +294,13 @@ test('plan validation enforces real role targets, acceptance, bounded node count
 
 test('写作节点按阅读顺序串联，不改变已有反向顺序，也不会成环', () => {
   const workspace = fixture();
-  const nodes = [node('writer', { id: 'late', sceneId: 'blank', dependsOn: [] }), node('writer', { id: 'early', sceneId: 'target', dependsOn: [] }),
+  const nodes = [node('writer', { id: 'late', passageId: 'blank', dependsOn: [] }), node('writer', { id: 'early', passageId: 'target', dependsOn: [] }),
     node('writer', { id: 'mid', sceneId: 'mixed', dependsOn: [] }), node('theme', { id: 'theme', dependsOn: [] })];
   assert.equal(chainWriterNodes(nodes, workspace, request(workspace)), 2);
   assert.deepEqual(Object.fromEntries(nodes.map(item => [item.id, item.dependsOn])), { late: ['mid'], early: [], mid: ['early'], theme: [] });
   validatePlan(nodes, workspace, request(workspace));
   // The author's plan already orders the later scene first: keep it, and never add the reverse edge.
-  const reversed = [node('writer', { id: 'a', sceneId: 'target', dependsOn: ['b'] }), node('writer', { id: 'b', sceneId: 'blank', dependsOn: [] })];
+  const reversed = [node('writer', { id: 'a', passageId: 'target', dependsOn: ['b'] }), node('writer', { id: 'b', passageId: 'blank', dependsOn: [] })];
   assert.equal(chainWriterNodes(reversed, workspace, request(workspace)), 0);
   assert.deepEqual(reversed.map(item => item.dependsOn), [['b'], []]);
 });
@@ -262,10 +309,10 @@ test('前置结论只交给作者侧专长；角色代入、读者与人物演�
   const workspace = fixture();
   const upstream: UpstreamResult[] = [{ nodeId: 'theme', role: 'theme', label: '立意', objective: '深化', result: { conclusion: '上游作者剧透：幕后凶手是林舟的师父' } }];
   const build = (role: SpecialistRequest['role'], patch: Partial<PlanNode> = {}) => JSON.stringify(specialistDefinition({ project: workspace, role, node: node(role, patch), request: request(workspace), upstream }).context);
-  assert.match(build('writer', { sceneId: 'blank' }), /上游作者剧透/);
+  assert.match(build('writer', { passageId: 'blank' }), /上游作者剧透/);
   assert.match(build('planner'), /上游作者剧透/);
   assert.match(build('continuity', { sceneId: 'target' }), /上游作者剧透/);
-  for (const [role, patch] of [['character', { characterId: 'person', eventId: 'now' }], ['evolution', { characterId: 'person', eventId: 'now' }],
+  for (const [role, patch] of [['character', { characterId: 'person', eventId: 'now' }], ['evolution', { sceneId: 'target', characterId: 'person' }],
     ['reader', { sceneId: 'target' }]] as const) assert.doesNotMatch(build(role, patch), /上游作者剧透/, role);
 });
 
@@ -287,7 +334,7 @@ test('作者确认的规则交给所有作者侧专长，角色代入与读者�
   const workspace = fixture(), authorRules = [{ kind: 'constraint', content: '作者约束：全书不出现穿越元素' }];
   const build = (role: SpecialistRequest['role'], patch: Partial<PlanNode> = {}) => JSON.stringify(specialistDefinition({ project: workspace, role, node: node(role, patch), request: request(workspace), authorRules }).context);
   for (const [role, patch] of [['planner', {}], ['world', {}], ['narrative', {}], ['canvas', {}], ['cast', {}], ['theme', {}], ['continuity', { sceneId: 'target' }],
-    ['evolution', { characterId: 'person', eventId: 'now' }], ['writer', { sceneId: 'blank' }]] as const) assert.match(build(role, patch), /全书不出现穿越元素/, role);
+    ['evolution', { sceneId: 'target', characterId: 'person' }], ['writer', { passageId: 'blank' }]] as const) assert.match(build(role, patch), /全书不出现穿越元素/, role);
   for (const [role, patch] of [['character', { characterId: 'person', eventId: 'now' }], ['reader', { sceneId: 'target' }]] as const) assert.doesNotMatch(build(role, patch), /穿越/, role);
 });
 
@@ -339,10 +386,10 @@ test('局部修订只替换引用的段落；找不到、重复或重叠的引�
 test('连续性与文风审阅读到整场正文，不只是开头', () => {
   const workspace = fixture();
   const long = `${'开头的铺垫。'.repeat(600)}结尾处林舟说出了不该知道的名字。`;
-  const scene = workspace.scenes.find(item => item.id === 'target')!;
-  const project = applyCommands(workspace, [{ type: 'putScene', value: { ...scene, text: long } }]);
+  const passage = workspace.passages.find(item => item.id === 'target')!;
+  const project = applyCommands(workspace, [{ type: 'putPassage', value: { ...passage, text: long } }]);
   for (const role of ['continuity', 'stylist'] as const) {
-    const review = specialistDefinition({ project, role, node: node(role, { sceneId: 'target', chapterId: 'chapter' }), request: request(project), focusSceneIds: ['target'] });
+    const review = specialistDefinition({ project, role, node: node(role, { passageId: 'target', chapterId: 'chapter' }), request: request(project), focusPassageIds: ['target'] });
     assert.match(JSON.stringify(review.context), /结尾处林舟说出了不该知道的名字/, role);
   }
 });
@@ -351,7 +398,7 @@ test('写作上下文：每个人物只带最近的记忆并注明更早的条�
   const base = fixture();
   const workspace = applyCommands(base, Array.from({ length: 30 }, (_, index) => ({ type: 'putKnowledge' as const,
     value: { id: `memory-${index}`, characterId: 'person', content: `第${index}条旧线索`, learnedAt: 'past', source: 'witness' as const } })));
-  const writer = specialistDefinition({ project: workspace, role: 'writer', node: node('writer', { sceneId: 'target' }), request: request(workspace, { stage: 'rewrite', sceneId: 'target' }) });
+  const writer = specialistDefinition({ project: workspace, role: 'writer', node: node('writer', { passageId: 'target' }), request: request(workspace, { stage: 'rewrite', passageId: 'target' }) });
   const person = (writer.context as any).eventContexts[0].characters.find((item: any) => item.characterId === 'person');
   assert.equal(person.memories.length, 16);
   assert.equal(person.earlierMemories, 31 - 16);

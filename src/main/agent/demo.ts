@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { ResponseOutputItem, ResponseStreamEvent } from 'openai/resources/responses/responses';
 import type { RunRequest, Workspace } from '../../shared/types.js';
 import type { PlanNode } from '../../shared/agent-types.js';
+import { chapterPassages, orderedChapters, orderedScenes, scenePassages } from '../../shared/structure.js';
 import { demoAssist, demoIdea, demoOutline, demoText } from '../agents.js';
 import { applyCommands } from '../domain.js';
 import { resolveReferences } from '../context.js';
@@ -47,17 +48,22 @@ export class DemoAgentTransport implements ResponseTransport {
       dependsOn: [], acceptance: '产出可核对的分析或领域候选，保留既有正文和知识边界', status: 'pending', ...patch });
     if (this.analysisOnly()) return [node('continuity', 'analysis')];
     if (this.request.stage === 'chapter' || this.request.stage === 'rewrite') {
-      const scenes = this.request.sceneId ? this.project.scenes.filter(scene => scene.id === this.request.sceneId)
-        : this.project.scenes.filter(scene => scene.chapterId === (this.request.chapterId ?? this.project.chapters[0]?.id) && !scene.text.trim()).sort((a, b) => a.order - b.order);
+      const passages = this.request.passageId ? this.project.passages.filter(passage => passage.id === this.request.passageId)
+        : chapterPassages(this.project, this.request.chapterId ?? orderedChapters(this.project)[0]?.id ?? '').filter(passage => !passage.text.trim());
+      const sceneOf = (sceneId: string) => this.project.scenes.find(scene => scene.id === sceneId)!;
       // One independent character perspective on the chapter's most important event, before any prose is written.
-      const perspective = this.request.stage === 'chapter' ? scenes.flatMap(scene => scene.eventIds.map(id => ({ scene, event: this.project.objects.find(item => item.id === id && item.event) })))
+      const perspective = this.request.stage === 'chapter' ? passages.flatMap(passage => sceneOf(passage.sceneId).eventIds.map(id => ({ passage, scene: sceneOf(passage.sceneId), event: this.project.objects.find(item => item.id === id && item.event) })))
         .filter(item => item.event).sort((a, b) => Number(!!b.event!.event!.critical) - Number(!!a.event!.event!.critical))
-        .map(({ scene, event }) => ({ scene, event: event!, characterId: [scene.povId, ...event!.event!.participants, ...Object.keys(event!.event!.observations)]
+        .map(({ passage, scene, event }) => ({ passage, event: event!, characterId: [scene.povId, ...event!.event!.participants, ...Object.keys(event!.event!.observations)]
           .find(id => id && this.project.objects.some(item => item.id === id && item.typeId === 'character')) }))
         .find(item => item.characterId) : undefined;
-      const roles = perspective ? [node('character', 'perspective', { sceneId: perspective.scene.id, chapterId: perspective.scene.chapterId, characterId: perspective.characterId!, eventId: perspective.event.id })] : [];
-      return [...roles, ...scenes.slice(0, 12 - roles.length).map((scene, i) => node('writer', `write-${i}`, { sceneId: scene.id, chapterId: scene.chapterId,
-        dependsOn: i ? [`write-${i - 1}`] : roles.map(role => role.id) }))];
+      const roles = perspective ? [node('character', 'perspective', { passageId: perspective.passage.id, chapterId: perspective.passage.chapterId, characterId: perspective.characterId!, eventId: perspective.event.id })] : [];
+      const writers = passages.slice(0, Math.floor((12 - roles.length) / 2)).map((passage, i) => node('writer', `write-${i}`, { passageId: passage.id, chapterId: passage.chapterId,
+        dependsOn: i ? [`write-${i - 1}`] : roles.map(role => role.id) }));
+      // Chapter writing also records how the people and places of each scene changed in what was written.
+      const evolution = this.request.stage === 'chapter' ? writers.map((writer, i) => node('evolution', `evolve-${i}`, { passageId: writer.passageId, chapterId: writer.chapterId,
+        sceneId: this.project.passages.find(passage => passage.id === writer.passageId)!.sceneId, dependsOn: [writer.id] })) : [];
+      return [...roles, ...writers, ...evolution];
     }
     if (this.request.stage === 'assist' && this.request.tool === 'theme') return [node('theme', 'theme')];
     if (this.request.stage === 'agent' && /人物|角色|阵容/.test(this.request.objective)) return [node('cast', 'cast')];
@@ -65,13 +71,15 @@ export class DemoAgentTransport implements ResponseTransport {
       const references = resolveReferences(this.project, this.request.references);
       const selected = references.objects.filter(object => object.typeId === 'character');
       const characters = selected.length ? selected : this.project.objects.filter(object => object.typeId === 'character');
-      const events = this.project.objects.filter(object => object.event).sort((a, b) => a.event!.worldOrder - b.event!.worldOrder);
+      const participants = new Map(this.project.objects.filter(object => object.event).map(object => [object.id, object.event!.participants]));
       const nodes: PlanNode[] = [];
+      // Each character through the scenes that put them on stage, in story order.
       for (const character of characters) {
         let preceding: string | undefined;
-        for (const event of events.filter(event => event.event!.participants.includes(character.id))) {
-          const id = `evolve-${nodes.length}`;
-          nodes.push(node('evolution', id, { characterId: character.id, eventId: event.id, dependsOn: preceding ? [preceding] : [] })); preceding = id;
+        for (const scene of orderedScenes(this.project).filter(scene => scene.povId === character.id || scene.castIds?.includes(character.id)
+          || scene.eventIds.some(id => participants.get(id)?.includes(character.id)))) {
+          const id = `evolve-${nodes.length}`, parts = scenePassages(this.project, scene.id);
+          nodes.push(node('evolution', id, { sceneId: scene.id, characterId: character.id, ...(parts.length > 1 ? { passageId: parts.at(-1)!.id } : {}), dependsOn: preceding ? [preceding] : [] })); preceding = id;
         }
       }
       if (nodes.length) return nodes.slice(0, 12);
@@ -84,7 +92,7 @@ export class DemoAgentTransport implements ResponseTransport {
     const history = this.history(request), last = history.at(-1);
     const artifactIds = [...new Set(history.flatMap(item => (item.result.artifacts ?? []).map((artifact: any) => artifact.artifactId)).filter(Boolean))];
     if (!last) return [invoke('set_plan', { summary: '根据目标选择必要专长，生成候选、审查后等待作者批准', nodes: this.plan().map(node => ({ ...node, status: undefined,
-      sceneId: node.sceneId ?? null, chapterId: node.chapterId ?? null, characterId: node.characterId ?? null, eventId: node.eventId ?? null })) })];
+      passageId: node.passageId ?? null, sceneId: node.sceneId ?? null, chapterId: node.chapterId ?? null, characterId: node.characterId ?? null, eventId: node.eventId ?? null })) })];
     if (last.result.ok === false && last.name !== 'commit_candidate') {
       return [invoke('ask_author', { question: `${last.name === 'propose_changes' ? '候选未能形成' : '执行遇到问题'}：${last.result.reason}。请补充目标或结束任务后选择新范围。`, options: ['缩小范围后重试', '结束本次任务'] })];
     }
@@ -103,7 +111,7 @@ export class DemoAgentTransport implements ResponseTransport {
     if (id === 'continuity' || id === 'reader') return { verdict: 'pass', issues: [], recommendation: '本地演示审查：信息边界与候选结构可继续核对。真实模型判断需要另行验证。' };
     if (id === 'stylist') {
       // Demo judgment comes from the local lint only: banned words and clichés ask for a revision.
-      const issues = (context.targetScenes ?? []).flatMap((scene: any) => (scene.lint ?? []).map((issue: any) => ({ quote: issue.excerpt ?? '', problem: `${scene.title}：${issue.message}`,
+      const issues = (context.targetPassages ?? []).flatMap((passage: any) => (passage.lint ?? []).map((issue: any) => ({ quote: issue.excerpt ?? '', problem: `${passage.title}：${issue.message}`,
         fix: '按作者范文的句长与用词改写这一句', severity: /禁用|AI 腔/.test(issue.message) ? 'must' : 'should' })));
       const blocking = issues.some((issue: { severity: string }) => issue.severity === 'must');
       return { verdict: blocking ? 'revise' : 'pass', issues: issues.slice(0, 6),
@@ -113,10 +121,20 @@ export class DemoAgentTransport implements ResponseTransport {
       winner: 'tie', reason: '本地演示评审：只验证盲评流程，真实比较需要设置评测模型。' };
     if (id === 'theme') return { question: '证据不足时，人是否愿意为信任承担风险？', choices: '只保护自己或共同承担未知风险', cost: '信任可能遭到背叛，拒绝可能失去解决困境的机会', expression: '用当场行动与选择代价表达，不安排说教独白。' };
     if (id.startsWith('character:')) return { perspective: `此刻我只能确认：${context.perception || '眼前线索不足'}。`, intention: '保护重视的人，先核实线索', action: '追问亲见亲闻的证据', uncertainty: '我不知道别人隐瞒的真相。' };
-    if (id.startsWith('evolution:')) return { perspective: `承接此前判断，此刻只能确认：${context.character?.perception || '线索不足'}。`, psychology: '戒备中开始犹豫，但不确定对方的全部意图。', motivation: '用可核对的行动保护重视的人，逐步判断是否合作。', evidence: `${context.sceneEvidence?.some((scene: any) => scene.actualText) ? '正文：' : '计划：'}${context.sceneEvidence?.map((scene: any) => `${scene.title}「${String(scene.actualText || scene.outline || '').slice(0, 100)}」`).join('；') || '依据当前亲见亲闻，证据不足时保持此前状态。'}` };
+    if (id.startsWith('evolution:')) {
+      // Demo changes: each character on stage grows wary but undecided, and the place turns tense; the note quotes the prose or plan.
+      const evidence = context.isPlan ? `计划：${String(context.plan?.outline ?? '').slice(0, 80)}` : `正文：「${String(context.prose?.[0]?.text ?? '').slice(0, 80)}」`;
+      const subjects = (context.subjects ?? []) as Array<{ id: string; kind: string; knowledge?: { learnsHere?: string[]; perception?: Record<string, string> } }>;
+      return { changes: [...subjects.filter(subject => subject.kind === '人物').slice(0, 3).map(subject => ({ subjectId: subject.id, eventId: context.events?.[0]?.id ?? '', note: evidence,
+        aspects: [{ aspect: '心理', value: '戒备中开始犹豫，但不确定对方的全部意图。' },
+          { aspect: '认知', value: subject.knowledge?.learnsHere?.[0] ?? Object.values(subject.knowledge?.perception ?? {})[0] ?? '只确认了眼前看到的线索。' },
+          { aspect: '动机', value: '用可核对的行动保护重视的人，逐步判断是否合作。' }] })),
+        ...subjects.filter(subject => subject.kind === '环境').slice(0, 1).map(subject => ({ subjectId: subject.id, eventId: '', note: evidence,
+          aspects: [{ aspect: '氛围', value: '钟声之后的寂静里，每一处响动都像在催促。' }] }))] };
+    }
     if (id === 'patch') {
-      // Demo revision: one local edit that extends the scene's closing paragraph.
-      const text = String(context.scene?.text ?? ''), last = text.split('\n\n').filter(part => part.trim()).at(-1) ?? text;
+      // Demo revision: one local edit that extends the passage's closing paragraph.
+      const text = String(context.passage?.text ?? ''), last = text.split('\n\n').filter(part => part.trim()).at(-1) ?? text;
       return { edits: [{ quote: last, replacement: `${last}\n\n他停了一瞬，听见身后的脚步也停住。至少此刻，没人把他独自留在雾里。` }], note: '本地演示修订：只补写了结尾一段。' };
     }
     if (id === 'writer' || id === 'rewrite' || id === 'revision') {

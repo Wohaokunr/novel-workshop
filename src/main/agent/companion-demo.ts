@@ -77,16 +77,18 @@ export class DemoCompanionTransport implements ResponseTransport {
     if (mode === 'structure') {
       const scenes: any[] = context.catalog?.scenes ?? [];
       const proposals: any[] = [];
+      // Where each scene is read: one entry per passage, with the scene's title.
+      const parts: any[] = scenes.flatMap(scene => (scene.passages ?? []).map((passage: any) => ({ ...passage, sceneId: scene.id, title: scene.title })));
       // Work on the chapter of the scene the author pointed at, like a real diagnosis would.
       const anchorId = context.anchor?.scenes?.[0]?.id;
-      const focus = scenes.find(scene => scene.id === anchorId) ?? scenes.at(-1);
-      const siblings = focus ? scenes.filter(scene => scene.chapterId === focus.chapterId) : [];
+      const focus = parts.find(part => part.sceneId === anchorId) ?? parts.at(-1);
+      const siblings = focus ? parts.filter(part => part.chapterId === focus.chapterId).sort((a, b) => a.order - b.order) : [];
       if (siblings.length >= 2) {
         const first = siblings[0], moved = focus === first ? siblings.at(-1) : focus;
-        proposals.push({ title: '换个开篇', summary: `以「${moved.title}」开场制造悬念，再回到起点。`, ops: [op({ op: 'moveScene', targetId: moved.id, parentId: moved.chapterId, order: 1, title: moved.title })] });
-        proposals.push({ title: '推迟揭露', summary: `把「${first.title}」后移，让读者多等一会儿答案。`, ops: [op({ op: 'moveScene', targetId: first.id, parentId: first.chapterId, order: 99, title: first.title })] });
+        proposals.push({ title: '换个开篇', summary: `以「${moved.title}」开场制造悬念，再回到起点。`, ops: [op({ op: 'moveScene', targetId: moved.passageId, order: 1, title: moved.title })] });
+        proposals.push({ title: '推迟揭露', summary: `把「${first.title}」后移，让读者多等一会儿答案。`, ops: [op({ op: 'moveScene', targetId: first.passageId, order: 99, title: first.title })] });
       }
-      const chapterId = scenes[0]?.chapterId ?? context.catalog?.chapters?.[0]?.id ?? null;
+      const chapterId = parts[0]?.chapterId ?? context.catalog?.chapters?.[0]?.id ?? null;
       if (chapterId) proposals.push({ title: '插入一场喘息', summary: '在紧张段落之间加入一场人物关系戏。', ops: [op({ op: 'addScene', parentId: chapterId, order: 2, title: '短暂的停顿', content: `${hero}与${other}在等待中交换了一个不该说出口的秘密。`, povName: hero, people: [other], places: place ? [place] : [] })] });
       // The outline has no chapter for a flashback yet: open one right after the focused chapter and put the scene there.
       const after = focus?.chapterId ?? chapterId;

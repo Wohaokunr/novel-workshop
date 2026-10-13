@@ -1,6 +1,7 @@
-import type { Chapter, NarrativeScene, Workspace } from '../../shared/types.js';
-import type { RollupDigest, SceneDigest, StoryDigest, StoryThread } from '../../shared/story-types.js';
-import { extractSummary, indexTerms, mentionExcerpt, sceneHash, sceneMentions, sketchSimilarity, storyIndex, textHash, textSketch, type Mention, type StoryIndex } from './story-index.js';
+import type { Chapter, NarrativeScene, Passage, Workspace } from '../../shared/types.js';
+import type { PassageDigest, RollupDigest, StoryDigest, StoryThread } from '../../shared/story-types.js';
+import { orderedChapters, orderedPassages, passageLabel } from '../../shared/structure.js';
+import { extractSummary, indexTerms, mentionExcerpt, passageHash, passageMentions, sketchSimilarity, storyIndex, textHash, textSketch, type Mention, type StoryIndex } from './story-index.js';
 
 /** fresh: digest of this exact text; drifted: digest of an earlier, mostly similar version; extract: zero-token fallback. */
 export type Freshness = 'fresh' | 'drifted' | 'extract';
@@ -11,11 +12,11 @@ export const VOLUME_CHAPTERS = 10;
 export function sameThread(a: string, b: string): boolean {
   return threadSimilarity(a, b) >= (Math.min(termSet(a).size, termSet(b).size) >= 8 ? 0.5 : 0.75);
 }
-/** A minor thread no scene summary has touched for this many chapters is stale: listed after everything else, so it only gives way
+/** A minor thread no passage summary has touched for this many chapters is stale: listed after everything else, so it only gives way
  * when the list is crowded. Major threads never go stale. */
 export const THREAD_EXPIRY_CHAPTERS = 30;
-/** An open thread with where it was opened and the last chapter whose summary picked up its wording. */
-export interface LedgerThread extends StoryThread { sceneId: string; chapterIndex: number; lastChapterIndex: number }
+/** An open thread with the passage that opened it and the last chapter whose summary picked up its wording. */
+export interface LedgerThread extends StoryThread { passageId: string; chapterIndex: number; lastChapterIndex: number }
 
 function termSet(text: string): Set<string> { return new Set(indexTerms(text)); }
 function sharedTerms(a: string, b: string) {
@@ -33,90 +34,101 @@ export function threadOverlap(a: string, b: string): number {
   const { shared, left, right } = sharedTerms(a, b);
   return left && right ? shared / Math.min(left, right) : 0;
 }
-export interface SceneMemory { title?: string; freshness: Freshness; summary: string; events?: string[]; changes?: SceneDigest['changes']; facts?: string[] }
+export interface PassageMemory { title?: string; freshness: Freshness; summary: string; events?: string[]; changes?: PassageDigest['changes']; facts?: string[] }
 export interface Volume { id: string; title: string; chapterIds: string[] }
 
 function clip(text: string, length: number): string { return text.length > length ? `${text.slice(0, length)}…` : text; }
 
-/** Read-only projection of a workspace plus its stored digests. Pure: works on candidate workspaces too. */
+/** Read-only projection of a workspace plus its stored digests. Pure: works on candidate workspaces too. The prose is read as passages
+ * in reading order (chapters in order, passages in chapter order); a scene running through several chapters is several passages. */
 export class StoryView {
   readonly index: StoryIndex;
-  readonly order: NarrativeScene[];
+  readonly order: Passage[];
   readonly chapters: Chapter[];
   private readonly position = new Map<string, number>();
   private readonly chapterPosition = new Map<string, number>();
-  private readonly sceneDigests = new Map<string, SceneDigest>();
+  private readonly scenes: Map<string, NarrativeScene>;
+  private readonly passageDigests = new Map<string, PassageDigest>();
   private readonly rollups = new Map<string, RollupDigest>();
   private readonly freshnessCache = new Map<string, Freshness>();
   private volumeCache?: Volume[];
 
   constructor(readonly workspace: Workspace, digests: StoryDigest[] = []) {
     this.index = storyIndex(workspace);
-    this.chapters = [...workspace.chapters].sort((a, b) => a.order - b.order);
+    this.chapters = orderedChapters(workspace);
     this.chapters.forEach((chapter, index) => this.chapterPosition.set(chapter.id, index));
-    this.order = this.chapters.flatMap(chapter => workspace.scenes.filter(scene => scene.chapterId === chapter.id).sort((a, b) => a.order - b.order));
-    this.order.forEach((scene, index) => this.position.set(scene.id, index));
+    this.order = orderedPassages(workspace);
+    this.order.forEach((passage, index) => this.position.set(passage.id, index));
+    this.scenes = new Map(workspace.scenes.map(scene => [scene.id, scene]));
     for (const digest of digests) {
-      if (digest.kind === 'scene') this.sceneDigests.set(digest.sceneId, digest);
+      if (digest.kind === 'passage') this.passageDigests.set(digest.passageId, digest);
       else this.rollups.set(`${digest.kind}:${digest.targetId}`, digest);
     }
   }
 
-  scene(id: string): NarrativeScene | undefined { const at = this.position.get(id); return at === undefined ? undefined : this.order[at]; }
-  positionOf(id: string): number { return this.position.get(id) ?? -1; }
+  passage(id: string): Passage | undefined { const at = this.position.get(id); return at === undefined ? undefined : this.order[at]; }
+  scene(id: string): NarrativeScene | undefined { return this.scenes.get(id); }
+  /** The scene a passage belongs to. */
+  sceneOf(passageId: string): NarrativeScene | undefined { const passage = this.passage(passageId); return passage && this.scenes.get(passage.sceneId); }
+  /** 「雨夜对峙（2/3）」: the scene title, and which of its passages this is when the scene runs through several chapters. */
+  label(passageId: string): string { const passage = this.passage(passageId); return passage ? passageLabel(this.workspace, passage) : ''; }
+  positionOf(passageId: string): number { return this.position.get(passageId) ?? -1; }
   chapterIndex(id: string): number { return this.chapterPosition.get(id) ?? -1; }
+  /** Passages of a scene in reading order. */
+  scenePassages(sceneId: string): Passage[] { return this.order.filter(passage => passage.sceneId === sceneId); }
 
-  freshness(sceneId: string): Freshness {
-    const cached = this.freshnessCache.get(sceneId);
+  freshness(passageId: string): Freshness {
+    const cached = this.freshnessCache.get(passageId);
     if (cached) return cached;
-    const scene = this.scene(sceneId), digest = this.sceneDigests.get(sceneId);
+    const passage = this.passage(passageId), digest = this.passageDigests.get(passageId);
     let result: Freshness = 'extract';
-    if (scene?.text.trim() && digest) {
-      if (digest.textHash === sceneHash(this.index, sceneId)) result = 'fresh';
-      else if (sketchSimilarity(digest.sketch, textSketch(scene.text)) >= DRIFT_SIMILARITY) result = 'drifted';
+    if (passage?.text.trim() && digest) {
+      if (digest.textHash === passageHash(this.index, passageId)) result = 'fresh';
+      else if (sketchSimilarity(digest.sketch, textSketch(passage.text)) >= DRIFT_SIMILARITY) result = 'drifted';
     }
-    this.freshnessCache.set(sceneId, result);
+    this.freshnessCache.set(passageId, result);
     return result;
   }
-  digest(sceneId: string): SceneDigest | undefined { return this.freshness(sceneId) === 'extract' ? undefined : this.sceneDigests.get(sceneId); }
-  storedDigest(sceneId: string): SceneDigest | undefined { return this.sceneDigests.get(sceneId); }
+  digest(passageId: string): PassageDigest | undefined { return this.freshness(passageId) === 'extract' ? undefined : this.passageDigests.get(passageId); }
+  storedDigest(passageId: string): PassageDigest | undefined { return this.passageDigests.get(passageId); }
   rollup(kind: RollupDigest['kind'], id: string): RollupDigest | undefined { return this.rollups.get(`${kind}:${id}`); }
 
-  /** readerSafe omits titles and outlines (author material); digests themselves derive from prose only. */
-  sceneMemory(sceneId: string, readerSafe = false): SceneMemory {
-    const scene = this.scene(sceneId)!, digest = this.digest(sceneId), freshness = this.freshness(sceneId);
-    const title = readerSafe ? undefined : scene.title;
+  /** readerSafe omits titles, outlines and beats (author material); digests themselves derive from prose only. */
+  passageMemory(passageId: string, readerSafe = false): PassageMemory {
+    const passage = this.passage(passageId)!, scene = this.scenes.get(passage.sceneId), digest = this.digest(passageId), freshness = this.freshness(passageId);
+    const title = readerSafe ? undefined : this.label(passageId);
     if (digest) return { title, freshness, summary: digest.summary, events: digest.events, changes: digest.changes, facts: digest.facts };
-    const { opening, closing } = extractSummary(scene.text);
-    const parts = [!readerSafe && scene.outline.trim() ? `大纲：${clip(scene.outline.trim(), 120)}` : '', opening ? `开头：${opening}` : '', closing ? `结尾：${closing}` : ''].filter(Boolean);
+    const { opening, closing } = extractSummary(passage.text);
+    const plan = readerSafe ? '' : [scene?.outline.trim() ? `大纲：${clip(scene.outline.trim(), 120)}` : '', passage.beat?.trim() ? `本段：${clip(passage.beat.trim(), 80)}` : ''].filter(Boolean).join(' / ');
+    const parts = [plan, opening ? `开头：${opening}` : '', closing ? `结尾：${closing}` : ''].filter(Boolean);
     return { title, freshness, summary: parts.join(' / ') || (readerSafe ? '' : '（尚无正文）') };
   }
 
-  /** Scenes whose prose has no up-to-date digest, in reading order. */
-  pending(): NarrativeScene[] { return this.order.filter(scene => scene.text.trim() && this.freshness(scene.id) !== 'fresh'); }
+  /** Passages whose prose has no up-to-date digest, in reading order. */
+  pending(): Passage[] { return this.order.filter(passage => passage.text.trim() && this.freshness(passage.id) !== 'fresh'); }
   coverage() {
-    let scenesWithText = 0, fresh = 0, drifted = 0, pendingChars = 0;
-    for (const scene of this.order) {
-      if (!scene.text.trim()) continue;
-      scenesWithText++;
-      const freshness = this.freshness(scene.id);
-      if (freshness === 'fresh') fresh++; else { if (freshness === 'drifted') drifted++; pendingChars += scene.text.length; }
+    let passagesWithText = 0, fresh = 0, drifted = 0, pendingChars = 0;
+    for (const passage of this.order) {
+      if (!passage.text.trim()) continue;
+      passagesWithText++;
+      const freshness = this.freshness(passage.id);
+      if (freshness === 'fresh') fresh++; else { if (freshness === 'drifted') drifted++; pendingChars += passage.text.length; }
     }
-    return { scenesWithText, fresh, drifted, pending: scenesWithText - fresh, pendingChars };
+    return { passagesWithText, fresh, drifted, pending: passagesWithText - fresh, pendingChars };
   }
 
-  /** Hash of the digests a chapter rollup summarises; undefined until every written scene has one. */
-  chapterInput(chapterId: string): { hash: string; scenes: Array<{ summary: string; events: string[] }> } | undefined {
-    const scenes = this.order.filter(scene => scene.chapterId === chapterId && scene.text.trim());
-    if (!scenes.length || scenes.some(scene => !this.digest(scene.id))) return undefined;
-    const value = scenes.map(scene => { const digest = this.digest(scene.id)!; return { summary: digest.summary, events: digest.events }; });
-    return { hash: textHash(JSON.stringify(value)), scenes: value };
+  /** Hash of the digests a chapter rollup summarises; undefined until every written passage has one. */
+  chapterInput(chapterId: string): { hash: string; passages: Array<{ summary: string; events: string[] }> } | undefined {
+    const passages = this.order.filter(passage => passage.chapterId === chapterId && passage.text.trim());
+    if (!passages.length || passages.some(passage => !this.digest(passage.id))) return undefined;
+    const value = passages.map(passage => { const digest = this.digest(passage.id)!; return { summary: digest.summary, events: digest.events }; });
+    return { hash: textHash(JSON.stringify(value)), passages: value };
   }
   chapterSummary(chapterId: string, readerSafe = false): { summary: string; freshness: Freshness } {
     const rollup = this.rollup('chapter', chapterId);
     if (rollup) return { summary: rollup.summary, freshness: rollup.inputHash === this.chapterInput(chapterId)?.hash ? 'fresh' : 'drifted' };
     const chapter = this.chapters[this.chapterIndex(chapterId)];
-    const joined = this.order.filter(scene => scene.chapterId === chapterId && scene.text.trim()).map(scene => this.sceneMemory(scene.id, readerSafe).summary).join(' ');
+    const joined = this.order.filter(passage => passage.chapterId === chapterId && passage.text.trim()).map(passage => this.passageMemory(passage.id, readerSafe).summary).join(' ');
     return { summary: clip(joined || (!readerSafe ? chapter?.summary ?? '' : ''), 300), freshness: 'extract' };
   }
 
@@ -147,7 +159,7 @@ export class StoryView {
   volumeOf(chapterId: string): Volume | undefined { return this.volumes().find(volume => volume.chapterIds.includes(chapterId)); }
   volumeInput(volumeId: string): { hash: string; chapters: Array<{ title: string; summary: string }> } | undefined {
     const volume = this.volumes().find(item => item.id === volumeId);
-    const chapters = volume?.chapterIds.map(id => ({ id, rollup: this.rollup('chapter', id) })).filter(item => item.rollup || this.order.some(scene => scene.chapterId === item.id && scene.text.trim()));
+    const chapters = volume?.chapterIds.map(id => ({ id, rollup: this.rollup('chapter', id) })).filter(item => item.rollup || this.order.some(passage => passage.chapterId === item.id && passage.text.trim()));
     if (!chapters?.length || chapters.some(item => !item.rollup)) return undefined;
     const value = chapters.map(item => ({ title: this.chapters[this.chapterIndex(item.id)]!.title, summary: item.rollup!.summary }));
     return { hash: textHash(JSON.stringify(value)), chapters: value };
@@ -166,10 +178,10 @@ export class StoryView {
   }
   bookSummary(): string { return this.rollup('book', this.workspace.id)?.summary ?? ''; }
 
-  /** Threads opened and not yet closed before this scene (or anywhere when omitted), oldest first. A thread worded like one
+  /** Threads opened and not yet closed before this passage (or anywhere when omitted), oldest first. A thread worded like one
    * already open is merged into it (closing either closes it, and it is major if either is). */
-  ledgerBefore(sceneId?: string): LedgerThread[] {
-    const end = sceneId === undefined ? this.order.length : Math.max(0, this.positionOf(sceneId));
+  ledgerBefore(passageId?: string): LedgerThread[] {
+    const end = passageId === undefined ? this.order.length : Math.max(0, this.positionOf(passageId));
     const open = new Map<string, LedgerThread>(), alias = new Map<string, string>();
     const terms = new Map<string, Set<string>>(), postings = new Map<string, Set<string>>();
     const remove = (id: string) => {
@@ -177,9 +189,9 @@ export class StoryView {
       terms.delete(id); open.delete(id);
     };
     for (let index = 0; index < end; index++) {
-      const scene = this.order[index]!, digest = this.digest(scene.id);
+      const passage = this.order[index]!, digest = this.digest(passage.id);
       if (!digest) continue;
-      const chapterIndex = this.chapterIndex(scene.chapterId), hits = new Map<string, number>();
+      const chapterIndex = this.chapterIndex(passage.chapterId), hits = new Map<string, number>();
       for (const term of termSet([digest.summary, ...digest.events].join(' '))) for (const id of postings.get(term) ?? []) hits.set(id, (hits.get(id) ?? 0) + 1);
       for (const [id, count] of hits) if (count * 2 >= terms.get(id)!.size) open.set(id, { ...open.get(id)!, lastChapterIndex: chapterIndex });
       for (const id of digest.threadsClosed) remove(alias.get(id) ?? id);
@@ -192,7 +204,7 @@ export class StoryView {
           if (thread.major && !open.get(same)!.major) open.set(same, { ...open.get(same)!, major: true });
           continue;
         }
-        open.set(thread.id, { ...thread, sceneId: scene.id, chapterIndex, lastChapterIndex: chapterIndex });
+        open.set(thread.id, { ...thread, passageId: passage.id, chapterIndex, lastChapterIndex: chapterIndex });
         terms.set(thread.id, own);
         for (const term of own) { let posting = postings.get(term); if (!posting) postings.set(term, posting = new Set()); posting.add(thread.id); }
       }
@@ -200,23 +212,23 @@ export class StoryView {
     return [...open.values()];
   }
 
-  lastAppearanceBefore(objectId: string, sceneId: string): { scene: NarrativeScene; mention: Mention } | undefined {
-    for (let index = this.positionOf(sceneId) - 1; index >= 0; index--) {
-      const scene = this.order[index]!, mention = sceneMentions(this.index, scene.id).get(objectId);
-      if (mention) return { scene, mention };
+  lastAppearanceBefore(objectId: string, passageId: string): { passage: Passage; mention: Mention } | undefined {
+    for (let index = this.positionOf(passageId) - 1; index >= 0; index--) {
+      const passage = this.order[index]!, mention = passageMentions(this.index, passage.id).get(objectId);
+      if (mention) return { passage, mention };
     }
     return undefined;
   }
-  timeline(objectId: string): Array<{ scene: NarrativeScene; mention: Mention }> {
-    return this.order.flatMap(scene => { const mention = sceneMentions(this.index, scene.id).get(objectId); return mention ? [{ scene, mention }] : []; });
+  timeline(objectId: string): Array<{ passage: Passage; mention: Mention }> {
+    return this.order.flatMap(passage => { const mention = passageMentions(this.index, passage.id).get(objectId); return mention ? [{ passage, mention }] : []; });
   }
   mentionCounts(): Map<string, number> {
     const counts = new Map<string, number>();
-    for (const scene of this.order) for (const [id, mention] of sceneMentions(this.index, scene.id)) counts.set(id, (counts.get(id) ?? 0) + mention.count);
+    for (const passage of this.order) for (const [id, mention] of passageMentions(this.index, passage.id)) counts.set(id, (counts.get(id) ?? 0) + mention.count);
     return counts;
   }
   /** The latest chapter that has prose: the default focus when no target is given. */
-  frontierChapterId(): string | undefined { return [...this.order].reverse().find(scene => scene.text.trim())?.chapterId ?? this.chapters[0]?.id; }
+  frontierChapterId(): string | undefined { return [...this.order].reverse().find(passage => passage.text.trim())?.chapterId ?? this.chapters[0]?.id; }
 
   /** Chapters within `radius` of the anchor in full, plus a sparse skeleton of the rest. */
   focusChapters(anchorChapterId: string | undefined, radius: number, skeleton = 12): { near: Chapter[]; skeleton: Chapter[]; omitted: number } {
@@ -229,12 +241,12 @@ export class StoryView {
   }
 }
 
-export const storyNotice = '故事记忆是由正文生成的辅助摘要，不是正式事实；与原文冲突时以原文和领域记录为准。drifted 表示摘要基于该场较早版本。';
+export const storyNotice = '故事记忆是由正文生成的辅助摘要，不是正式事实；与原文冲突时以原文和领域记录为准。drifted 表示摘要基于该段较早版本。';
 
-/** Layered "story so far" for a scene: book → earlier volumes → recent chapters → earlier scenes of this chapter. */
-export function storySoFar(view: StoryView, sceneId: string, options: { readerSafe?: boolean; recentChapters?: number; exclude?: Set<string> } = {}) {
-  const scene = view.scene(sceneId)!, readerSafe = !!options.readerSafe;
-  const chapterAt = view.chapterIndex(scene.chapterId), volume = view.volumeOf(scene.chapterId);
+/** Layered "story so far" for a passage: book → earlier volumes → recent chapters → earlier passages of this chapter. */
+export function storySoFar(view: StoryView, passageId: string, options: { readerSafe?: boolean; recentChapters?: number; exclude?: Set<string> } = {}) {
+  const passage = view.passage(passageId)!, readerSafe = !!options.readerSafe;
+  const chapterAt = view.chapterIndex(passage.chapterId), volume = view.volumeOf(passage.chapterId);
   const volumes = view.volumes(), volumeAt = volume ? volumes.indexOf(volume) : volumes.length;
   const recentCount = options.recentChapters ?? 5;
   const earlierChapters = view.chapters.slice(0, chapterAt);
@@ -249,16 +261,16 @@ export function storySoFar(view: StoryView, sceneId: string, options: { readerSa
     ...(volumeAt > 8 ? { omittedVolumes: volumeAt - 8 } : {}),
     currentVolumeEarlierChapters: inVolume.map(chapter => chapterLine(chapter, 120)).filter(item => item.summary),
     recentChapters: recent.map(chapter => chapterLine(chapter, 300)),
-    thisChapterEarlierScenes: view.order.slice(0, view.positionOf(sceneId)).filter(item => item.chapterId === scene.chapterId && !options.exclude?.has(item.id)).slice(-12)
-      .map(item => { const memory = view.sceneMemory(item.id, readerSafe); return { ...memory, summary: clip(memory.summary, 240) }; }),
+    thisChapterEarlierPassages: view.order.slice(0, view.positionOf(passageId)).filter(item => item.chapterId === passage.chapterId && !options.exclude?.has(item.id)).slice(-12)
+      .map(item => { const memory = view.passageMemory(item.id, readerSafe); return { ...memory, summary: clip(memory.summary, 240) }; }),
   };
 }
 
-/** Open threads before the scene: those naming the given people/things, then major threads, then recently active ones, newest first;
+/** Open threads before the passage: those naming the given people/things, then major threads, then recently active ones, newest first;
  * stale minor threads (see THREAD_EXPIRY_CHAPTERS) come last, so they no longer crowd out live ones. */
-export function openThreads(view: StoryView, sceneId: string | undefined, names: string[], limit = 15): StoryThread[] {
-  const open = view.ledgerBefore(sceneId).reverse();
-  const here = sceneId ? view.chapterIndex(view.scene(sceneId)?.chapterId ?? '') : view.chapters.length - 1;
+export function openThreads(view: StoryView, passageId: string | undefined, names: string[], limit = 15): StoryThread[] {
+  const open = view.ledgerBefore(passageId).reverse();
+  const here = passageId ? view.chapterIndex(view.passage(passageId)?.chapterId ?? '') : view.chapters.length - 1;
   const relevant = open.filter(thread => names.some(name => name && thread.title.includes(name)));
   const live = open.filter(thread => here - thread.lastChapterIndex <= THREAD_EXPIRY_CHAPTERS);
   return [...new Set([...relevant, ...open.filter(thread => thread.major), ...live, ...open])].slice(0, limit).map(({ id, title, major }) => ({ id, title, ...(major ? { major } : {}) }));
@@ -276,17 +288,17 @@ export function ledgerForDigest(open: LedgerThread[], prose: string, limit = 60)
 }
 
 /** Where each entity was last seen, when that is outside the window the caller already shows in full. */
-export function entityRecall(view: StoryView, sceneId: string, objectIds: string[], shown: Set<string>, limit = 8) {
-  const result: Array<{ objectId: string; name: string; lastSeen: { sceneId: string; chapter: string; scene: string; summary: string }; excerpt: string; scenesAgo: number }> = [];
+export function entityRecall(view: StoryView, passageId: string, objectIds: string[], shown: Set<string>, limit = 8) {
+  const result: Array<{ objectId: string; name: string; lastSeen: { passageId: string; chapter: string; scene: string; summary: string }; excerpt: string; passagesAgo: number }> = [];
   for (const objectId of [...new Set(objectIds)]) {
     if (result.length >= limit) break;
     const object = view.workspace.objects.find(item => item.id === objectId);
-    const last = object && view.lastAppearanceBefore(objectId, sceneId);
-    if (!object || !last || shown.has(last.scene.id)) continue;
-    const memory = view.sceneMemory(last.scene.id);
+    const last = object && view.lastAppearanceBefore(objectId, passageId);
+    if (!object || !last || shown.has(last.passage.id)) continue;
+    const memory = view.passageMemory(last.passage.id);
     result.push({ objectId, name: object.name,
-      lastSeen: { sceneId: last.scene.id, chapter: view.chapters[view.chapterIndex(last.scene.chapterId)]?.title ?? '', scene: last.scene.title, summary: clip(memory.summary, 200) },
-      excerpt: mentionExcerpt(last.scene.text, last.mention).text, scenesAgo: view.positionOf(sceneId) - view.positionOf(last.scene.id) });
+      lastSeen: { passageId: last.passage.id, chapter: view.chapters[view.chapterIndex(last.passage.chapterId)]?.title ?? '', scene: view.label(last.passage.id), summary: clip(memory.summary, 200) },
+      excerpt: mentionExcerpt(last.passage.text, last.mention).text, passagesAgo: view.positionOf(passageId) - view.positionOf(last.passage.id) });
   }
   return result;
 }

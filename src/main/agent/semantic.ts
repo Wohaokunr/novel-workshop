@@ -8,18 +8,18 @@ const EMBED_BATCH = 64;
 const DEMO_DIMENSIONS = 256;
 const RELATIVE_FLOOR = 0.7;
 
-export interface SemanticHit { sceneId: string; start: number; end: number; similarity: number }
-export interface VectorChunk { sceneId: string; start: number; end: number; text: string; textHash: string }
+export interface SemanticHit { passageId: string; start: number; end: number; similarity: number }
+export interface VectorChunk { passageId: string; start: number; end: number; text: string; textHash: string }
 
 /** The paragraph chunks of the keyword index, with the hash that tells whether a stored vector still describes them. */
 export function vectorChunks(workspace: Workspace): VectorChunk[] {
   const index = storyIndex(workspace);
-  return workspace.scenes.flatMap(scene => (index.scenes.get(scene.id)?.chunks ?? []).map(id => {
-    const chunk = index.chunks.get(id)!, text = scene.text.slice(chunk.start, chunk.end);
-    return { sceneId: scene.id, start: chunk.start, end: chunk.end, text, textHash: textHash(text) };
+  return workspace.passages.flatMap(passage => (index.passages.get(passage.id)?.chunks ?? []).map(id => {
+    const chunk = index.chunks.get(id)!, text = passage.text.slice(chunk.start, chunk.end);
+    return { passageId: passage.id, start: chunk.start, end: chunk.end, text, textHash: textHash(text) };
   }));
 }
-const key = (chunk: { sceneId: string; start: number }) => `${chunk.sceneId}:${chunk.start}`;
+const key = (chunk: { passageId: string; start: number }) => `${chunk.passageId}:${chunk.start}`;
 
 /** Embeds chunks that have no current vector and drops vectors of chunks that no longer exist. Returns the coverage afterwards. */
 export async function indexVectors(store: NovelStore, projectId: string, embedder: EmbeddingTransport, model: string, signal: AbortSignal,
@@ -50,20 +50,20 @@ function cosine(a: Float32Array, b: number[]): number {
   return left && right ? dot / Math.sqrt(left * right) : 0;
 }
 
-/** Chunks closest in meaning to the query vector, at most two per scene, and only those within RELATIVE_FLOOR of the best match:
+/** Chunks closest in meaning to the query vector, at most two per passage, and only those within RELATIVE_FLOOR of the best match:
  * similarity scales differ between models, so the cut is relative. A vector counts only while its chunk text is unchanged in this
- * (possibly candidate) workspace, and `allowed` filters scenes before scoring. */
+ * (possibly candidate) workspace, and `allowed` filters passages before scoring. */
 export function nearestChunks(store: NovelStore, workspace: Workspace, model: string, query: number[], options: { allowed?: Set<string>; limit: number }): SemanticHit[] {
-  const texts = new Map(workspace.scenes.map(scene => [scene.id, scene.text]));
+  const texts = new Map(workspace.passages.map(passage => [passage.id, passage.text]));
   const scored = store.getStoryVectors(workspace.id, model).flatMap(row => {
-    const text = texts.get(row.sceneId);
-    if (text === undefined || (options.allowed && !options.allowed.has(row.sceneId)) || row.vector.length !== query.length || textHash(text.slice(row.start, row.end)) !== row.textHash) return [];
-    return [{ sceneId: row.sceneId, start: row.start, end: row.end, similarity: cosine(row.vector, query) }];
+    const text = texts.get(row.passageId);
+    if (text === undefined || (options.allowed && !options.allowed.has(row.passageId)) || row.vector.length !== query.length || textHash(text.slice(row.start, row.end)) !== row.textHash) return [];
+    return [{ passageId: row.passageId, start: row.start, end: row.end, similarity: cosine(row.vector, query) }];
   }).sort((a, b) => b.similarity - a.similarity).filter((hit, _index, all) => hit.similarity > 0 && hit.similarity >= all[0]!.similarity * RELATIVE_FLOOR);
-  const perScene = new Map<string, number>(), result: SemanticHit[] = [];
+  const perPassage = new Map<string, number>(), result: SemanticHit[] = [];
   for (const hit of scored) {
-    if ((perScene.get(hit.sceneId) ?? 0) >= 2) continue;
-    perScene.set(hit.sceneId, (perScene.get(hit.sceneId) ?? 0) + 1); result.push(hit);
+    if ((perPassage.get(hit.passageId) ?? 0) >= 2) continue;
+    perPassage.set(hit.passageId, (perPassage.get(hit.passageId) ?? 0) + 1); result.push(hit);
     if (result.length >= options.limit) break;
   }
   return result;

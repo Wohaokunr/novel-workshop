@@ -1,11 +1,13 @@
 import { createContext, useContext, useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { Check, CircleAlert, MoreHorizontal, NotebookPen, X } from 'lucide-react';
 import type { Workspace, Command, RunRequest, AgentRun, AssistTool, SourceReference } from '../shared/types';
+import { orderedChapters, orderedPassages, orderedScenes, scenePassages } from '../shared/structure';
 
 export type Commit = (commands: Command[] | ((workspace: Workspace) => Command[]), label?: string) => Promise<Workspace>;
 export interface TaskDraft {
   stage: RunRequest['stage']; tool: AssistTool; objective: string; references: SourceReference[];
-  sceneId?: string; chapterScope: 'scene' | 'chapter'; selection?: { start: number; end: number; text: string };
+  /** The prose a chapter or rewrite task writes: one scene's passage in one chapter. */
+  passageId?: string; chapterScope: 'scene' | 'chapter'; selection?: { start: number; end: number; text: string };
 }
 export const SaveFeedbackContext = createContext<(id: string, status: 'editing' | 'saving' | 'error' | 'conflict' | null, pending?: Promise<unknown>) => void>(() => {});
 export class ActionCancelled extends Error { constructor() { super('操作已取消'); } }
@@ -29,13 +31,20 @@ export const statuses: Record<AgentRun['status'],string> = { queued:'等待中',
 export const taskObjective = (stage: RunRequest['stage'], tool: AssistTool = 'canvas', scope: 'scene' | 'chapter' = 'scene') => ({
   agent: '', idea: '根据作品设定和引用资料发散构思，形成可发展的小说方向。',
   outline: '根据引用资料、人物和世界事实编排事件与叙述场景。',
-  chapter: scope === 'scene' ? '根据当前场景大纲和人物视角生成正文，保留其他场景。' : '按顺序完成目标章节中尚未写作的场景正文，保留已有正文。',
+  chapter: scope === 'scene' ? '根据场景大纲、本段要点和人物视角生成正文，保留其他场景。' : '按顺序完成目标章节中尚未写作的场景正文，保留已有正文。',
   rewrite: '改写所选文字，保持人物与已发生事件一致，保留选段之外的正文。', assist: assistTools[tool].objective,
 }[stage]);
 export const characters = (w: Workspace) => w.objects.filter(o => o.typeId === 'character');
-export const orderedChapters = (w: Workspace) => [...w.chapters].sort((a,b)=>a.order-b.order);
-export const orderedScenes = (w: Workspace) => orderedChapters(w).flatMap(c => w.scenes.filter(s=>s.chapterId===c.id).sort((a,b)=>a.order-b.order));
-export const sceneFor = (w: Workspace, id: string) => w.scenes.find(s=>s.id===id)||orderedScenes(w)[0];
+export { orderedChapters, orderedPassages, orderedScenes };
+/** The passage the writer shows: the selected one, else the first in reading order. */
+export const passageFor = (w: Workspace, id: string) => w.passages.find(p=>p.id===id)||orderedPassages(w)[0];
+/** Where a scene is read, for labels: its chapter, 「第3章 等 2 章」 when it runs on, or 未排入章节. */
+export const sceneChapters = (w: Workspace, sceneId: string) => {
+  const titles = [...new Set(scenePassages(w, sceneId).map(p=>w.chapters.find(c=>c.id===p.chapterId)?.title??''))];
+  return !titles.length ? '未排入章节' : titles.length > 1 ? `${titles[0]} 等 ${titles.length} 章` : titles[0]!;
+};
+/** A scene's prose across the chapters it runs through. */
+export const sceneProse = (w: Workspace, sceneId: string) => scenePassages(w, sceneId).map(p=>p.text).filter(text=>text.trim()).join('\n\n');
 export const events = (w: Workspace) => w.objects.filter(o=>o.event).sort((a,b)=>a.event!.worldOrder-b.event!.worldOrder);
 export const showValue = (v: unknown) => typeof v === 'string' ? v : JSON.stringify(v, null, 2);
 

@@ -109,5 +109,5 @@ test('提示词独立成文件：id 唯一、版本由文本计算，写作步�
   for (const item of PROMPTS) { assert.ok(item.text.trim()); assert.equal(item.version, promptVersion(item.text)); }
   assert.notEqual(prompt('x', 'a').version, prompt('x', 'b').version);
   const mist = BENCHMARK[0]!, result = await runTask(mist, mist.tasks[0]!, compliant() as never);
-  assert.equal(result.promptVersion, promptVersion(`${writerPrompt.text}\n${writerScopePrompts.scene.text}`));
+  assert.equal(result.promptVersion, promptVersion(`${writerPrompt.text}\n${writerScopePrompts.passage.text}`));
 });
