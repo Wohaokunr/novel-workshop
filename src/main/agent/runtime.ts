@@ -9,7 +9,7 @@ import { addUsage, AgentSuspended, emptyUsage, OutputLimitError, runAgent, runti
 import { bookSources, boundedContext, changeSources, collectContext, compactChanges, filteredScenes, fingerprint, refreshMemories, searchContext, selectAuthorRules } from './memory.js';
 import { nearestChunks, type SemanticHit } from './semantic.js';
 import { assertWriteScope, canProposeCommands, canReadAuthor, chainWriterNodes, createBudget, PLAN_ROLES, touchesProse, validatePlan } from './policy.js';
-import { specialistDefinition, type SpecialistDefinition } from './specialists.js';
+import { reviewOutcome, specialistDefinition, type SpecialistDefinition } from './specialists.js';
 import { createCoordinatorTools, toolDefinitions, type ToolName } from './tools.js';
 import { sceneMentions } from './story-index.js';
 import { StoryView } from './story-view.js';
@@ -35,6 +35,10 @@ export const MAX_OUTPUT_REPAIRS = 2;
 const REPAIR_NOTICE = '运行时校验未通过：';
 /** Dependency conclusions handed to a dependent node: the nearest few, each clipped. */
 const MAX_UPSTREAM = 6, UPSTREAM_TEXT_CHARS = 1500;
+/** Automatic revisions of reviewed prose before the candidate goes to the author; the coordinator may still revise up to maxRevisions. */
+export const AUTO_REVISIONS = 1;
+/** Chapters a candidate's reader review covers, latest first. */
+const READER_REVIEW_CHAPTERS = 3;
 function commandsOf(artifact: AgentArtifact): Command[] { return (artifact.structured as { commands?: Command[] } | undefined)?.commands ?? []; }
 function clipText(text: string, length: number) { return text.length > length ? `${text.slice(0, length)}…` : text; }
 /** A dependency's conclusion without its raw commands; writer prose is pointed to in the workspace when it was folded in. */
@@ -833,29 +837,32 @@ export class PersistentAgentRuntime {
       const node: PlanNode = { id: `review-${candidate.hash}`, role: 'continuity', objective: '检查这组候选修改的因果、人物认知、正文与设定一致性；只报告可指出依据的实际问题。', dependsOn: [], acceptance: '给出具体问题和 pass/revise', status: 'running' };
       const changed = candidate.changes.filter(change => change.collection === 'scenes' && change.after !== undefined).map(change => change.key);
       const artifact = await this.specialist(entry, node, `review:${candidate.hash}:continuity`, candidate.workspace, changed);
-      const review = artifact.structured as { verdict: 'pass' | 'revise'; issues: string[]; recommendation: string };
-      candidate.reviews = [{ candidateHash: candidate.hash, role: 'continuity', ...review, sources: artifact.sources, stepId: artifact.stepId }];
+      candidate.reviews = [{ candidateHash: candidate.hash, role: 'continuity', ...reviewOutcome(artifact.structured), sources: artifact.sources, stepId: artifact.stepId }];
+      const story = this.story(candidate.workspace);
       const scenes = candidate.workspace.scenes.filter(scene => candidate.changes.some(change => change.collection === 'scenes' && change.key === scene.id
-        && (change.before as { text?: string } | undefined)?.text !== scene.text && scene.text.trim()));
+        && (change.before as { text?: string } | undefined)?.text !== scene.text && scene.text.trim()))
+        .sort((a, b) => story.positionOf(a.id) - story.positionOf(b.id));
       if (scenes.length) {
-        const scene = scenes[0]!;
-        const readerNode: PlanNode = { ...node, id: `reader-${candidate.hash}`, role: 'reader', sceneId: scene.id, chapterId: scene.chapterId };
-        const reader = await this.specialist(entry, readerNode, `review:${candidate.hash}:reader`, candidate.workspace);
-        const opinion = reader.structured as typeof review;
-        candidate.reviews.push({ candidateHash: candidate.hash, role: 'reader', ...opinion, sources: reader.sources, stepId: reader.stepId });
+        // A reader sees a chapter up to its target scene, so the last rewritten scene of each chapter covers the ones before it.
+        const lastPerChapter = [...new Map(scenes.map(scene => [scene.chapterId, scene])).values()].slice(-READER_REVIEW_CHAPTERS);
+        for (const [index, scene] of lastPerChapter.entries()) {
+          const readerNode: PlanNode = { ...node, id: `reader-${candidate.hash}${index ? `-${index}` : ''}`, role: 'reader', sceneId: scene.id, chapterId: scene.chapterId };
+          const reader = await this.specialist(entry, readerNode, `review:${candidate.hash}:reader${index ? `:${scene.chapterId}` : ''}`, candidate.workspace);
+          candidate.reviews.push({ candidateHash: candidate.hash, role: 'reader', ...reviewOutcome(reader.structured), sources: reader.sources, stepId: reader.stepId });
+        }
         // The author's voice is reviewed separately from story logic: does this read like them?
-        const styleNode: PlanNode = { ...node, id: `style-${candidate.hash}`, role: 'stylist', sceneId: scene.id, chapterId: scene.chapterId };
+        const styleNode: PlanNode = { ...node, id: `style-${candidate.hash}`, role: 'stylist', sceneId: scenes[0]!.id, chapterId: scenes[0]!.chapterId };
         const stylist = await this.specialist(entry, styleNode, `review:${candidate.hash}:style`, candidate.workspace, scenes.map(item => item.id));
-        const voice = stylist.structured as typeof review;
-        candidate.reviews.push({ candidateHash: candidate.hash, role: 'style', ...voice, sources: stylist.sources, stepId: stylist.stepId });
+        candidate.reviews.push({ candidateHash: candidate.hash, role: 'style', ...reviewOutcome(stylist.structured), sources: stylist.sources, stepId: stylist.stepId });
       }
       const needsRevision = candidate.reviews.some(review => review.verdict === 'revise');
       const remaining = Math.max(0, entry.state.budget.maxRevisions - entry.state.budget.revisions);
-      if (!needsRevision || !scenes.length || !remaining) return { candidateId: candidate.id, hash: candidate.hash, candidateHash: candidate.hash, reviews: candidate.reviews,
+      // One automatic pass on the must-fix issues; anything still open goes to the author with the reviews rather than another rewrite.
+      if (!needsRevision || !scenes.length || !remaining || entry.state.budget.revisions >= AUTO_REVISIONS) return { candidateId: candidate.id, hash: candidate.hash, candidateHash: candidate.hash, reviews: candidate.reviews,
         revisionsRemaining: remaining, nextAction: needsRevision && !scenes.length && remaining ? 'revise_candidate' : 'commit_candidate' };
-      const writers: PlanNode[] = scenes.map(scene => ({ id: `write-${scene.id}`, role: 'writer', objective: entry.run.objective,
+      const writers: PlanNode[] = scenes.map(scene => ({ id: `write-${scene.id}`, role: 'writer', objective: entry.run.objective, mode: 'patch',
         sceneId: scene.id, chapterId: scene.chapterId, dependsOn: [], acceptance: '落实当前候选的自动审查意见，保留授权范围以外的正文', status: 'pending' }));
-      await this.reviseCandidate(entry, candidate, writers, '根据 candidateReviews 中的一致性、读者与文风审查意见修订当前正文，保留成立的情节、作者方向与其他场景；文风意见落实到具体句子。', revisionCall);
+      await this.reviseCandidate(entry, candidate, writers, '按 candidateReviews 中【必须】的意见局部修订本场正文：只改被指出的句段，保留其余原文、成立的情节与作者方向；【建议】的意见有把握才改。', revisionCall);
       candidate = entry.state.candidates.at(-1)!;
     }
   }

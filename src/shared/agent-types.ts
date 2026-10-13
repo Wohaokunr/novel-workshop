@@ -22,6 +22,8 @@ export interface PlanNode {
   acceptance: string; status: 'pending' | 'running' | 'completed' | 'failed'; artifactId?: string;
   /** Why a failed node failed, as reported to the coordinator and the author. */
   error?: string;
+  /** patch: a writer revising written prose replaces only the passages the reviews point at. */
+  mode?: 'patch';
 }
 export interface AgentPlan { version: number; summary: string; nodes: PlanNode[] }
 export interface EvidenceSource { projectId: string; kind: string; id: string; hash: string; start?: number; end?: number }

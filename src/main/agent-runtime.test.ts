@@ -11,7 +11,7 @@ import { KEEP_FINISHED_SNAPSHOTS, NovelStore } from './store.js';
 import { DatabaseSync } from 'node:sqlite';
 import { NovelAgentScheduler } from './agents.js';
 import { DemoAgentTransport } from './agent/demo.js';
-import { checkCancelled, CONTINUE_NOTICE, ModelServiceError, type EmbeddingTransport, type ModelRequest, type ModelResponse, type ResponseTransport } from './responses.js';
+import { checkCancelled, CONTINUE_NOTICE, ModelServiceError, restoreProse, type EmbeddingTransport, type ModelRequest, type ModelResponse, type ResponseTransport } from './responses.js';
 import { indexVectors } from './agent/semantic.js';
 import type { AgentCheckpoint } from './responses.js';
 import type { PlanNode, UpstreamResult } from '../shared/agent-types.js';
@@ -19,6 +19,12 @@ import { MAX_EXPERIENCES, MAX_OUTPUT_REPAIRS } from './agent/runtime.js';
 
 const provider: ProviderSecret = { name: 'fixture', mode: 'mock', baseURL: 'https://example.invalid/v1', model: 'fixture', apiKey: '' };
 const waitingStates = ['awaitingApproval', 'awaitingInput', 'paused', 'failed', 'cancelled', 'completed'];
+const issue = (problem: string) => ({ quote: '', problem, fix: '补一句交代', severity: 'must' });
+/** A patch writer's answer: the whole current scene as the quote, with a line added at its end. */
+function patch(request: ModelRequest, addition: string): ModelResponse {
+  const text = String(restoreProse(request.input).scene.text);
+  return reply({ edits: [{ quote: text, replacement: `${text}${addition}` }], note: '' });
+}
 function reply(value: unknown): ModelResponse {
   return { id: randomUUID(), status: 'completed', output: [{ type: 'message', id: randomUUID(), role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: typeof value === 'string' ? value : JSON.stringify(value), annotations: [] }] }], usage: null };
 }
@@ -307,22 +313,21 @@ test('构思候选不经审查直接等待作者批准，批准前不写入', { 
   } finally { store.close(); }
 });
 
-for (const stillRevise of [false, true]) test(`自动审查直接驱动写作者修订：${stillRevise ? '修订两次仍有意见' : '一次修订后通过'}`, { timeout: 10000 }, async () => {
+for (const stillRevise of [false, true]) test(`自动审查直接驱动写作者局部修订：${stillRevise ? '修订一次仍有意见就交给作者' : '一次修订后通过'}`, { timeout: 10000 }, async () => {
   const store = new NovelStore(':memory:'); let revisions = 0;
   try {
     const project = scenes(store, ['', '作者保留的正文']);
     const h = harness(store, (request, signal, demo) => {
       if (request.agentId === 'continuity' || request.agentId === 'reader') {
-        return stream(reply({ verdict: stillRevise || revisions === 0 ? 'revise' : 'pass', issues: stillRevise || revisions === 0 ? ['说明谁在岸上接绳'] : [], recommendation: '交代救援站位' }));
+        return stream(reply({ verdict: stillRevise || revisions === 0 ? 'revise' : 'pass', issues: stillRevise || revisions === 0 ? [issue('说明谁在岸上接绳')] : [], recommendation: '交代救援站位' }));
       }
-      if (request.agentId === 'rewrite') {
-        const input = request.input.find(item => 'role' in item && item.role === 'user') as { content: string };
-        const { context, objective } = JSON.parse(input.content);
-        assert.match(objective, /审查意见修订当前正文/);
+      if (request.agentId === 'patch') {
+        const context = restoreProse(request.input);
+        assert.match(JSON.parse((request.input[0] as { content: string }).content).objective, /局部修订/);
         assert.ok(context.scene.text.trim(), '修订必须读取当前候选正文');
-        assert.ok(context.candidateReviews.some((review: { issues: string[] }) => review.issues.includes('说明谁在岸上接绳')));
+        assert.ok(context.candidateReviews.some((review: { issues: string[] }) => review.issues.some(text => text.includes('【必须】说明谁在岸上接绳'))));
         revisions++;
-        return stream(reply(`${context.scene.text}\n\n第${revisions}次修订：少年站在岸上接住了绳子。`));
+        return stream(patch(request, `\n\n第${revisions}次修订：少年站在岸上接住了绳子。`));
       }
       return demo.stream(request, signal);
     });
@@ -330,8 +335,9 @@ for (const stillRevise of [false, true]) test(`自动审查直接驱动写作者
     const pending = await wait(store, run);
     assert.equal(pending.status, 'awaitingApproval', pending.error ?? pending.runtime?.pauseReason ?? '');
     const candidate = pending.runtime!.candidates.at(-1)!;
-    assert.equal(revisions, stillRevise ? 2 : 1);
+    assert.equal(revisions, 1, '只自动修订一轮，仍有意见时交给作者');
     assert.equal(pending.runtime!.budget.revisions, revisions);
+    assert.equal(candidate.reviews.some(review => review.verdict === 'revise'), stillRevise);
     assert.equal(candidate.version, revisions + 1);
     assert.ok(h.requests.filter(request => request.agentId === 'coordinator').every(request => !request.input.some(item => item.type === 'function_call' && item.name === 'revise_candidate')), '自动修订不依赖协调模型调用修订工具');
     assert.ok(candidate.reviews.every(review => review.candidateHash === candidate.hash));
@@ -350,11 +356,8 @@ for (const ending of ['finish_run', 'text'] as const) test(`审查后${ending ==
   try {
     const project = scenes(store, ['', '保留正文']);
     const h = harness(store, (request, signal, demo) => {
-      if (request.agentId === 'continuity' || request.agentId === 'reader') return stream(reply({ verdict: 'revise', issues: ['站位仍可改进'], recommendation: '补足站位' }));
-      if (request.agentId === 'rewrite') {
-        const input = request.input.find(item => 'role' in item && item.role === 'user') as { content: string };
-        return stream(reply(`${JSON.parse(input.content).context.scene.text}\n少年在岸上接绳。`));
-      }
+      if (request.agentId === 'continuity' || request.agentId === 'reader') return stream(reply({ verdict: 'revise', issues: [issue('站位仍可改进')], recommendation: '补足站位' }));
+      if (request.agentId === 'patch') return stream(patch(request, '\n少年在岸上接绳。'));
       const last = request.input.at(-1);
       if (request.agentId === 'coordinator' && last?.type === 'function_call_output' && JSON.parse(String(last.output)).reviews) {
         return stream(ending === 'text' ? reply('候选仍有意见，尚未写入。') : tool('finish_run', { summary: '只生成了候选，尚未写入', artifactIds: [] }));
@@ -364,7 +367,7 @@ for (const ending of ['finish_run', 'text'] as const) test(`审查后${ending ==
     const run = h.start({ projectId: project.id, stage: 'chapter', sceneId: 'scene-0', objective: '生成正文' });
     const pending = await wait(store, run);
     assert.equal(pending.status, 'awaitingApproval', pending.runtime?.pauseReason ?? pending.error ?? '');
-    assert.equal(pending.runtime!.budget.revisions, 2, '先自动修订到上限，再交给作者');
+    assert.equal(pending.runtime!.budget.revisions, 1, '先自动修订一轮，再交给作者');
     assert.deepEqual(store.getProject(project.id), project);
     await h.scheduler.shutdown();
     const second = new NovelAgentScheduler(store, () => provider, () => {}); second.recover();
@@ -389,7 +392,7 @@ test('自动审查修订变长的选区候选仍只替换选区，作者批准�
         const call = output?.type === 'function_call_output' ? request.input.find(item => item.type === 'function_call' && item.call_id === output.call_id) : undefined;
         if (call?.type === 'function_call' && call.name === 'commit_candidate') return stream(reply('已完成作者决定。'));
       }
-      if (request.agentId === 'reader') return stream(reply({ verdict: writes === 1 ? 'revise' : 'pass', issues: writes === 1 ? ['选区动作不够清楚'] : [], recommendation: '明确动作' }));
+      if (request.agentId === 'reader') return stream(reply({ verdict: writes === 1 ? 'revise' : 'pass', issues: writes === 1 ? [issue('选区动作不够清楚')] : [], recommendation: '明确动作' }));
       if (request.agentId === 'rewrite') {
         const input = request.input.find(item => 'role' in item && item.role === 'user') as { content: string };
         const { context } = JSON.parse(input.content);
@@ -414,21 +417,20 @@ test('自动修订中暂停并重开，恢复当前轮次而不重复已生成�
     const project = scenes(store, ['', '原有正文']);
     const request: RunRequest = { projectId: project.id, stage: 'chapter', sceneId: 'scene-0', objective: '生成场景正文' };
     const intercept = (input: ModelRequest, signal: AbortSignal, demo: DemoAgentTransport) => {
-      if (input.agentId === 'continuity' || input.agentId === 'reader') return stream(reply({ verdict: 'revise', issues: ['救援站位应更明确'], recommendation: '明确站位' }));
-      if (input.agentId === 'rewrite') {
+      if (input.agentId === 'continuity' || input.agentId === 'reader') return stream(reply({ verdict: 'revise', issues: [issue('救援站位应更明确')], recommendation: '明确站位' }));
+      if (input.agentId === 'patch') {
         rewrites++;
-        if (block && rewrites === 2) return { events: (async function* () {
+        if (block && rewrites === 1) return { events: (async function* () {
           await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true })); checkCancelled(signal);
         })(), finalResponse: async () => reply('未完成请求不应使用') };
-        const user = input.input.find(item => 'role' in item && item.role === 'user') as { content: string };
-        return stream(reply(`${JSON.parse(user.content).context.scene.text}\n新的站位说明。`));
+        return stream(patch(input, '\n新的站位说明。'));
       }
       return demo.stream(input, signal);
     };
     const h = harness(store, intercept), run = h.start(request);
-    await until(store, run.id, () => rewrites === 2); await h.scheduler.pause(run.id); await h.scheduler.shutdown();
+    await until(store, run.id, () => rewrites === 1); await h.scheduler.pause(run.id); await h.scheduler.shutdown();
     const before = store.getAgentState(run.id)!;
-    assert.equal(before.candidates.length, 2); assert.equal(before.budget.revisions, 1);
+    assert.equal(before.candidates.length, 1); assert.equal(before.budget.revisions, 0);
     const savedCandidate = before.candidates.at(-1)!;
     store.close(); store = new NovelStore(filename); block = false;
     const demo = new DemoAgentTransport(request, project);
@@ -436,9 +438,9 @@ test('自动修订中暂停并重开，恢复当前轮次而不重复已生成�
     second.recover(); await second.resume(run.id, true);
     const pending = await wait(store, run);
     assert.equal(pending.status, 'awaitingApproval', pending.runtime?.pauseReason ?? pending.error ?? '');
-    assert.equal(rewrites, 3, '只重发被中断的第二轮请求');
-    assert.equal(pending.runtime!.candidates.length, 3); assert.equal(pending.runtime!.budget.revisions, 2);
-    assert.equal(pending.runtime!.candidates[1]!.hash, savedCandidate.hash);
+    assert.equal(rewrites, 2, '只重发被中断的修订请求');
+    assert.equal(pending.runtime!.candidates.length, 2); assert.equal(pending.runtime!.budget.revisions, 1);
+    assert.equal(pending.runtime!.candidates[0]!.hash, savedCandidate.hash);
     assert.equal(pending.steps.filter(step => step.agentId === 'writer').length, 1);
     assert.deepEqual(store.getProject(project.id), project);
     const candidate = pending.runtime!.candidates.at(-1)!;

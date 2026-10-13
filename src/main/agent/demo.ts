@@ -5,17 +5,14 @@ import type { PlanNode } from '../../shared/agent-types.js';
 import { demoAssist, demoIdea, demoOutline, demoText } from '../agents.js';
 import { applyCommands } from '../domain.js';
 import { resolveReferences } from '../context.js';
-import { checkCancelled, type ModelRequest, type ModelResponse, type ResponseTransport } from '../responses.js';
+import { checkCancelled, restoreProse, type ModelRequest, type ModelResponse, type ResponseTransport } from '../responses.js';
 
 type Call = Extract<ResponseOutputItem, { type: 'function_call' }>;
 function message(value: unknown): ResponseOutputItem {
   return { type: 'message', id: randomUUID(), role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: typeof value === 'string' ? value : JSON.stringify(value), annotations: [] }] };
 }
 function invoke(name: string, args: unknown): Call { return { type: 'function_call', id: randomUUID(), call_id: randomUUID(), name, arguments: JSON.stringify(args) }; }
-function contextOf(request: ModelRequest): Record<string, any> {
-  const item = request.input.find(item => 'role' in item && item.role === 'user') as { content?: string } | undefined;
-  return typeof item?.content === 'string' ? JSON.parse(item.content).context ?? {} : {};
-}
+function contextOf(request: ModelRequest): Record<string, any> { return restoreProse(request.input); }
 
 /** Offline fixtures choose real runtime tools; they are not evidence of a live model's judgment. */
 export class DemoAgentTransport implements ResponseTransport {
@@ -104,14 +101,20 @@ export class DemoAgentTransport implements ResponseTransport {
     if (id === 'continuity' || id === 'reader') return { verdict: 'pass', issues: [], recommendation: '本地演示审查：信息边界与候选结构可继续核对。真实模型判断需要另行验证。' };
     if (id === 'stylist') {
       // Demo judgment comes from the local lint only: banned words and clichés ask for a revision.
-      const issues = (context.targetScenes ?? []).flatMap((scene: any) => (scene.lint ?? []).map((issue: any) => `${scene.title}：${issue.message}${issue.excerpt ? `（${issue.excerpt}）` : ''}`));
-      const blocking = issues.some((issue: string) => /禁用|AI 腔/.test(issue));
+      const issues = (context.targetScenes ?? []).flatMap((scene: any) => (scene.lint ?? []).map((issue: any) => ({ quote: issue.excerpt ?? '', problem: `${scene.title}：${issue.message}`,
+        fix: '按作者范文的句长与用词改写这一句', severity: /禁用|AI 腔/.test(issue.message) ? 'must' : 'should' })));
+      const blocking = issues.some((issue: { severity: string }) => issue.severity === 'must');
       return { verdict: blocking ? 'revise' : 'pass', issues: issues.slice(0, 6),
         recommendation: blocking ? '本地演示文风审阅：删去禁用词与套话，按作者范文的句长与节奏重写相关句子。' : '本地演示文风审阅：未发现明显偏离作者文风的句子。真实模型判断需要另行验证。' };
     }
     if (id === 'theme') return { question: '证据不足时，人是否愿意为信任承担风险？', choices: '只保护自己或共同承担未知风险', cost: '信任可能遭到背叛，拒绝可能失去解决困境的机会', expression: '用当场行动与选择代价表达，不安排说教独白。' };
     if (id.startsWith('character:')) return { perspective: `此刻我只能确认：${context.perception || '眼前线索不足'}。`, intention: '保护重视的人，先核实线索', action: '追问亲见亲闻的证据', uncertainty: '我不知道别人隐瞒的真相。' };
     if (id.startsWith('evolution:')) return { perspective: `承接此前判断，此刻只能确认：${context.character?.perception || '线索不足'}。`, psychology: '戒备中开始犹豫，但不确定对方的全部意图。', motivation: '用可核对的行动保护重视的人，逐步判断是否合作。', evidence: `${context.sceneEvidence?.some((scene: any) => scene.actualText) ? '正文：' : '计划：'}${context.sceneEvidence?.map((scene: any) => `${scene.title}「${String(scene.actualText || scene.outline || '').slice(0, 100)}」`).join('；') || '依据当前亲见亲闻，证据不足时保持此前状态。'}` };
+    if (id === 'patch') {
+      // Demo revision: one local edit that extends the scene's closing paragraph.
+      const text = String(context.scene?.text ?? ''), last = text.split('\n\n').filter(part => part.trim()).at(-1) ?? text;
+      return { edits: [{ quote: last, replacement: `${last}\n\n他停了一瞬，听见身后的脚步也停住。至少此刻，没人把他独自留在雾里。` }], note: '本地演示修订：只补写了结尾一段。' };
+    }
     if (id === 'writer' || id === 'rewrite' || id === 'revision') {
       const scene = context.scene;
       if (typeof context.selectedText === 'string') return `她把话咽了回去，指腹沿铜片的缺口缓缓移过。${context.selectedText}`;

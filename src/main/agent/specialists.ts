@@ -8,7 +8,7 @@ import { boundedContext, collectContext, sourceFor, sourcesForLabels } from './m
 import { UPSTREAM_ROLES, validatePlanTarget } from './policy.js';
 import { sceneMentions } from './story-index.js';
 import { STORY_OPS, storyOpsCommands } from './story-ops.js';
-import { characterPrompt, commandHelpPrompt, continuityPrompt, evolutionPrompt, proposalPrompts, readerPrompt, stylistPrompt, themePrompt, writerPrompt, writerScopePrompts } from '../prompts/specialists.js';
+import { characterPrompt, commandHelpPrompt, continuityPrompt, evolutionPrompt, proposalPrompts, readerPrompt, reviewFormatPrompt, stylistPrompt, themePrompt, writerPrompt, writerScopePrompts } from '../prompts/specialists.js';
 import type { CompanionOpKind } from '../../shared/companion-types.js';
 import { openThreads, StoryView } from './story-view.js';
 import { objectNames } from '../../shared/story-elements.js';
@@ -18,11 +18,45 @@ import { styleBaseline, styleLint } from '../../shared/style-metrics.js';
 
 export const READER_TEXT_CHARS = 12_000;
 export const EVIDENCE_TEXT_CHARS = 6_000;
+/** Prose a stylist or continuity review reads in full, shared among its target scenes; longer text keeps its head and tail. */
+export const REVIEW_TEXT_CHARS = 18_000;
 
 // Match the established agents.ts result schemas; no transport or provider-specific API is introduced.
 const string = { type: 'string' }, strings = { type: 'array', items: string };
 const perspectiveSchema = objectSchema({ perspective: string, intention: string, action: string, uncertainty: string });
-export const reviewSchema = objectSchema({ verdict: { type: 'string', enum: ['pass', 'revise'] }, issues: strings, recommendation: string });
+const reviewIssueSchema = objectSchema({ quote: string, problem: string, fix: string, severity: { type: 'string', enum: ['must', 'should'] } });
+export const reviewSchema = objectSchema({ verdict: { type: 'string', enum: ['pass', 'revise'] }, issues: { type: 'array', items: reviewIssueSchema }, recommendation: string });
+const patchSchema = objectSchema({ edits: { type: 'array', items: objectSchema({ quote: string, replacement: string }) }, note: string });
+export interface ReviewIssue { quote: string; problem: string; fix: string; severity: 'must' | 'should' }
+
+/** A reviewer's answer as stored on a candidate: only a must-fix issue asks for a revision, whatever verdict the model gave. */
+export function reviewOutcome(structured: unknown): { verdict: 'pass' | 'revise'; issues: string[]; recommendation: string } {
+  const review = structured as { verdict: 'pass' | 'revise'; issues: Array<ReviewIssue | string>; recommendation: string };
+  // Reviews recorded before issues were structured keep their wording and verdict when a run resumes.
+  if (review.issues.some(issue => typeof issue === 'string')) return { verdict: review.verdict, issues: review.issues.map(issue => typeof issue === 'string' ? issue : issue.problem), recommendation: review.recommendation };
+  const issues = [...review.issues as ReviewIssue[]].sort((a, b) => (a.severity === 'must' ? 0 : 1) - (b.severity === 'must' ? 0 : 1));
+  return { verdict: issues.some(issue => issue.severity === 'must') ? 'revise' : 'pass', recommendation: review.recommendation,
+    issues: issues.map(issue => `${issue.severity === 'must' ? '【必须】' : '【建议】'}${issue.quote ? `「${issue.quote}」` : ''}${issue.problem}${issue.fix ? `｜改法：${issue.fix}` : ''}`) };
+}
+/** Applies a patch writer's edits; every quote must occur exactly once in the current text, or the writer is asked again. */
+export function applyEdits(text: string, edits: Array<{ quote: string; replacement: string }>): string {
+  const problems: string[] = [];
+  const located = edits.map(edit => {
+    const at = edit.quote ? text.indexOf(edit.quote) : -1;
+    if (at < 0) problems.push(`找不到「${edit.quote.slice(0, 40)}」`);
+    else if (text.indexOf(edit.quote, at + 1) >= 0) problems.push(`「${edit.quote.slice(0, 40)}」在正文中出现不止一次，请摘录更长的一段`);
+    return { ...edit, at };
+  }).filter(edit => edit.at >= 0).sort((a, b) => a.at - b.at);
+  for (let index = 1; index < located.length; index++) if (located[index]!.at < located[index - 1]!.at + located[index - 1]!.quote.length) problems.push(`「${located[index]!.quote.slice(0, 40)}」与另一条 edit 重叠，请合并`);
+  if (problems.length) throw new DomainValidationError(`edits 的 quote 必须逐字摘自当前正文且只出现一次：${problems.join('；')}`);
+  let result = '', cursor = 0;
+  for (const edit of located) { result += text.slice(cursor, edit.at) + edit.replacement; cursor = edit.at + edit.quote.length; }
+  return result + text.slice(cursor);
+}
+/** A scene's prose within a review budget: whole when it fits, otherwise head and tail around a marked gap. */
+function reviewText(text: string, limit: number): string {
+  return text.length > limit ? `${text.slice(0, limit / 2)}\n……（中间 ${text.length - limit} 字略）……\n${text.slice(-limit / 2)}` : text;
+}
 const themeSchema = objectSchema({ question: string, choices: string, cost: string, expression: string });
 const stateSchema = objectSchema({ perspective: string, psychology: string, motivation: string, evidence: string });
 const proposalSchema = objectSchema({ summary: string, commandsJson: string, opsJson: string });
@@ -125,7 +159,7 @@ export function specialistDefinition(specialist: SpecialistRequest & { story?: S
     const target = readerTarget(project, request, sceneId, node.chapterId);
     const context = buildReaderContext(project, target.chapterId, target.sceneId);
     const chapters = [...project.chapters].filter(chapter => chapter.order <= project.chapters.find(item => item.id === target.chapterId)!.order);
-    return { definition: proseDefinition('reader', '读者 · 正文审阅', readerPrompt.text, reviewSchema),
+    return { definition: proseDefinition('reader', '读者 · 正文审阅', `${readerPrompt.text}\n${reviewFormatPrompt.text}`, reviewSchema),
       context: boundedContext({ title: context.title, earlierStory: readerEarlierStory(story, context.sources, context.text.length), text: context.text.slice(-READER_TEXT_CHARS),
         omitted: { earlierVisibleChars: Math.max(0, context.text.length - READER_TEXT_CHARS), notice: '这里只包含已呈现正文；earlierStory 是较早已读正文的摘要。未读后文和作者目标/设定未提供。' } }, undefined, ['text']),
       objective: '从读者视角审阅可见正文，给出 pass/revise、具体问题与修订建议。',
@@ -135,6 +169,14 @@ export function specialistDefinition(specialist: SpecialistRequest & { story?: S
     const scene = structuredClone(project.scenes.find(item => item.id === sceneId)!);
     const selection = request.stage === 'rewrite' && request.sceneId === scene.id ? request.selection : undefined;
     const { sources: labels, ...context } = buildWriterContext(project, scene.id, request.references, story);
+    const patch = node.mode === 'patch' && !selection && !!scene.text.trim();
+    if (patch) return { definition: proseDefinition('patch', `${scene.title} · 局部修订`, `${writerPrompt.text}\n${writerScopePrompts.patch.text}`, patchSchema),
+      context: boundedContext({ ...context, authorRules, ...(upstream ? { upstream } : {}) }, WRITER_CONTEXT_CHARS, WRITER_PRIORITY), objective,
+      sources: [...novelSources(project), ...sourcesForLabels(project, labels, role)],
+      toCommands: step => {
+        const { edits } = result<{ edits: Array<{ quote: string; replacement: string }> }>(step, patchSchema);
+        return [{ type: 'putScene', value: { ...structuredClone(scene), text: applyEdits(scene.text, edits) } }];
+      } };
     return { definition: proseDefinition(request.stage === 'rewrite' ? 'rewrite' : 'writer', `${scene.title} · 正文写作`, `${writerPrompt.text}\n${(selection ? writerScopePrompts.selection : writerScopePrompts.scene).text}`),
       context: boundedContext({ ...context, authorRules, ...(upstream ? { upstream } : {}), selectedText: selection ? scene.text.slice(selection.start, selection.end) : null }, WRITER_CONTEXT_CHARS, WRITER_PRIORITY), objective,
       sources: [...novelSources(project), ...sourcesForLabels(project, labels, role)],
@@ -183,9 +225,9 @@ export function specialistDefinition(specialist: SpecialistRequest & { story?: S
     const profile = styleProfile(project), baseline = styleBaseline(profile);
     const before = story.order[story.positionOf(scenes[0]!.id) - 1];
     const { notice: _notice, ...style } = writerStyle(project, scenes[0]!);
-    return { definition: proseDefinition('stylist', '文风 · 笔触审阅', stylistPrompt.text, reviewSchema),
+    return { definition: proseDefinition('stylist', '文风 · 笔触审阅', `${stylistPrompt.text}\n${reviewFormatPrompt.text}`, reviewSchema),
       context: boundedContext({ style,
-        targetScenes: scenes.map(scene => ({ id: scene.id, title: scene.title, text: scene.text.length > EVIDENCE_TEXT_CHARS ? `${scene.text.slice(0, EVIDENCE_TEXT_CHARS / 2)}\n……\n${scene.text.slice(-EVIDENCE_TEXT_CHARS / 2)}` : scene.text,
+        targetScenes: scenes.map(scene => ({ id: scene.id, title: scene.title, text: reviewText(scene.text, Math.floor(REVIEW_TEXT_CHARS / scenes.length)),
           lint: styleLint(scene.text, profile, baseline).issues.map(issue => ({ message: issue.message, excerpt: issue.excerpt })) })),
         precedingText: before?.text.slice(-1500) ?? '' }, undefined, ['style', 'targetScenes']),
       objective: '审阅这些正文与作者文风的贴合度，给出 pass/revise、具体问题与修改方向。',
@@ -216,8 +258,9 @@ export function specialistDefinition(specialist: SpecialistRequest & { story?: S
     const objects = project.objects.filter(object => subjects.has(object.id));
     const shown = new Set(scenes.map(scene => scene.id));
     const before = [...new Set(scenes.flatMap(scene => story.order.slice(Math.max(0, story.positionOf(scene.id) - 3), story.positionOf(scene.id))))].filter(scene => !shown.has(scene.id));
-    return { definition: definition('continuity', '作者 · 连续性审阅', continuityPrompt.text, reviewSchema),
-      context: boundedContext({ targetScenes: scenes.map(scene => ({ ...scene, text: scene.text.slice(0, 3000), outline: scene.outline.slice(0, 1200) })),
+    const perScene = Math.max(3000, Math.floor(REVIEW_TEXT_CHARS / Math.max(1, scenes.length)));
+    return { definition: proseDefinition('continuity', '作者 · 连续性审阅', `${continuityPrompt.text}\n${reviewFormatPrompt.text}`, reviewSchema),
+      context: boundedContext({ targetScenes: scenes.map(scene => ({ ...scene, text: reviewText(scene.text, perScene), outline: scene.outline.slice(0, 1200) })),
         precedingScenes: before.map(scene => ({ id: scene.id, ...story.sceneMemory(scene.id) })),
         openThreads: scenes[0] ? openThreads(story, scenes[0].id, objects.flatMap(objectNames), 12).map(thread => thread.title) : [],
         authorFacts: facts.slice(0, 40), characterStates: states.slice(0, 20), authorObjects: objects.slice(0, 30), overview,

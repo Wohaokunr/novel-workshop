@@ -7,7 +7,7 @@ import { emptyUsage } from './responses.js';
 import { boundedContext, collectContext, fingerprint, MAX_CONTEXT_CHARS, refreshMemories, searchContext, selectAuthorRules, sourceFor, sourceValid, sourcesForWorkspace } from './agent/memory.js';
 import { assertWriteScope, canReadAuthor, chainWriterNodes, createBudget, PLAN_ROLES, ROLE_CAPABILITIES, UPSTREAM_ROLES, validatePlan } from './agent/policy.js';
 import { toolDefinitions } from './agent/tools.js';
-import { reviewSchema, specialistDefinition } from './agent/specialists.js';
+import { applyEdits, reviewOutcome, reviewSchema, specialistDefinition } from './agent/specialists.js';
 import { keepCompleted } from './agent/runtime.js';
 
 function fixture(id = 'project-a'): Workspace {
@@ -316,4 +316,33 @@ test('角色清单只在 ROLE_CAPABILITIES 定义一次：计划角色与工具�
   const nodeSchema = (planTool.parameters as { properties: { nodes: { items: { properties: { role: { enum: string[] } } } } } }).properties.nodes.items.properties.role;
   assert.deepEqual(nodeSchema.enum, PLAN_ROLES);
   assert.deepEqual([...UPSTREAM_ROLES].sort(), ['canvas', 'cast', 'continuity', 'narrative', 'planner', 'theme', 'world', 'writer']);
+});
+
+test('审阅只把【必须】的问题算作需要修订，意见带原句与改法，必须项排在前面', () => {
+  const outcome = reviewOutcome({ verdict: 'revise', recommendation: '整体可读', issues: [
+    { quote: '他沉声道', problem: '说话标签', fix: '删去', severity: 'should' },
+    { quote: '林舟早就知道', problem: '人物提前知道真相', fix: '改为猜测', severity: 'must' },
+  ] });
+  assert.equal(outcome.verdict, 'revise');
+  assert.deepEqual(outcome.issues, ['【必须】「林舟早就知道」人物提前知道真相｜改法：改为猜测', '【建议】「他沉声道」说话标签｜改法：删去']);
+  assert.equal(reviewOutcome({ verdict: 'revise', recommendation: '', issues: [{ quote: '', problem: '可以更紧凑', fix: '', severity: 'should' }] }).verdict, 'pass');
+});
+
+test('局部修订只替换引用的段落；找不到、重复或重叠的引用退回写作者', () => {
+  const text = '第一段。\n\n第二段，雾很大。\n\n第三段。';
+  assert.equal(applyEdits(text, [{ quote: '第三段。', replacement: '第三段，钟响了。' }, { quote: '雾很大', replacement: '雾散了' }]), '第一段。\n\n第二段，雾散了。\n\n第三段，钟响了。');
+  assert.throws(() => applyEdits(text, [{ quote: '不存在的句子', replacement: '' }]), /找不到/);
+  assert.throws(() => applyEdits(text, [{ quote: '段。', replacement: '' }]), /不止一次/);
+  assert.throws(() => applyEdits(text, [{ quote: '第二段，雾', replacement: '' }, { quote: '雾很大', replacement: '' }]), /重叠/);
+});
+
+test('连续性与文风审阅读到整场正文，不只是开头', () => {
+  const workspace = fixture();
+  const long = `${'开头的铺垫。'.repeat(600)}结尾处林舟说出了不该知道的名字。`;
+  const scene = workspace.scenes.find(item => item.id === 'target')!;
+  const project = applyCommands(workspace, [{ type: 'putScene', value: { ...scene, text: long } }]);
+  for (const role of ['continuity', 'stylist'] as const) {
+    const review = specialistDefinition({ project, role, node: node(role, { sceneId: 'target', chapterId: 'chapter' }), request: request(project), focusSceneIds: ['target'] });
+    assert.match(JSON.stringify(review.context), /结尾处林舟说出了不该知道的名字/, role);
+  }
 });

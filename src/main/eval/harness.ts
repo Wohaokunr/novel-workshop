@@ -52,7 +52,7 @@ export async function runTask(benchCase: BenchCase, task: BenchTask, transport: 
   const checks = contextChecks(benchCase, task, project, JSON.stringify(spec.context));
   try {
     const step = await runAgent(spec.definition, { transport: transport(project, request), context: spec.context, objective: spec.objective, contextSources: [], signal });
-    const text = task.role === 'writer' ? step.output : Object.values((step.structured ?? {}) as Record<string, unknown>).flat().join('\n');
+    const text = task.role === 'writer' ? step.output : Object.values((step.structured ?? {}) as Record<string, unknown>).flat().map(value => typeof value === 'string' ? value : JSON.stringify(value)).join('\n');
     return { ...base, promptVersion: step.promptVersion, checks: [...checks, ...outputChecks(benchCase, task, project, text, step.structured)], usage: step.usage, output: task.role === 'writer' ? text : JSON.stringify(step.structured) };
   } catch (error) {
     return { ...base, checks, usage: emptyUsage(), output: '', error: error instanceof Error ? error.message : String(error) };
