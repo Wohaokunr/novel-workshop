@@ -8,14 +8,14 @@ import type { ResponseInputItem } from 'openai/resources/responses/responses';
 import { addUsage, AgentSuspended, emptyUsage, OutputLimitError, runAgent, runtimeCalls, settleCheckpointTool, ToolValidationError, type AgentCheckpoint, type AgentDefinition, type EmbeddingTransport, type ResponseTransport, type RunAgentOptions, type RuntimeCall, type ToolCallContext } from '../responses.js';
 import { bookSources, boundedContext, changeSources, collectContext, compactChanges, filteredPassages, fingerprint, refreshMemories, searchContext, selectAuthorRules } from './memory.js';
 import { nearestChunks, type SemanticHit } from './semantic.js';
-import { assertWriteScope, canProposeCommands, canReadAuthor, chainWriterNodes, createBudget, PLAN_ROLES, touchesProse, validatePlan, validatePlanTarget } from './policy.js';
+import { assertWriteScope, canProposeCommands, canReadAuthor, chainWriterNodes, createBudget, nodeTarget, PLAN_ROLES, touchesProse, validatePlan, validatePlanTarget } from './policy.js';
 import { reviewOutcome, specialistDefinition, type SpecialistDefinition } from './specialists.js';
 import { createCoordinatorTools, toolDefinitions, type ToolName } from './tools.js';
 import { passageMentions } from './story-index.js';
 import { StoryView } from './story-view.js';
 import { storyOpsCommands } from './story-ops.js';
 import { objectNames } from '../../shared/story-elements.js';
-import { orderedChapters } from '../../shared/structure.js';
+import { orderedChapters, passageLabel } from '../../shared/structure.js';
 import { changePlace, labelledAspects, storyTimeline } from '../../shared/story-state.js';
 import { coordinatorPrompt } from '../prompts/coordinator.js';
 import { promptVersion } from '../prompts/prompt.js';
@@ -580,7 +580,8 @@ export class PersistentAgentRuntime {
       case 'search_context': {
         const workspace = this.workspace(entry), query = String(args.query);
         const filter = { chapterFrom: args.chapterFrom as string | null, chapterTo: args.chapterTo as string | null, entityId: args.entityId as string | null };
-        return searchContext(workspace, query, 6, 'coordinator', {}, filter, await this.semantic(entry, workspace, query, filteredPassages(workspace, filter)));
+        const allowed = filteredPassages(workspace, filter);
+        return searchContext(workspace, query, 6, 'coordinator', {}, filter, await this.semantic(entry, workspace, query, allowed), allowed);
       }
       case 'get_context': {
         const workspace = this.workspace(entry, args.candidateId);
@@ -592,7 +593,7 @@ export class PersistentAgentRuntime {
         const workspace = this.workspace(entry), passage = workspace.passages.find(item => item.id === String(args.passageId)) ?? fail('场景段不存在');
         const start = Math.max(0, Math.min(passage.text.length, Math.floor(Number(args.start) || 0)));
         const end = Math.min(passage.text.length, start + Math.max(1, Math.min(READ_TEXT_CHARS, Math.floor(Number(args.length) || READ_TEXT_CHARS))));
-        return { passageId: passage.id, sceneId: passage.sceneId, chapterId: passage.chapterId, title: this.story(workspace).label(passage.id), start, end, totalChars: passage.text.length, text: passage.text.slice(start, end) };
+        return { passageId: passage.id, sceneId: passage.sceneId, chapterId: passage.chapterId, title: passageLabel(workspace, passage), start, end, totalChars: passage.text.length, text: passage.text.slice(start, end) };
       }
       case 'recall_memory': return this.memories(projectId).filter(memory => memory.status === 'active' && memory.confirmed).map(memory => ({ id: memory.id, kind: memory.kind, content: memory.content, sources: memory.sources }));
       case 'refresh_context': {
@@ -740,10 +741,10 @@ export class PersistentAgentRuntime {
     const state = entry.state;
     if (state.finalSummary) return true;
     if (state.waiting) return undefined;
-    const quick = this.quickPlan(entry);
-    if (quick) {
+    if (this.quickTarget(entry)) {
       const last = lastCall(cp);
-      if (!state.plan && !last && !cp.input.some(item => item.type === 'function_call')) return [quick];
+      // The plan is built once, before anything has happened; later turns only need to know the run is a quick one.
+      if (!state.plan && !last && !cp.input.some(item => item.type === 'function_call')) { const quick = this.quickPlan(entry); if (quick) return [quick]; }
       // The author's decision on the single candidate ends a quick run; anything unexpected goes back to the coordinator.
       if (last?.name === 'commit_candidate' && (last.output.ok === true || last.output.reason === 'author_declined') && !this.nextStep(entry)) {
         const artifactIds = state.artifacts.map(artifact => artifact.id);
@@ -764,22 +765,28 @@ export class PersistentAgentRuntime {
   /** Writing one passage or rewriting / continuing at one place needs no planning: the runtime saves the plan itself, so the coordinator
    * model is only consulted when something goes wrong. Writing a passage also records how the people and places of its scene change
    * in what was just written. */
-  private quickPlan(entry: Entry): RuntimeCall | undefined {
+  private quickTarget(entry: Entry) {
     const run = entry.run;
     if (!run.passageId || (run.stage !== 'rewrite' && run.stage !== 'chapter')) return undefined;
     const workspace = entry.state.baseWorkspace, passage = workspace.passages.find(item => item.id === run.passageId);
     const scene = passage && workspace.scenes.find(item => item.id === passage.sceneId);
-    if (!passage || !scene) return undefined;
+    return passage && scene ? { workspace, passage, scene } : undefined;
+  }
+  private quickPlan(entry: Entry): RuntimeCall | undefined {
+    const run = entry.run, quick = this.quickTarget(entry);
+    if (!quick) return undefined;
+    const { workspace, passage, scene } = quick;
     const target = { passageId: passage.id, chapterId: passage.chapterId };
     const nodes: Array<Record<string, unknown>> = [{ id: 'write', role: 'writer', objective: run.objective, dependsOn: [], acceptance: run.stage === 'rewrite'
       ? '只写入选区或光标处，保留其余正文' : '写出本段完整正文，落实场景大纲与本段节拍', ...target, sceneId: null, characterId: null, eventId: null }];
-    const onStage = !!scene.povId || !!scene.castIds?.length || !!scene.settingIds?.length || scene.eventIds.length > 0;
-    if (run.stage === 'chapter' && onStage) {
+    // Who is on stage is only known once the prose is written (it may name people the scene was not bound to); evolution skips
+    // itself without a model call when nobody is.
+    if (run.stage === 'chapter') {
       const node = { id: 'evolve', role: 'evolution' as const, objective: '依据刚写好的正文，记下这一场里人物与环境的状态变化。', dependsOn: ['write'],
         acceptance: '每条变化都有正文依据', ...target, sceneId: scene.id };
       try { validatePlanTarget({ ...node, status: 'pending' }, workspace, run); nodes.push({ ...node, characterId: null, eventId: null }); } catch { /* Out of the task's scope: the passage alone is written. */ }
     }
-    const title = new StoryView(workspace).label(passage.id);
+    const title = passageLabel(workspace, passage);
     return { name: 'set_plan', arguments: { summary: run.stage === 'rewrite' ? '在目标位置改写或续写，审阅后交作者批准。' : `写作「${clipText(title, 30)}」，审阅后交作者批准。`, nodes } };
   }
   private nextStep(entry: Entry): RuntimeCall | undefined {
@@ -853,11 +860,32 @@ export class PersistentAgentRuntime {
     if (entry.state.budget.revisions >= entry.state.budget.maxRevisions) fail('修订额度已用完，请将候选与审查意见提交作者决定');
     if (nodes.some(node => !canProposeCommands(node.role))) fail('修订节点必须能提出修改');
     const artifacts: AgentArtifact[] = [];
-    for (const node of nodes) {
+    // State changes are read from the prose, so evolution runs after the rewrite, on the rewritten text: the ones asked for, and
+    // the plan's finished evolution of every scene whose prose is being rewritten (its changes and their quoted evidence came from the old text).
+    const writers = nodes.filter(node => node.role !== 'evolution');
+    for (const node of writers) {
       const revised = { ...node, objective: `${node.objective}\n本次修订要求：${objective}` };
       artifacts.push(await this.specialist(entry, revised, `revision:${call.key}:${node.id}`, candidate.workspace));
     }
+    const evolutions = [...nodes.filter(node => node.role === 'evolution'), ...this.staleEvolution(entry, candidate.workspace, writers, nodes)];
+    if (evolutions.length) {
+      let rewritten = candidate.workspace;
+      const commands = artifacts.flatMap(commandsOf);
+      if (commands.length) { try { rewritten = this.store.previewCommands(candidate.workspace, commands).workspace; } catch { /* propose_changes reports the conflict. */ } }
+      for (const node of evolutions) {
+        const revised = { ...node, objective: `${node.objective}\n正文已按修订要求改写：依据改写后的正文更新这一场的状态变化。` };
+        artifacts.push(await this.specialist(entry, revised, `revision:${call.key}:${node.id}`, rewritten));
+      }
+    }
     return this.action(entry, 'propose_changes', { label: `${candidate.label} · 修订`, artifactIds: artifacts.map(artifact => artifact.id), commandsJson: '' }, call);
+  }
+
+  /** Finished evolution nodes of the plan whose scene has a passage among the writers' targets. */
+  private staleEvolution(entry: Entry, workspace: Workspace, writers: PlanNode[], asked: PlanNode[]): PlanNode[] {
+    const target = (node: PlanNode) => { try { return nodeTarget(node, workspace, entry.run); } catch { return {}; } };
+    const scenes = new Set(writers.flatMap(node => { const { passage, scene } = target(node), id = passage?.sceneId ?? scene?.id; return id ? [id] : []; }));
+    return (entry.state.plan?.nodes ?? []).filter(node => node.role === 'evolution' && node.status === 'completed' && !asked.some(item => item.id === node.id)
+      && scenes.has(target(node).scene?.id ?? ''));
   }
 
   private async reviewCandidate(entry: Entry, candidateId: string, call: ToolCallContext): Promise<unknown> {
@@ -905,14 +933,10 @@ export class PersistentAgentRuntime {
   private async specialist(entry: Entry, node: PlanNode, slot: string, workspace = this.workspace(entry), focusPassageIds?: string[], upstream?: UpstreamResult[]): Promise<AgentArtifact> {
     const previous = entry.state.artifacts.find(artifact => artifact.id === `artifact-${fingerprint(`${entry.run.id}:${slot}`).slice(0, 24)}`);
     if (previous) return previous;
-    const reservations = entry.state.reservedChildren ??= [];
-    if (!reservations.includes(slot)) {
-      if (entry.state.budget.children >= entry.state.budget.maxChildren) throw new AgentSuspended('专长与审查任务预算耗尽');
-      entry.state.budget.children++; reservations.push(slot); this.publish(entry);
-    }
     let specialistRequest = entry.run;
     // A writer revising what this task already wrote: the passage now has prose, so it is rewritten rather than written afresh.
-    const candidatePassage = node.role === 'writer' ? workspace.passages.find(passage => passage.id === (node.passageId ?? entry.run.passageId)) : undefined;
+    // The passage is the node's target as the plan resolved it, which may come from its scene alone.
+    const candidatePassage = node.role === 'writer' ? nodeTarget(node, workspace, entry.run).passage : undefined;
     if (candidatePassage && entry.run.stage === 'chapter' && candidatePassage.text.trim()
       && !entry.state.baseWorkspace.passages.find(passage => passage.id === candidatePassage.id)?.text.trim()) {
       specialistRequest = { ...entry.run, stage: 'rewrite', passageId: candidatePassage.id, selection: undefined };
@@ -928,6 +952,17 @@ export class PersistentAgentRuntime {
       const candidate = [...entry.state.candidates].reverse().find(candidate => candidate.workspace === workspace);
       const reviews = candidate?.reviews.filter(review => review.candidateHash === candidate.hash);
       if (reviews?.length) specification.context = { ...(specification.context as Record<string, unknown>), candidateReviews: reviews.map(({ role, verdict, issues, recommendation }) => ({ role, verdict, issues, recommendation })) };
+    }
+    // Nothing for the model to look at: the node completes with an empty result and spends no budget.
+    if (specification.skip) {
+      const artifact: AgentArtifact = { id: `artifact-${fingerprint(`${entry.run.id}:${slot}`).slice(0, 24)}`, nodeId: node.id, role: node.role, label: specification.definition.label,
+        text: specification.skip, structured: { commands: [] }, stepId: '', sources: specification.sources, createdAt: stamp() };
+      this.check(entry); entry.state.artifacts.push(artifact); this.publish(entry); return artifact;
+    }
+    const reservations = entry.state.reservedChildren ??= [];
+    if (!reservations.includes(slot)) {
+      if (entry.state.budget.children >= entry.state.budget.maxChildren) throw new AgentSuspended('专长与审查任务预算耗尽');
+      entry.state.budget.children++; reservations.push(slot); this.publish(entry);
     }
     const { step, commands } = await this.specialistOutput(entry, slot, node.role, specification);
     const structured = commands ? { ...(step.structured && typeof step.structured === 'object' ? step.structured : {}), commands } : step.structured;

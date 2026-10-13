@@ -74,8 +74,9 @@ const proposalSchema = objectSchema({ summary: string, commandsJson: string, ops
 export function stateChangeId(change: Pick<StateChange, 'subjectId' | 'sceneId' | 'passageId' | 'eventId'>): string {
   return `change-${createHash('sha1').update(JSON.stringify([change.subjectId, change.sceneId ?? null, change.passageId ?? null, change.eventId ?? null]), 'utf8').digest('hex').slice(0, 20)}`;
 }
-const sameAnchor = (a: Pick<StateChange, 'subjectId' | 'sceneId' | 'passageId' | 'eventId'>, b: typeof a) =>
-  a.subjectId === b.subjectId && a.sceneId === b.sceneId && a.passageId === b.passageId && a.eventId === b.eventId;
+const samePlace = (a: Pick<StateChange, 'subjectId' | 'sceneId' | 'passageId'>, b: typeof a) =>
+  a.subjectId === b.subjectId && a.sceneId === b.sceneId && a.passageId === b.passageId;
+const sameAnchor = (a: Pick<StateChange, 'subjectId' | 'sceneId' | 'passageId' | 'eventId'>, b: typeof a) => samePlace(a, b) && a.eventId === b.eventId;
 
 export interface SpecialistDefinition {
   definition: AgentDefinition;
@@ -84,6 +85,8 @@ export interface SpecialistDefinition {
   sources: EvidenceSource[];
   /** Pure conversion only. The coordinator must preview, assert scope, review and request approval. */
   toCommands?(step: AgentStep): Command[];
+  /** Set when there is nothing for the model to do: the node completes with this note and no commands, without a model call. */
+  skip?: string;
 }
 
 type ProposalRole = 'planner' | 'world' | 'narrative' | 'canvas' | 'cast';
@@ -326,7 +329,8 @@ function evolutionDefinition(project: Workspace, request: RunRequest, story: Sto
   const allowed = new Set(subjects.map(subject => subject.id)), title = anchor ? story.label(anchor.id) : scene.title;
   const chapterTitle = (item: Passage) => story.chapters[story.chapterIndex(item.chapterId)]?.title ?? '';
   // Written prose is the evidence on its own: the outline is the plan, and only stands in for prose not written yet.
-  return { definition: definition(`evolution:${scene.id}`, `${title} · 人物与环境演进`, evolutionPrompt.text, evolutionSchema),
+  return { ...(subjects.length ? {} : { skip: '这一场没有登场或正文提到的人物与环境，无需记录状态变化。' }),
+    definition: definition(`evolution:${scene.id}`, `${title} · 人物与环境演进`, evolutionPrompt.text, evolutionSchema),
     context: boundedContext({ ...(authorRules.length ? { authorRules } : {}),
       scene: { id: scene.id, title: scene.title, ...(anchor ? { passage: { chapter: chapterTitle(anchor), part: `${parts.indexOf(anchor) + 1}/${parts.length}`, beat: anchor.beat ?? '' } } : {}) },
       events: events.map(event => ({ id: event.id, name: event.name, worldOrder: event.event!.worldOrder, participants: event.event!.participants.map(id => project.objects.find(object => object.id === id)?.name ?? id) })),
@@ -351,10 +355,20 @@ function evolutionDefinition(project: Workspace, request: RunRequest, story: Sto
         const eventId = item.eventId && scene.eventIds.includes(item.eventId) ? item.eventId : undefined;
         const place = { subjectId: item.subjectId, sceneId: scene.id, ...(anchor ? { passageId: anchor.id } : {}), ...(eventId ? { eventId } : {}) };
         const note = !item.note.trim() || written.length || item.note.startsWith('计划：') ? item.note.trim() : `计划：${item.note.trim()}`;
-        const value: StateChange = { id: project.stateChanges.find(change => sameAnchor(change, place))?.id ?? stateChangeId(place), ...place, aspects, ...(note ? { note } : {}) };
+        const value: StateChange = { id: '', ...place, aspects, ...(note ? { note } : {}) };
         const index = values.findIndex(change => sameAnchor(change, value));
         if (index >= 0) values[index] = value; else values.push(value);
       }
+      // A re-run updates what it recorded here before even when it names a different event (or none): the same anchor first,
+      // then the subject's other change at this place, so one place never ends up with two contradicting changes.
+      const recorded = project.stateChanges.filter(change => values.some(value => samePlace(change, value))), claimed = new Set<string>();
+      const claim = (value: StateChange, match: (change: StateChange) => boolean) => {
+        const found = value.id ? undefined : recorded.find(change => !claimed.has(change.id) && match(change));
+        if (found) { value.id = found.id; claimed.add(found.id); }
+      };
+      for (const value of values) claim(value, change => sameAnchor(change, value));
+      for (const value of values) claim(value, change => samePlace(change, value));
+      for (const value of values) value.id ||= stateChangeId(value);
       const commands: Command[] = values.map(value => ({ type: 'putStateChange', value }));
       applyCommands(project, commands);
       return commands;

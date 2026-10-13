@@ -338,6 +338,28 @@ test('后台故事记忆：模型漏掉的场景不存兜底摘要，保持待�
   } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
+test('后台故事记忆：摘要模型只看正文不看场景标题；前情跳过空的占位段，接上最近写过的一段', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'story-title-'));
+  const store = new NovelStore(join(directory, 'test.sqlite'));
+  try {
+    const project = store.createProject('剧透'), chapterId = project.chapters[0]!.id;
+    store.execute({ projectId: project.id, actor: 'human', commands: placed('s0', chapterId, 0, '揭示：管家是凶手', '管家端着茶走进书房，雾里传来钟声。') });
+    const demo = new DemoStoryTransport(), contexts: Array<{ previousSummary: string; passages: Array<Record<string, unknown>> }> = [];
+    const transport: ResponseTransport = { stream(request: ModelRequest, signal: AbortSignal) {
+      if (request.agentId === 'story:digest') contexts.push(JSON.parse((request.input as Array<{ content: string }>)[0]!.content).context);
+      return demo.stream(request, signal);
+    } };
+    const service = new StoryMemoryService(store, () => ({ name: 'demo', baseURL: '', model: 'demo', mode: 'mock', apiKey: '' }), () => {}, () => transport);
+    await service.run(project.id);
+    store.execute({ projectId: project.id, actor: 'human', commands: [...placed('gap', chapterId, 1, '空场', ''), ...placed('s1', chapterId, 2, '后续', '第二天清晨，书房的门还锁着。')] });
+    await service.run(project.id);
+    assert.equal(contexts.length, 2);
+    assert.doesNotMatch(JSON.stringify(contexts), /管家是凶手/);
+    assert.deepEqual(Object.keys(contexts[1]!.passages[0]!).sort(), ['chapter', 'passageId', 'sceneId', 'text']);
+    assert.ok(contexts[1]!.previousSummary.trim(), '前一段是空的占位段时，前情取自更早写过的一段');
+  } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test('后台故事记忆：超长场景分段整理再合并，不再省略中段；段内开启又回收的伏笔不留在账本里', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'story-long-'));
   const store = new NovelStore(join(directory, 'test.sqlite'));
