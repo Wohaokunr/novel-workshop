@@ -8,7 +8,7 @@ import type { ResponseInputItem } from 'openai/resources/responses/responses';
 import { addUsage, AgentSuspended, emptyUsage, OutputLimitError, runAgent, runtimeCalls, settleCheckpointTool, ToolValidationError, type AgentCheckpoint, type AgentDefinition, type EmbeddingTransport, type ResponseTransport, type RunAgentOptions, type RuntimeCall, type ToolCallContext } from '../responses.js';
 import { bookSources, boundedContext, changeSources, collectContext, compactChanges, filteredScenes, fingerprint, refreshMemories, searchContext, selectAuthorRules } from './memory.js';
 import { nearestChunks, type SemanticHit } from './semantic.js';
-import { assertWriteScope, canProposeCommands, canReadAuthor, chainWriterNodes, createBudget, PLAN_ROLES, touchesProse, validatePlan } from './policy.js';
+import { assertWriteScope, canProposeCommands, canReadAuthor, chainWriterNodes, createBudget, PLAN_ROLES, touchesProse, validatePlan, validatePlanTarget } from './policy.js';
 import { reviewOutcome, specialistDefinition, type SpecialistDefinition } from './specialists.js';
 import { createCoordinatorTools, toolDefinitions, type ToolName } from './tools.js';
 import { sceneMentions } from './story-index.js';
@@ -176,7 +176,7 @@ export class PersistentAgentRuntime {
     const scene = project.scenes.find(scene => scene.id === request.sceneId);
     if (scene && request.chapterId && scene.chapterId !== request.chapterId) fail('场景不属于目标章节');
     if (request.selection && !allowWrittenTargets && (!scene || !Number.isSafeInteger(request.selection.start) || !Number.isSafeInteger(request.selection.end)
-      || request.selection.start < 0 || request.selection.end <= request.selection.start || request.selection.end > scene.text.length)) fail('改写选区无效');
+      || request.selection.start < 0 || request.selection.end < request.selection.start || request.selection.end > scene.text.length)) fail('改写选区无效');
     if (request.stage === 'rewrite' && !scene) fail('请选择要改写的场景');
     if (request.selection && request.stage !== 'rewrite') fail('只有改写任务可设置选区');
     if (request.stage === 'assist' ? !request.tool || !['character', 'world', 'narrative', 'canvas', 'theme', 'continuity'].includes(request.tool) : request.tool !== undefined) fail('辅助工具与任务类型不匹配');
@@ -738,6 +738,18 @@ export class PersistentAgentRuntime {
     const state = entry.state;
     if (state.finalSummary) return true;
     if (state.waiting) return undefined;
+    const quick = this.quickPlan(entry);
+    if (quick) {
+      const last = lastCall(cp);
+      if (!state.plan && !last && !cp.input.some(item => item.type === 'function_call')) return [quick];
+      // The author's decision on the single candidate ends a quick run; anything unexpected goes back to the coordinator.
+      if (last?.name === 'commit_candidate' && (last.output.ok === true || last.output.reason === 'author_declined') && !this.nextStep(entry)) {
+        const artifactIds = state.artifacts.map(artifact => artifact.id);
+        return [{ name: 'finish_run', arguments: { artifactIds, summary: last.output.ok
+          ? '已按目标生成正文，经审阅后由作者批准写入作品。'
+          : '作者拒绝了这次生成的正文；作品保持不变，草稿与审阅意见保留在任务记录里。' } }];
+      }
+    }
     if (!anyTime) {
       const last = lastCall(cp);
       if (!last || !PIPELINE.has(last.name) || last.output.ok === false) return undefined;
@@ -746,6 +758,25 @@ export class PersistentAgentRuntime {
     }
     const call = this.nextStep(entry);
     return call && !failedBefore(cp, call) ? [call] : undefined;
+  }
+  /** Writing one scene or rewriting / continuing at one place needs no planning: the runtime saves the plan itself, so the coordinator
+   * model is only consulted when something goes wrong. Chapter writing also follows the viewpoint character through the scene's events. */
+  private quickPlan(entry: Entry): RuntimeCall | undefined {
+    const run = entry.run;
+    if (!run.sceneId || (run.stage !== 'rewrite' && run.stage !== 'chapter')) return undefined;
+    const workspace = entry.state.baseWorkspace, scene = workspace.scenes.find(item => item.id === run.sceneId);
+    if (!scene) return undefined;
+    const target = { sceneId: scene.id, chapterId: scene.chapterId };
+    const nodes: Array<Record<string, unknown>> = [{ id: 'write', role: 'writer', objective: run.objective, dependsOn: [], acceptance: run.stage === 'rewrite'
+      ? '只写入选区或光标处，保留其余正文' : '写出本场完整正文，落实场景大纲的每个节拍', ...target, characterId: null, eventId: null }];
+    if (run.stage === 'chapter' && scene.povId) {
+      for (const eventId of scene.eventIds.slice(0, 2)) {
+        const node = { id: `evolve-${eventId}`, role: 'evolution', objective: '依据本场正文跟进视角人物在这个事件之后的视角、心理与动机。', dependsOn: ['write'],
+          acceptance: '变化有正文依据', ...target, characterId: scene.povId, eventId };
+        try { validatePlanTarget({ ...node, status: 'pending' } as PlanNode, workspace, run); nodes.push(node); } catch { /* The viewpoint character is not part of this event. */ }
+      }
+    }
+    return { name: 'set_plan', arguments: { summary: run.stage === 'rewrite' ? '在目标位置改写或续写，审阅后交作者批准。' : `写作「${clipText(scene.title, 30)}」，审阅后交作者批准。`, nodes } };
   }
   private nextStep(entry: Entry): RuntimeCall | undefined {
     const state = entry.state, ready = this.readyNodes(entry);

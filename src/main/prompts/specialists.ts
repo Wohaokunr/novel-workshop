@@ -56,5 +56,6 @@ must 只用于不改就会出问题的情况：读者会看不懂或被误导、
 export const writerScopePrompts = prompts('writerScope', {
   selection: '本次只改写选中文本，仅输出替换段落，保留选区外内容；不要重写整个场景。篇幅与选段相当，objective 另有要求时从其要求；替换段要与选区前后文自然衔接，开场与结尾的写法要求只在选区恰好是场景开头或结尾时适用。',
   scene: '输出这个场景完整正文，不输出其他场景正文。',
+  insert: '本次是在光标处续写：只输出要插入光标处的新正文，不重复光标前已有的文字，也不输出光标后的原文。cursor.before 是光标前的原文，cursor.after 是光标后的原文（为空表示写在场景末尾）。紧接 cursor.before 的最后一句往下写，语气、人称与节奏一致；cursor.after 不为空时，新内容要能自然接上它。篇幅按 objective；没有要求时写一段完整的情节推进，约 800–1500 字，停在动作或对白上。',
   patch: '本次是按 candidateReviews 做局部修订，不重写整场。输出 edits：每条 quote 是当前正文 scene.text 里要改的一段原文，逐字摘录、在正文中只出现一次（可以是一句，也可以是一整段）；replacement 是替换后的文字。没被意见指出的段落保持原样，为了衔接可以顺带改相邻的句子。先处理 severity 为 must 的意见，should 的意见有把握才改；不成立的意见不改，在 note 里一句话说明理由。',
 });

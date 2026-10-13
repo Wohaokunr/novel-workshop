@@ -63,7 +63,7 @@ test('每个角色的请求发给该角色指定的模型，未指定的角色�
   const store = new NovelStore(':memory:');
   try {
     const project = scenes(store), requests: ModelRequest[] = [];
-    const request: RunRequest = { projectId: project.id, stage: 'chapter', sceneId: 'scene-0', objective: '只写这个场景' };
+    const request: RunRequest = { projectId: project.id, stage: 'chapter', chapterId: project.chapters[0]!.id, objective: '完成本章空白场景' };
     let settings: ProviderSecret = { ...provider, roleModels: { coordinator: 'strong', continuity: 'cheap' } };
     const scheduler = new NovelAgentScheduler(store, () => settings, () => {}, () => {
       const demo = new DemoAgentTransport(request, store.getProject(project.id));
@@ -78,6 +78,27 @@ test('每个角色的请求发给该角色指定的模型，未指定的角色�
     assert.deepEqual(models('continuity'), new Set(['cheap']));
     settings = { ...settings, roleModels: { coordinator: 'other' } };
     await assert.rejects(scheduler.resume(run.id), /模型配置已变化/);
+  } finally { store.close(); }
+});
+
+for (const stage of ['chapter', 'rewrite'] as const) test(`${stage === 'chapter' ? '写一个场景' : '在光标处续写'}不经过协调模型：运行时自己保存计划，作者决定后直接结束`, { timeout: 15000 }, async () => {
+  const store = new NovelStore(':memory:');
+  try {
+    const project = scenes(store, stage === 'chapter' ? ['', ''] : ['已有的开头。', '']);
+    const h = harness(store);
+    const run = h.start({ projectId: project.id, stage, sceneId: 'scene-0', objective: '写这一场', references: [{ kind: 'scene', id: 'scene-0' }],
+      ...(stage === 'rewrite' ? { selection: { start: 6, end: 6 } } : {}) });
+    const pending = await wait(store, run);
+    assert.equal(pending.status, 'awaitingApproval', pending.error ?? pending.runtime?.pauseReason ?? '');
+    assert.deepEqual(pending.runtime!.plan!.nodes.map(node => node.role), ['writer']);
+    const candidate = pending.runtime!.candidates.at(-1)!;
+    await h.scheduler.decide({ runId: run.id, candidateId: candidate.id, candidateHash: candidate.hash, approve: true });
+    const done = await until(store, run.id, value => value.status === 'completed' || value.status === 'paused' || value.status === 'failed');
+    assert.equal(done.status, 'completed', done.runtime?.pauseReason ?? done.error ?? '');
+    assert.ok(!h.requests.some(request => request.agentId === 'coordinator'), '协调模型一次都没有被调用');
+    const text = store.getProject(project.id).scenes[0]!.text;
+    if (stage === 'rewrite') assert.ok(text.startsWith('已有的开头。') && text.length > '已有的开头。'.length, text);
+    else assert.ok(text.trim());
   } finally { store.close(); }
 });
 

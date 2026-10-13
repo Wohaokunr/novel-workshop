@@ -20,6 +20,8 @@ export const READER_TEXT_CHARS = 12_000;
 export const EVIDENCE_TEXT_CHARS = 6_000;
 /** Prose a stylist or continuity review reads in full, shared among its target scenes; longer text keeps its head and tail. */
 export const REVIEW_TEXT_CHARS = 18_000;
+/** Prose around the cursor a continuation sees beside the whole scene: what it must follow, and what it must lead into. */
+const CURSOR_BEFORE_CHARS = 2000, CURSOR_AFTER_CHARS = 800;
 
 // Match the established agents.ts result schemas; no transport or provider-specific API is introduced.
 const string = { type: 'string' }, strings = { type: 'array', items: string };
@@ -168,6 +170,8 @@ export function specialistDefinition(specialist: SpecialistRequest & { story?: S
   if (role === 'writer') {
     const scene = structuredClone(project.scenes.find(item => item.id === sceneId)!);
     const selection = request.stage === 'rewrite' && request.sceneId === scene.id ? request.selection : undefined;
+    // An empty selection is a cursor: continue the prose there instead of replacing anything.
+    const insert = !!selection && selection.start === selection.end;
     const { sources: labels, ...context } = buildWriterContext(project, scene.id, request.references, story);
     const patch = node.mode === 'patch' && !selection && !!scene.text.trim();
     if (patch) return { definition: proseDefinition('patch', `${scene.title} · 局部修订`, `${writerPrompt.text}\n${writerScopePrompts.patch.text}`, patchSchema),
@@ -177,8 +181,9 @@ export function specialistDefinition(specialist: SpecialistRequest & { story?: S
         const { edits } = result<{ edits: Array<{ quote: string; replacement: string }> }>(step, patchSchema);
         return [{ type: 'putScene', value: { ...structuredClone(scene), text: applyEdits(scene.text, edits) } }];
       } };
-    return { definition: proseDefinition(request.stage === 'rewrite' ? 'rewrite' : 'writer', `${scene.title} · 正文写作`, `${writerPrompt.text}\n${(selection ? writerScopePrompts.selection : writerScopePrompts.scene).text}`),
-      context: boundedContext({ ...context, authorRules, ...(upstream ? { upstream } : {}), selectedText: selection ? scene.text.slice(selection.start, selection.end) : null }, WRITER_CONTEXT_CHARS, WRITER_PRIORITY), objective,
+    return { definition: proseDefinition(request.stage === 'rewrite' ? 'rewrite' : 'writer', `${scene.title} · ${insert ? '续写' : '正文写作'}`, `${writerPrompt.text}\n${(insert ? writerScopePrompts.insert : selection ? writerScopePrompts.selection : writerScopePrompts.scene).text}`),
+      context: boundedContext({ ...context, authorRules, ...(upstream ? { upstream } : {}), selectedText: selection && !insert ? scene.text.slice(selection.start, selection.end) : null,
+        ...(insert ? { cursor: { before: scene.text.slice(Math.max(0, selection.start - CURSOR_BEFORE_CHARS), selection.start), after: scene.text.slice(selection.end, selection.end + CURSOR_AFTER_CHARS) } } : {}) }, WRITER_CONTEXT_CHARS, [...WRITER_PRIORITY.slice(0, 1), 'cursor', ...WRITER_PRIORITY.slice(1)]), objective,
       sources: [...novelSources(project), ...sourcesForLabels(project, labels, role)],
       toCommands: step => {
         if (typeof step.output !== 'string' || !step.output.trim()) throw new DomainValidationError('模型没有生成正文');

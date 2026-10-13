@@ -103,7 +103,7 @@ export function validatePlanTarget(node: PlanNode, workspace: Workspace, request
     const target = scopedScenes(workspace, request)[0]!;
     if (request.selection) {
       const { start, end } = request.selection;
-      requirePlan(Number.isSafeInteger(start) && Number.isSafeInteger(end) && start >= 0 && end > start && end <= target.text.length, '改写选区无效');
+      requirePlan(Number.isSafeInteger(start) && Number.isSafeInteger(end) && start >= 0 && end >= start && end <= target.text.length, '改写选区无效');
     }
   }
 }
@@ -209,7 +209,7 @@ export function assertWriteScope(request: RunRequest, before: Workspace, after: 
     if (request.stage === 'chapter') requireScope(!oldText.trim() || oldText === nextText, '必须守护章节中已有的正式正文');
     if (request.stage === 'rewrite' && request.selection) {
       const { start, end } = request.selection;
-      requireScope(Number.isSafeInteger(start) && Number.isSafeInteger(end) && start >= 0 && end > start && end <= oldText.length, '改写选区无效');
+      requireScope(Number.isSafeInteger(start) && Number.isSafeInteger(end) && start >= 0 && end >= start && end <= oldText.length, '改写选区无效');
       const prefix = oldText.slice(0, start), suffix = oldText.slice(end);
       requireScope(nextText.length >= prefix.length + suffix.length && nextText.startsWith(prefix) && nextText.endsWith(suffix), '改写必须保留选区外的前缀和后缀');
     }

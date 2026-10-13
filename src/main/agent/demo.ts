@@ -22,12 +22,14 @@ export class DemoAgentTransport implements ResponseTransport {
     const output = request.agentId === 'coordinator' ? this.coordinate(request) : [message(this.specialist(request))];
     const text = output.flatMap(item => item.type === 'message' ? item.content.flatMap(part => part.type === 'output_text' ? [part.text] : []) : []).join('');
     const response: ModelResponse = { id: `demo-agent-${randomUUID()}`, status: 'completed', output, output_text: text, usage: null };
+    // Desktop acceptance slows the stream down so streaming UI can be seen; it is never set outside the smoke run.
+    const pace = Number(process.env.NOVEL_DEMO_PACE_MS) || 0;
     return { events: (async function* (): AsyncGenerator<ResponseStreamEvent> {
       for (let index = 0; index < text.length; index += 80) {
-        checkCancelled(signal); await new Promise<void>(resolve => setImmediate(resolve));
+        checkCancelled(signal); await new Promise<void>(resolve => pace ? setTimeout(resolve, pace) : setImmediate(resolve));
         yield { type: 'response.output_text.delta', delta: text.slice(index, index + 80), output_index: 0, content_index: 0, item_id: output[0]!.id, sequence_number: index } as ResponseStreamEvent;
       }
-    })(), finalResponse: async () => { checkCancelled(signal); return response; } };
+    })(), finalResponse: async () => { if (pace) await new Promise<void>(resolve => setTimeout(resolve, pace)); checkCancelled(signal); return response; } };
   }
   private history(request: ModelRequest) {
     const calls = request.input.filter((item): item is Call => item.type === 'function_call');
@@ -117,6 +119,7 @@ export class DemoAgentTransport implements ResponseTransport {
     }
     if (id === 'writer' || id === 'rewrite' || id === 'revision') {
       const scene = context.scene;
+      if (context.cursor) return '\n\n她没有回头，只把铜片塞进袖口，朝雾里走了两步。钟又响了一下，比刚才那声更低，像是从地底传上来的。\n\n林舟追到门口，雾已经把她的背影吞掉了一半。他想喊，喉咙里却只挤出一声干咳。';
       if (typeof context.selectedText === 'string') return `她把话咽了回去，指腹沿铜片的缺口缓缓移过。${context.selectedText}`;
       return demoText(scene, id === 'revision');
     }
