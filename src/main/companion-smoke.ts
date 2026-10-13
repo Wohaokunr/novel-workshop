@@ -242,6 +242,11 @@ export async function runCompanionSmoke(window: BrowserWindow, store: NovelStore
   await click('show-details-panel');
   await until(() => ui<boolean>(`!!document.querySelector('.writer-details [data-testid="scene-elements"]')`), '场景三要素小结');
   await capture('companion-07b-scene-elements.png');
+  // Where the scene is read, and how it changes its people and places.
+  await ui(`document.querySelector('[data-testid="scene-passages"]').scrollIntoView({block:'start'})`); await delay(300);
+  await capture('companion-07c-scene-passages.png');
+  await ui(`document.querySelector('[data-testid="scene-changes"]').scrollIntoView({block:'start'})`); await delay(300);
+  await capture('companion-07d-scene-changes.png');
   await click('show-details-panel');
   const rows = await ui<number[]>(`[...document.querySelectorAll('.scene-row')].map(e => Math.round(e.getBoundingClientRect().height))`);
   assert.ok(Math.max(...rows) < 60, `空白场景目录行高度正常 ${JSON.stringify(rows)}`);

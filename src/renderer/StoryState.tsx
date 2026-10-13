@@ -136,7 +136,7 @@ export function ScenePassages({ workspace: w, scene, commit, askDelete, current,
     {parts.map((part, index) => <div className={`nested-card passage-card ${part.id === current?.id ? 'current' : ''}`} key={part.id}>
       <div className="passage-card-head">
         <strong>{chapterTitle(w, part.chapterId)}{parts.length > 1 && ` · 第 ${index + 1} 段`}</strong>
-        <small className={proseChars(part.text) ? '' : 'empty'}>{proseChars(part.text) ? `${proseChars(part.text).toLocaleString()} 字` : '空白'}</small>
+        <small className={proseChars(part.text) ? '' : 'blank'}>{proseChars(part.text) ? `${proseChars(part.text).toLocaleString()} 字` : '空白'}</small>
         {onOpenPassage && part.id !== current?.id && <button className="link-button" onClick={() => open(part.id)}>打开</button>}
         {parts.length > 1 && <button className="icon-button ghost small text-danger" title="删除这一段" aria-label="删除这一段" onClick={() => fire(askDelete({ type: 'deletePassage', id: part.id }, `删除「${scene.title}」在${chapterTitle(w, part.chapterId)}的一段`))}><Trash2/></button>}
       </div>
