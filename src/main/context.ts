@@ -5,11 +5,16 @@ import { isSettingLike, objectNames, sceneElements } from '../shared/story-eleme
 
 /** Raw prose immediately before the target scene; everything earlier reaches the writer as layered digests. */
 export const RECENT_TEXT_CHARS = 6000;
-/** Writer budget: big enough for the target scene plus memory, small enough to stay cheap on a million-word book. */
-export const WRITER_CONTEXT_CHARS = 28_000;
+/** Writer budget: big enough for the target scene, style samples, the prose just before and the book's memory together, small
+ * enough to stay cheap on a million-word book. */
+export const WRITER_CONTEXT_CHARS = 40_000;
+/** Memories each character on stage brings to the writer, most recent first kept; older ones are counted, not listed. */
+export const WRITER_MEMORIES = 16;
 /** Books with this few settings still hand all of them to a scene that names none. */
 export const ALL_SETTINGS_UP_TO = 6;
-export const WRITER_PRIORITY = ['scene', 'sceneElements', 'selectedText', 'style', 'authorRules', 'recentText', 'eventContexts', 'upstream', 'outlinePlan', 'novel', 'storySoFar', 'entityRecall', 'openThreads', 'initialCharacters'];
+/** What survives when the budget runs out, first to last: the scene and its voice, the prose it continues, the plan, what came
+ * earlier in the book, then who knows what; reference material goes last. */
+export const WRITER_PRIORITY = ['scene', 'sceneElements', 'selectedText', 'style', 'authorRules', 'recentText', 'outlinePlan', 'storySoFar', 'openThreads', 'eventContexts', 'upstream', 'entityRecall', 'novel', 'initialCharacters', 'relatedObjects', 'initialFacts', 'materials'];
 
 export function resolveReferences(workspace: Workspace, references: SourceReference[] = []) {
   if (!Array.isArray(references)) throw new Error('参考资料必须是列表');
@@ -88,7 +93,12 @@ export function buildWriterContext(workspace: Workspace, sceneId: string, refere
     const characterIds = new Set([...event.event!.participants, ...characterTransitions.map(state => state.characterId), ...(scene.povId ? [scene.povId] : []), ...(scene.castIds ?? [])]);
     return {
       eventId: event.id, facts: activeFacts.filter(fact => !replaced.has(fact.id)),
-      characters: [...characterIds].filter(id => workspace.objects.find(object => object.id === id)?.typeId === 'character').map(id => buildCharacterContext(workspace, id, event.id)),
+      characters: [...characterIds].filter(id => workspace.objects.find(object => object.id === id)?.typeId === 'character').map(id => {
+        const character = buildCharacterContext(workspace, id, event.id), kept = character.memories.slice(-WRITER_MEMORIES);
+        const dropped = new Set(character.memories.slice(0, character.memories.length - kept.length).map(item => `knowledge:${item.id}`));
+        return { ...character, memories: kept, ...(character.memories.length > kept.length ? { earlierMemories: character.memories.length - kept.length } : {}),
+          sources: character.sources.filter(source => !dropped.has(source)) };
+      }),
       characterTransitions,
     };
   });
@@ -108,6 +118,8 @@ export function buildWriterContext(workspace: Workspace, sceneId: string, refere
     ...recentText.map(item => `scene:${item.sceneId}:text`),
     ...recall.map(item => `scene:${item.lastSeen.sceneId}:text`),
   ])];
+  // Source labels are bookkeeping for the run record, not material for the writer.
+  const writerEvents = eventContexts.map(event => ({ ...event, characters: event.characters.map(({ sources: _sources, ...character }) => character) }));
   return {
     novel: { title: workspace.title, brief: workspace.brief, genre: workspace.genre, audience: workspace.audience, theme: workspace.theme ?? '', logline: workspace.logline ?? '' },
     outlinePlan: { chapter: { title: chapter.title, summary: chapter.summary ?? '' }, act: act ? { title: act.title, purpose: act.purpose, summary: act.summary } : null,
@@ -115,7 +127,7 @@ export function buildWriterContext(workspace: Workspace, sceneId: string, refere
     sceneElements: (({ missing: _missing, ...names }) => ({ ...names, notice: '本场的人物、环境与世界事件；环境的样貌与规则见 relatedObjects。' }))(sceneElements(workspace, scene)),
     style: writerStyle(workspace, scene),
     storySoFar: storySoFar(view, scene.id, { exclude: shown }), openThreads: threads.map(thread => thread.title), entityRecall: recall,
-    scene, materials, relatedObjects, initialFacts, initialCharacters, eventContexts, recentText, sources,
+    scene, materials, relatedObjects, initialFacts, initialCharacters, eventContexts: writerEvents, recentText, sources,
   };
 }
 

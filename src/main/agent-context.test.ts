@@ -346,3 +346,16 @@ test('连续性与文风审阅读到整场正文，不只是开头', () => {
     assert.match(JSON.stringify(review.context), /结尾处林舟说出了不该知道的名字/, role);
   }
 });
+
+test('写作上下文：每个人物只带最近的记忆并注明更早的条数，不把来源标签发给写作者', () => {
+  const base = fixture();
+  const workspace = applyCommands(base, Array.from({ length: 30 }, (_, index) => ({ type: 'putKnowledge' as const,
+    value: { id: `memory-${index}`, characterId: 'person', content: `第${index}条旧线索`, learnedAt: 'past', source: 'witness' as const } })));
+  const writer = specialistDefinition({ project: workspace, role: 'writer', node: node('writer', { sceneId: 'target' }), request: request(workspace, { stage: 'rewrite', sceneId: 'target' }) });
+  const person = (writer.context as any).eventContexts[0].characters.find((item: any) => item.characterId === 'person');
+  assert.equal(person.memories.length, 16);
+  assert.equal(person.earlierMemories, 31 - 16);
+  assert.equal(person.memories.at(-1).content, '第29条旧线索', '保留最近的记忆');
+  assert.equal(person.sources, undefined);
+  assert.ok(!writer.sources.some(source => source.kind === 'knowledge' && source.id === 'memory-0'), '没给写作者的记忆不算作依据');
+});
