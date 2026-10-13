@@ -1,6 +1,15 @@
-import type { AgentStep, Change, Command, RunRequest, TokenUsage, Workspace } from './types.js';
+import type { AgentStep, Change, Command, ProviderSettings, RunRequest, TokenUsage, Workspace } from './types.js';
 
 export type AgentRole = 'coordinator' | 'theme' | 'planner' | 'world' | 'narrative' | 'canvas' | 'cast' | 'writer' | 'character' | 'evolution' | 'reader' | 'continuity' | 'stylist';
+/** What the author sees for each role, in the order of ROLE_CAPABILITIES (main/agent/policy.ts). */
+export const ROLE_LABELS: Readonly<Record<AgentRole, string>> = Object.freeze({
+  coordinator: '创作统筹', theme: '立意', planner: '方案编排', world: '世界因果', narrative: '叙述编排',
+  canvas: '构思画布', cast: '人物塑造', writer: '正文创作', evolution: '人物演进', character: '人物视角', reader: '读者审查', continuity: '一致性审查', stylist: '文风审阅',
+});
+/** The model a role's requests go to: its own when the author set one, otherwise the main model. */
+export function modelForRole(provider: Pick<ProviderSettings, 'model' | 'roleModels'>, role: AgentRole): string {
+  return provider.roleModels?.[role]?.trim() || provider.model;
+}
 export interface AgentBudget {
   maxModelCalls: number; maxToolCalls: number; maxChildren: number; maxParallel: number;
   maxReplans: number; maxRevisions: number; maxActiveMs: number; maxTokens: number;

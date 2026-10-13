@@ -1,4 +1,4 @@
-import type { AgentRuntimeAPI, AgentRuntimeSummary } from './agent-types.js';
+import type { AgentRole, AgentRuntimeAPI, AgentRuntimeSummary } from './agent-types.js';
 import type { CompanionAPI, CompanionThread } from './companion-types.js';
 import type { StoryMemoryAPI, StoryMemoryStatus } from './story-types.js';
 import type { StyleAPI, StyleLearningStatus, StyleProfile } from './style-types.js';
@@ -105,6 +105,8 @@ export interface ProviderSettings {
   maxOutputTokens?: number;
   /** Optional embedding model: story memory then keeps a local semantic index and searches recall by meaning as well as by words. */
   embeddingModel?: string;
+  /** Optional model per agent role, at the same service; a role left out uses the main model (see modelForRole). */
+  roleModels?: Partial<Record<AgentRole, string>>;
 }
 export interface ProviderInput extends Omit<ProviderSettings, 'hasKey'> { apiKey?: string }
 export interface ProviderSecret extends Omit<ProviderSettings, 'hasKey'> { apiKey: string }

@@ -329,6 +329,7 @@ details[open] > summary::before { transform: rotate(45deg) !important; }
 details[open] > summary ~ * { animation: details-open var(--motion-content) var(--ease-out); }
 details > summary::-webkit-details-marker { display: none; }
 details.subsection[open] > summary { margin-bottom: 12px; }
+.role-models { margin: 2px 0 14px; }
 .nested-card { padding: 12px; margin-top: 10px; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius); }
 .nested-card > summary { font-weight: 600; }
 .nested-card[open] > summary { margin-bottom: 10px; }

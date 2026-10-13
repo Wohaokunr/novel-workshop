@@ -201,6 +201,18 @@ test('推理配置请求加密推理内容并给出更高的输出上限；无�
   } finally { await service.close(); }
 });
 
+test('智能体指定的模型发给服务，未指定时用配置的主模型', async () => {
+  const service = await fakeService(() => completed('OK'));
+  try {
+    const transport = new OpenAIResponseTransport(live(service.baseURL));
+    const options = { transport, context: {}, objective: 'x', signal: new AbortController().signal, contextSources: [] };
+    await runAgent(ask, { ...options, model: 'role-model' });
+    assert.equal(service.bodies.at(-1)!.model, 'role-model');
+    await runAgent(ask, options);
+    assert.equal(service.bodies.at(-1)!.model, 'fixture');
+  } finally { await service.close(); }
+});
+
 test('后台请求只在作者的请求都结束后逐个发出；取消排队不占位，作者的请求从不等待', async () => {
   const gate = new RequestGate(), signal = new AbortController().signal, order: string[] = [];
   const author = await gate.enter(false, signal);

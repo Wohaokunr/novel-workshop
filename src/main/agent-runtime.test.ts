@@ -53,6 +53,28 @@ function scenes(store: NovelStore, texts = ['', '']) {
   return store.execute({ projectId: initial.id, actor: 'human', commands: texts.map((text, i) => ({ type: 'putScene', value: { id: `scene-${i}`, chapterId: initial.chapters[0]!.id, order: i, title: `场景${i}`, text, outline: '人物面对当场线索作出选择', povId: null, eventIds: [] } })) });
 }
 
+test('每个角色的请求发给该角色指定的模型，未指定的角色用主模型；修改角色模型后旧任务不会发给新配置', { timeout: 15000 }, async () => {
+  const store = new NovelStore(':memory:');
+  try {
+    const project = scenes(store), requests: ModelRequest[] = [];
+    const request: RunRequest = { projectId: project.id, stage: 'chapter', sceneId: 'scene-0', objective: '只写这个场景' };
+    let settings: ProviderSecret = { ...provider, roleModels: { coordinator: 'strong', continuity: 'cheap' } };
+    const scheduler = new NovelAgentScheduler(store, () => settings, () => {}, () => {
+      const demo = new DemoAgentTransport(request, store.getProject(project.id));
+      return { stream: (input, signal) => { requests.push(structuredClone(input)); return demo.stream(input, signal); } };
+    });
+    const run = scheduler.start(request);
+    const pending = await wait(store, run);
+    assert.equal(pending.status, 'awaitingApproval', pending.error ?? pending.runtime?.pauseReason ?? '');
+    const models = (agentId: string) => new Set(requests.filter(item => item.agentId === agentId).map(item => item.model));
+    assert.deepEqual(models('coordinator'), new Set(['strong']));
+    assert.deepEqual(models('writer'), new Set(['fixture']));
+    assert.deepEqual(models('continuity'), new Set(['cheap']));
+    settings = { ...settings, roleModels: { coordinator: 'other' } };
+    await assert.rejects(scheduler.resume(run.id), /模型配置已变化/);
+  } finally { store.close(); }
+});
+
 test('自然语言目标动态委派并生成审查候选，批准前正文/设定/history 零写入', { timeout: 15000 }, async () => {
   const store = new NovelStore(':memory:');
   try {
