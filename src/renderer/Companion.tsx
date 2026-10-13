@@ -2,7 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useLayoutEffect, use
 import { createPortal } from 'react-dom';
 import { ArrowDown, ArrowRight, ArrowUp, Check, ChevronRight, CornerDownRight, GitBranch, GripHorizontal, Layers, Lightbulb, ListTree, LoaderCircle, MapPin, MessageCircleQuestion, MessagesSquare, PanelRight, PenLine, RefreshCw, Sparkles, Square, StickyNote, Trash2, Undo2, UserPlus, Workflow, X, type LucideIcon } from 'lucide-react';
 import type { Workspace } from '../shared/types';
-import type { CompanionAnchor, CompanionIntensity, CompanionMode, CompanionNovelField, CompanionOp, CompanionProposal, CompanionThread, CompanionTurn } from '../shared/companion-types';
+import type { CompanionAnchor, CompanionAskOptions, CompanionIntensity, CompanionMode, CompanionNovelField, CompanionOp, CompanionProposal, CompanionThread, CompanionTurn } from '../shared/companion-types';
 import { companionModeNames, focusNames, ideaKindNames, intensityNames, novelFieldNames } from '../shared/companion-types';
 import { nextStage } from '../shared/story-flow';
 import { companionCommands, selectCompanionItems } from '../shared/companion';
@@ -17,6 +17,8 @@ export interface SummonRequest {
   screen?: { x: number; y: number };
   /** Sent immediately when present. */
   message?: string;
+  /** Explicit choices sent with the message (e.g. a full three-layer outline draft). */
+  options?: CompanionAskOptions;
   label?: string;
 }
 interface PopoverState { threadId?: string; mode: CompanionMode; anchor: CompanionAnchor; x: number; y: number; label?: string; opener: HTMLElement | null }
@@ -24,7 +26,7 @@ interface CompanionApi {
   threads: CompanionThread[];
   intensity: CompanionIntensity; setIntensity: (value: CompanionIntensity) => void;
   summon: (request: SummonRequest) => void;
-  send: (target: { thread?: CompanionThread; mode: CompanionMode; anchor: CompanionAnchor }, message: string, retry?: boolean) => Promise<CompanionThread | undefined>;
+  send: (target: { thread?: CompanionThread; mode: CompanionMode; anchor: CompanionAnchor }, message: string, retry?: boolean, options?: CompanionAskOptions) => Promise<CompanionThread | undefined>;
   adopt: (thread: CompanionThread, turn: CompanionTurn, itemIds: string[], options?: { group?: boolean; target?: 'canvas' | 'sceneOutline'; as?: 'character' | 'setting' }) => Promise<void>;
   undo: (thread: CompanionThread, batchId: string) => Promise<void>;
   cancel: (thread: CompanionThread) => Promise<void>;
@@ -72,10 +74,10 @@ export function CompanionProvider({ workspace, children, beforeChange, onError, 
   const guard = useCallback(async <T,>(work: () => Promise<T>): Promise<T | undefined> => {
     try { return await work(); } catch (error) { onError(error); return undefined; }
   }, [onError]);
-  const send: CompanionApi['send'] = useCallback((target, message, retry = false) => guard(async () => {
+  const send: CompanionApi['send'] = useCallback((target, message, retry = false, options) => guard(async () => {
     if (!projectRef.current) throw new Error('请先打开作品');
     const thread = await window.novel.askCompanion({ projectId: projectRef.current, threadId: target.thread?.id, mode: target.thread?.mode ?? target.mode,
-      anchor: target.thread?.anchor ?? target.anchor, message, intensity, retry });
+      anchor: target.thread?.anchor ?? target.anchor, message, intensity, retry, ...(options ? { options } : {}) });
     upsert(thread); return thread;
   }), [guard, intensity, upsert]);
   const summon = useCallback((request: SummonRequest) => {
@@ -84,7 +86,7 @@ export function CompanionProvider({ workspace, children, beforeChange, onError, 
       if (request.screen) setPopover({ threadId, mode: request.mode, anchor: request.anchor, x: request.screen.x, y: request.screen.y, label: request.label, opener });
       else { setPopover(null); if (threadId) setPanelThread(threadId); else setPanelThread(`new:${request.mode}:${JSON.stringify(request.anchor)}`); showPanel(); }
     };
-    if (request.message) fire(send({ mode: request.mode, anchor: request.anchor }, request.message).then(thread => { if (thread) open(thread.id); }));
+    if (request.message) fire(send({ mode: request.mode, anchor: request.anchor }, request.message, false, request.options).then(thread => { if (thread) open(thread.id); }));
     else open();
   }, [send, showPanel]);
   const api: CompanionApi = {
@@ -188,10 +190,10 @@ export function CompanionThreadView({ workspace, thread, mode, anchor, onThread,
     element.style.height = 'auto';
     element.style.height = `${Math.min(element.scrollHeight, compact ? 120 : 160)}px`;
   }, [message, compact]);
-  const submit = (text: string, retry = false) => {
+  const submit = (text: string, retry = false, options?: CompanionAskOptions) => {
     if ((!text.trim() && !retry) || sending || streaming) return;
     setSending(true); pinned.current = true; setBehind(false);
-    fire(companion.send({ thread, mode, anchor }, text.trim(), retry).then(next => { if (next) { if (!retry) setMessage(''); onThread?.(next.id); } }).finally(() => setSending(false)));
+    fire(companion.send({ thread, mode, anchor }, text.trim(), retry, options).then(next => { if (next) { if (!retry) setMessage(''); onThread?.(next.id); } }).finally(() => setSending(false)));
   };
   const lastCompanion = [...turns].reverse().find(turn => turn.role === 'companion');
   const followUps = !streaming && lastCompanion === turns.at(-1) ? lastCompanion?.response?.followUps ?? [] : [];
@@ -200,10 +202,10 @@ export function CompanionThreadView({ workspace, thread, mode, anchor, onThread,
       const element = event.currentTarget, near = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
       pinned.current = near; if (near) setBehind(false);
     }}>
-      {!turns.length && <CompanionIntro mode={mode} disabled={sending || streaming} onPick={text => submit(text)}/>}
+      {!turns.length && <CompanionIntro mode={mode} disabled={sending || streaming} onPick={(text, options) => submit(text, false, options)}/>}
       {turns.map(turn => turn.role === 'author'
         ? <div key={turn.id} className="companion-msg author"><p className="companion-author">{turn.text}</p><time dateTime={turn.at}>{relativeTime(turn.at)}</time></div>
-        : <PartnerMessage key={turn.id} at={turn.at}><CompanionReply workspace={workspace} thread={thread!} turn={turn} latest={turn === lastCompanion} onAnswer={text => submit(text)}/></PartnerMessage>)}
+        : <PartnerMessage key={turn.id} at={turn.at} tokens={turn.usage?.provided ? turn.usage.total : undefined}><CompanionReply workspace={workspace} thread={thread!} turn={turn} latest={turn === lastCompanion} onAnswer={text => submit(text)}/></PartnerMessage>)}
       {streaming && <PartnerMessage live><div className="companion-reply streaming" aria-live="polite">
         {thread?.streaming ? <Markdown text={thread.streaming} streaming/> : <div className="companion-thinking"><span><Sparkles aria-hidden="true"/>正在构思…</span><i/><i/><i/></div>}
       </div></PartnerMessage>}
@@ -230,11 +232,11 @@ export function CompanionThreadView({ workspace, thread, mode, anchor, onThread,
 /** Staggered entrance for lists; capped so long lists don't wait. */
 const stagger = (index: number) => ({ '--i': Math.min(index, 6) } as React.CSSProperties);
 
-function PartnerMessage({ at, live = false, children }: { at?: string; live?: boolean; children: ReactNode }) {
+function PartnerMessage({ at, live = false, tokens, children }: { at?: string; live?: boolean; tokens?: number; children: ReactNode }) {
   return <div className={`companion-msg partner ${live ? 'live' : ''}`}>
     <span className="ai-mark companion-avatar" aria-hidden="true"><Sparkles/></span>
     <div className="companion-msg-body">
-      <div className="companion-msg-meta"><strong>创作伙伴</strong>{live ? <span className="live-dot" aria-hidden="true"/> : at && <time dateTime={at}>{relativeTime(at)}</time>}</div>
+      <div className="companion-msg-meta"><strong>创作伙伴</strong>{live ? <span className="live-dot" aria-hidden="true"/> : at && <time dateTime={at}>{relativeTime(at)}</time>}{tokens !== undefined && <span className="companion-usage" title="这条回复用掉的 token">{tokens.toLocaleString()} tokens</span>}</div>
       {children}
     </div>
   </div>;
@@ -252,18 +254,19 @@ function NextStep({ workspace, thread }: { workspace: Workspace; thread: Compani
 }
 
 const modeIcons: Record<CompanionMode, LucideIcon> = { diverge: Lightbulb, causality: GitBranch, structure: Workflow, outline: ListTree, beat: PenLine, develop: Sparkles, style: PenLine };
-/** Openers shown on an empty conversation; one click sends them. */
-const starters: Record<CompanionMode, string[]> = {
+/** Openers shown on an empty conversation; one click sends them, with explicit options where the answer differs in kind. */
+type Starter = string | { text: string; options: CompanionAskOptions };
+const starters: Record<CompanionMode, Starter[]> = {
   diverge: ['往几个截然不同的方向发散', '给我一个出人意料的反转', '先问我几个问题'],
   causality: ['往后推演两三步后果', '补一个关键前因', '如果这件事没发生呢？'],
   structure: ['诊断整体节奏', '换一个更抓人的开篇', '哪里的揭露太早了？'],
-  outline: ['先定故事骨架', '给我 3 个版本比较', '展开下一层'],
+  outline: ['先定故事骨架', '给我 3 个版本比较', '展开下一层', { text: '一次给出幕、章、场景三层完整草案', options: { fullDraft: true } }],
   beat: ['给我几个下一拍', '让冲突升级一点', '这一场怎么收尾？'],
-  develop: ['根据已有信息推断', '先问我几个选择题', '直接给我几个版本'],
+  develop: ['根据已有信息推断', '先问我几个选择题', { text: '直接给我几个版本', options: { versions: true } }],
   style: ['描述一下我的笔触', '给我几段盲测', '列出该避免的写法'],
 };
 
-function CompanionIntro({ mode, disabled, onPick }: { mode: CompanionMode; disabled: boolean; onPick: (text: string) => void }) {
+function CompanionIntro({ mode, disabled, onPick }: { mode: CompanionMode; disabled: boolean; onPick: (text: string, options?: CompanionAskOptions) => void }) {
   const text: Record<CompanionMode, string> = {
     diverge: '我会给你几个方向截然不同的点子，也会追问一些你可能还没想清楚的问题。喜欢的点子一键放到画布。',
     causality: '告诉我想往前追溯原因，还是往后推演后果。采纳的事件会接进世界因果图。',
@@ -278,7 +281,8 @@ function CompanionIntro({ mode, disabled, onPick }: { mode: CompanionMode; disab
     <span className="companion-intro-icon" aria-hidden="true"><Icon/></span>
     <strong>{companionModeNames[mode]}</strong>
     <p className="companion-intro">{text[mode]}</p>
-    <div className="companion-starters">{starters[mode].map((starter, index) => <button key={starter} type="button" className="chip" style={stagger(index)} disabled={disabled} onClick={() => onPick(starter)}>{starter}<ChevronRight aria-hidden="true"/></button>)}</div>
+    <div className="companion-starters">{starters[mode].map((starter, index) => { const text = typeof starter === 'string' ? starter : starter.text;
+      return <button key={text} type="button" className="chip" style={stagger(index)} disabled={disabled} onClick={() => onPick(text, typeof starter === 'string' ? undefined : starter.options)}>{text}<ChevronRight aria-hidden="true"/></button>; })}</div>
   </div>;
 }
 
@@ -409,10 +413,12 @@ function ProposalCard({ index, workspace, thread, turn, proposal, onAct }: { ind
       op.targetId && op.op !== 'moveScene' && op.op !== 'addChapter' && (op.op === 'addEvent' ? `引发「${nameOf(op.targetId)}」` : `「${nameOf(op.targetId)}」`),
       op.parentId && !op.parentRef && op.op !== 'moveScene' && !opensChapter && `归入「${nameOf(op.parentId)}」`,
       op.causes.length && `起因：${op.causes.map(id => proposal.ops.find(item => item.ref === id)?.title ?? nameOf(id)).join('、')}`].filter(Boolean).join(' · ');
-    return <li key={op.id} className={`op-node depth-${Math.min(depth, 3)} ${done ? 'adopted' : ''}`}>
+    const skip = proposal.check?.skipped.find(item => item.opId === op.id);
+    return <li key={op.id} className={`op-node depth-${Math.min(depth, 3)} ${done ? 'adopted' : ''} ${skip && !done ? 'will-skip' : ''}`}>
       <label><input type="checkbox" disabled={done} checked={done || selected.has(op.id)} onChange={event => toggle(node, event.target.checked)}/>
         <span className="op-kind">{opNames[op.op]}</span><strong>{op.title || nameOf(op.targetId)}</strong>{done && <Check className="op-done" aria-label="已采纳"/>}</label>
       {detail && <p>{detail}</p>}
+      {skip && !done && <p className="op-skip" role="note">采纳时会跳过：{skip.reason}</p>}
       {!!node.children.length && <ul>{node.children.map(child => renderNode(child, depth + 1))}</ul>}
     </li>;
   };
@@ -427,6 +433,7 @@ function ProposalCard({ index, workspace, thread, turn, proposal, onAct }: { ind
     </header>
     {!!preview.length && <div className="structure-preview">{preview.map(row => <div key={row.id} className={row.fresh ? 'fresh' : undefined}><span className="eyebrow">{row.chapter}{row.fresh && <b className="new-chapter">新章</b>}</span>
       <ol className="before">{row.fresh ? <li className="muted">尚无此章</li> : row.before.map((title, index) => <li key={index}>{title}</li>)}</ol><span aria-hidden="true">→</span><ol className="after">{row.after.map((title, index) => <li key={index}>{title}</li>)}</ol></div>)}</div>}
+    {proposal.check?.error && !batches.length && <p className="op-skip" role="note">生成时试算未通过，采纳可能失败：{proposal.check.error}</p>}
     {blind && !batches.length ? <p className="muted blind-note">选中后揭晓这一版对应的笔调。</p> : <ul className="op-tree">{tree.map(node => renderNode(node, 0))}</ul>}
     <div className="button-row proposal-actions">
       {!!pending.length && <button className="small primary" data-testid="adopt-proposal" disabled={!chosen.length} onClick={() => onAct(() => companion.adopt(thread, turn, itemIds))}>

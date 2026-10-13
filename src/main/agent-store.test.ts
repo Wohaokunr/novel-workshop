@@ -5,7 +5,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { NovelStore } from './store.js';
+import { KEEP_FINISHED_SNAPSHOTS, NovelStore } from './store.js';
 import { STORE_SCHEMA_VERSION } from './migrations.js';
 import { applyCommands, createWorkspace } from './domain.js';
 import type { AgentRun, CanvasCard, Command, OperationBatch, Workspace } from '../shared/types.js';
@@ -210,14 +210,15 @@ test('正文候选审批必须有当前版本的独立审查；设定候选可�
   assert.equal(applied.state.candidates[0]!.reviews[1]!.verdict, 'revise');
 });
 
-test('预览与提交 commands/changes/workspace 不一致时原子阻止提交', t => {
+test('预览与提交 commands/changes/基础快照不一致时原子阻止提交', t => {
   const { store } = temporaryStore(t), f = candidateFixture(store);
   for (const mutate of [
-    (candidate: AgentCandidate) => { candidate.commands = [{ type: 'updateNovel', patch: { brief: '篡改命令' } }]; },
-    (candidate: AgentCandidate) => { candidate.changes[0]!.after = '篡改预览'; },
-    (candidate: AgentCandidate) => { candidate.workspace.brief = '篡改快照'; },
+    (state: AgentState) => { state.candidates[0]!.commands = [{ type: 'updateNovel', patch: { brief: '篡改命令' } }]; },
+    (state: AgentState) => { state.candidates[0]!.changes[0]!.after = '篡改预览'; },
+    // Candidate workspaces are rebuilt from the base snapshot, so a snapshot that is not the formal project must not commit.
+    (state: AgentState) => { state.baseWorkspace.genre = '篡改快照'; },
   ]) {
-    const state = structuredClone(f.state); mutate(state.candidates[0]!); store.saveAgentState(state);
+    const state = structuredClone(f.state); mutate(state); store.saveAgentState(state);
     assert.throws(() => store.commitAgentCandidate(f.decision, completeCheckpoint), /CANDIDATE_DIFF_MISMATCH/);
     assert.deepEqual(store.getProject(f.before.id), f.before); assert.equal(store.history(f.before.id).length, 0);
     assert.equal(store.getAgentReceipt(f.receipt.key)!.status, 'pending');
@@ -356,4 +357,49 @@ test('receipt 唯一 key/参数 hash/项目和 run 受保护，terminal result �
   assert.throws(() => store.saveAgentReceipt({ ...completed, projectId: second.before.id }), /不属于/);
   assert.throws(() => store.saveAgentReceipt({ ...completed, runId: second.run.id, projectId: second.before.id }), /冲突/);
   assert.equal(store.getAgentReceipt('missing'), undefined);
+});
+
+test('状态行不含书稿副本：基础快照每个任务只写一次，候选工作区在载入时由基础与命令重建', t => {
+  const { store, filename } = temporaryStore(t), f = candidateFixture(store);
+  const data = JSON.parse(row(filename, 'SELECT data FROM agent_states').data as string) as Record<string, unknown> & { candidates: Array<Record<string, unknown>> };
+  assert.equal(data.baseWorkspace, undefined); assert.ok(data.candidates.every(candidate => !('workspace' in candidate)));
+  const written = row(filename, 'SELECT updated_at FROM agent_snapshots').updated_at;
+  store.saveAgentState({ ...f.state, updatedAt: '2026-10-11T00:00:00.000Z' });
+  assert.equal(row(filename, 'SELECT updated_at FROM agent_snapshots').updated_at, written, '同一基础快照不重复写入');
+  store.saveAgentState({ ...f.state, baseWorkspace: structuredClone(f.before), updatedAt: '2026-10-12T00:00:00.000Z' });
+  assert.equal(row(filename, 'SELECT updated_at FROM agent_snapshots').updated_at, '2026-10-12T00:00:00.000Z', '替换基础快照时重写');
+  const loaded = store.getAgentState(f.run.id)!;
+  assert.deepEqual(loaded.baseWorkspace, f.before); assert.deepEqual(loaded.candidates[0]!.workspace, stored(f.preview.workspace));
+  const slim = store.getStoredAgentState(f.run.id)!;
+  assert.ok(!('baseWorkspace' in slim) && !('workspace' in slim.candidates[0]!));
+  assert.ok(store.listAgentStates().every(state => !('baseWorkspace' in state)));
+});
+
+test('旧格式状态压缩：未结束任务的基础快照移入独立表，已结束任务只保留记录', t => {
+  const temp = temporaryStore(t), active = candidateFixture(temp.store), finished = candidateFixture(temp.store);
+  temp.store.saveRun({ ...finished.run, status: 'completed', finishedAt: at });
+  // Rows from before snapshots: base and candidate workspaces inline.
+  const db = new DatabaseSync(temp.filename);
+  for (const f of [active, finished]) db.prepare('UPDATE agent_states SET data=? WHERE run_id=?').run(JSON.stringify(f.state), f.run.id);
+  db.exec('DELETE FROM agent_snapshots'); db.close();
+  const store = temp.reopen();
+  assert.deepEqual(store.getAgentState(active.run.id)!.candidates[0]!.workspace, stored(active.preview.workspace), '压缩前仍可读取旧格式');
+  assert.equal(store.compactLegacyAgentStates(), 2); assert.equal(store.compactLegacyAgentStates(), 0);
+  assert.equal(row(temp.filename, `SELECT COUNT(*) AS count FROM agent_states WHERE instr(data, '"baseWorkspace":') > 0`).count, 0);
+  assert.equal(row(temp.filename, 'SELECT COUNT(*) AS count FROM agent_snapshots').count, 1);
+  assert.deepEqual(store.getAgentState(active.run.id)!.baseWorkspace, active.before);
+  assert.equal(store.commitAgentCandidate(active.decision, completeCheckpoint).state.candidates[0]!.status, 'applied');
+  assert.throws(() => store.getAgentState(finished.run.id), /已清理/);
+  assert.equal(store.getStoredAgentState(finished.run.id)!.candidates[0]!.id, finished.candidate.id);
+});
+
+test('已结束任务的基础快照只保留最近几条，未结束任务的快照不清理', t => {
+  const { store, filename } = temporaryStore(t), project = store.createProject('快照清理');
+  const fixtures = Array.from({ length: KEEP_FINISHED_SNAPSHOTS + 2 }, () => candidateFixture(store, undefined, project));
+  for (const f of fixtures.slice(0, -1)) store.saveRun({ ...f.run, status: 'completed', finishedAt: at });
+  assert.equal(store.pruneAgentSnapshots(project.id), 1);
+  assert.equal(row(filename, 'SELECT COUNT(*) AS count FROM agent_snapshots').count, KEEP_FINISHED_SNAPSHOTS + 1);
+  assert.throws(() => store.getAgentState(fixtures[0]!.run.id), /已清理/);
+  assert.ok(store.getAgentState(fixtures.at(-1)!.run.id), '未结束任务保留快照');
+  assert.equal(store.pruneAgentSnapshots(project.id), 0);
 });

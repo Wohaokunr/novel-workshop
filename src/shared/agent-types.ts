@@ -11,6 +11,8 @@ export interface PlanNode {
   id: string; role: Exclude<AgentRole, 'coordinator'>; objective: string; dependsOn: string[];
   sceneId?: string; characterId?: string; eventId?: string; chapterId?: string;
   acceptance: string; status: 'pending' | 'running' | 'completed' | 'failed'; artifactId?: string;
+  /** Why a failed node failed, as reported to the coordinator and the author. */
+  error?: string;
 }
 export interface AgentPlan { version: number; summary: string; nodes: PlanNode[] }
 export interface EvidenceSource { projectId: string; kind: string; id: string; hash: string; start?: number; end?: number }
@@ -23,6 +25,8 @@ export interface AgentCandidate {
   hash: string; commands: Command[]; changes: Change[]; workspace: Workspace;
   sources: EvidenceSource[]; reviews: CandidateReview[];
   status: 'draft' | 'awaitingApproval' | 'applied' | 'rejected' | 'stale';
+  /** Artifacts whose commands this cumulative candidate already contains. */
+  artifactIds?: string[];
   batchId?: string; appliedRevision?: number; commitCallKey?: string; createdAt: string;
 }
 export interface AgentArtifact {
@@ -47,6 +51,10 @@ export interface AgentState {
   waiting?: AgentWaiting; pauseReason?: string; interrupted?: boolean;
   currentStepId?: string; finalSummary?: string; updatedAt: string;
 }
+/** Persisted form of a run's state. The base snapshot is stored once in its own table and candidate workspaces are
+ * rebuilt from base + commands when a run is loaded, so a save writes neither copy of the book. */
+export type StoredAgentCandidate = Omit<AgentCandidate, 'workspace'>;
+export type StoredAgentState = Omit<AgentState, 'baseWorkspace' | 'candidates'> & { candidates: StoredAgentCandidate[] };
 export interface AgentReceipt {
   key: string; runId: string; projectId: string; argumentsHash: string;
   status: 'pending' | 'completed' | 'denied'; result?: unknown; at: string;
@@ -74,6 +82,8 @@ export interface AgentRuntimeAPI {
   confirmMemory(projectId: string, id: string): Promise<void>;
   deleteMemory(projectId: string, id: string): Promise<void>;
 }
+/** A finished dependency's conclusion handed to a dependent author-side node. */
+export interface UpstreamResult { nodeId: string; role: Exclude<AgentRole, 'coordinator'>; label: string; objective: string; result: unknown }
 export interface SpecialistResult { step: AgentStep; text: string; structured?: unknown; commands?: Command[] }
 export interface SpecialistRequest { role: Exclude<AgentRole, 'coordinator'>; node: PlanNode; project: Workspace; request: RunRequest }
 export interface SearchChunk { source: EvidenceSource; title: string; text: string; score: number }

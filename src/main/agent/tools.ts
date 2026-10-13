@@ -1,10 +1,11 @@
 import { objectSchema, type AgentTool, type JsonSchema, type ToolCallContext } from '../responses.js';
+import { PLAN_ROLES } from './policy.js';
 
 const string: JsonSchema = { type: 'string' };
 const strings: JsonSchema = { type: 'array', items: string };
 const nullable: JsonSchema = { type: ['string', 'null'] };
 const node = objectSchema({
-  id: string, role: { type: 'string', enum: ['theme', 'planner', 'world', 'narrative', 'canvas', 'cast', 'writer', 'character', 'evolution', 'reader', 'continuity'] },
+  id: string, role: { type: 'string', enum: PLAN_ROLES },
   objective: string, dependsOn: strings, acceptance: string,
   sceneId: nullable, chapterId: nullable, characterId: nullable, eventId: nullable,
 });
@@ -17,17 +18,17 @@ export const toolDefinitions = [
   { name: 'get_context', description: '装配一个场景的写作上下文，包括其事件、人物知识边界和前文。', parameters: objectSchema({ sceneId: string, candidateId: nullable }) },
   { name: 'recall_memory', description: '读取作者确认的偏好/约束及有来源的任务经验；记忆不是正式小说事实。', parameters: objectSchema({}) },
   { name: 'refresh_context', description: '人工修改使旧候选过期时，重新读取作品基线并作新计划；旧候选保留但不可继续批准。', parameters: objectSchema({}) },
-  { name: 'set_plan', description: '保存真正可执行的专长任务及依赖。节点状态由实际执行推进，不接受自称已完成。仅在目标需要这些专长时设置，不必固定调用所有角色；构思类目标不超过 6 个节点。保存后必须立即按返回的 next 用 delegate_tasks 执行。cast=人物塑造（新建/丰富人物并在画布连线）。', parameters: objectSchema({ summary: string, nodes: { type: 'array', items: node } }) },
-  { name: 'delegate_tasks', description: '执行已保存计划中依赖满足的节点；最多两个独立专长并行。子任务返回真实报告/草稿/命令建议，绝不直接改正式作品。', parameters: objectSchema({ nodeIds: strings }) },
+  { name: 'set_plan', description: '保存真正可执行的专长任务及依赖。保存后运行时自动按依赖执行节点、把带修改的产物组成候选、审查正文并提交作者批准，完成或需要你决定时交还给你。节点状态由实际执行推进，不接受自称已完成；重新规划时，目标、范围与依赖未变的已完成节点保留结果。仅在目标需要这些专长时设置，不必固定调用所有角色；构思类目标不超过 6 个节点。cast=人物塑造（新建/丰富人物并在画布连线）。', parameters: objectSchema({ summary: string, nodes: { type: 'array', items: node } }) },
+  { name: 'delegate_tasks', description: '立即执行已保存计划中依赖满足的节点（最多两个并行）。通常不需要：运行时会自动执行计划。子任务返回结论和修改条数，绝不直接改正式作品。', parameters: objectSchema({ nodeIds: strings }) },
   { name: 'save_report', description: '保存分析或回答作为本次实际产物。纯分析目标不必生成修改。', parameters: objectSchema({ label: string, text: string }) },
-  { name: 'propose_changes', description: '把子任务产物中的命令、commandsJson(JSON命令数组，可为空字符串)和 opsJson(故事操作数组，可为空字符串)组装为累计候选工作区。画布卡片、连线、人物、事件因果、大纲优先用 opsJson，程序自动处理位置与引用。只预览，不改正式作品；返回 nextAction 指明下一步。', parameters: objectSchema({ label: string, artifactIds: strings, commandsJson: string, opsJson: string }) },
+  { name: 'propose_changes', description: '把子任务产物中的命令、commandsJson(JSON命令数组，可为空字符串)和 opsJson(故事操作数组，可为空字符串)组装为累计候选工作区。画布卡片、连线、人物、事件因果、大纲优先用 opsJson，程序自动处理位置与引用。只预览，不改正式作品；组成后运行时会按需审查并提交作者批准。', parameters: objectSchema({ label: string, artifactIds: strings, commandsJson: string, opsJson: string }) },
   { name: 'read_candidate', description: '检查候选修改及工作区，后续写作/检查可以使用候选版本。', parameters: objectSchema({ candidateId: string }) },
   { name: 'revise_candidate', description: '按候选审查意见重新执行指定计划节点，读取当前候选原文与审查意见并形成新候选。用于修订，不要重复委派已完成节点取回旧产物。修订后需要重新 review_candidate。', parameters: objectSchema({ candidateId: string, nodeIds: strings, objective: string }) },
-  { name: 'review_candidate', description: '只在候选修改了正文时需要。独立审查候选正文；有修改意见时自动让写作者修订并重新审查，直到通过或达到修订上限。返回最终候选 candidateId/candidateHash，后续审批必须使用返回的新版本标识。', parameters: objectSchema({ candidateId: string }) },
-  { name: 'commit_candidate', description: '把候选提交作者一键批准：修改正文的候选须先 review_candidate；只改设定、画布、人物、大纲的候选可直接提交。审查建议修改时也可提交，由作者决定是否接受。执行将挂起等待批准，未批准不算保存；拒绝后应尊重作者，不绕过审批。', parameters: objectSchema({ candidateId: string, candidateHash: string }) },
+  { name: 'review_candidate', description: '通常由运行时自动调用。独立审查修改了正文的候选；有修改意见时自动让写作者修订并重新审查，直到通过或达到修订上限。返回最终候选 candidateId/candidateHash。', parameters: objectSchema({ candidateId: string }) },
+  { name: 'commit_candidate', description: '通常由运行时自动调用。把候选提交作者一键批准：修改正文的候选须先审查；只改设定、画布、人物、大纲的候选可直接提交。执行将挂起等待批准，未批准不算保存；拒绝后应尊重作者，不绕过审批。', parameters: objectSchema({ candidateId: string, candidateHash: string }) },
   { name: 'ask_author', description: '缺少作者必须决定的信息时提出一个具体问题，持久等待回答。options 给 2–4 个可直接点选的具体答案（无法预设时给 []）。不要询问可以由现有资料或常规默认决定的问题。', parameters: objectSchema({ question: string, options: strings }) },
   { name: 'suggest_memory', description: '提出可供作者确认的偏好/约束记忆，不能把自己的建议自动变成作者偏好。', parameters: objectSchema({ content: string, kind: { type: 'string', enum: ['preference', 'constraint'] } }) },
-  { name: 'finish_run', description: '根据真实产物和完成节点提交最终总结。存在未完成计划、未审查/未批准候选时不能声称作品已完成修改。', parameters: objectSchema({ summary: string, artifactIds: strings }) },
+  { name: 'finish_run', description: '根据真实产物提交最终总结。计划还有可执行节点或候选正等待作者决定时不能结束；失败的节点与未提交的修改由运行时记录在总结之后，总结里也要如实说明。', parameters: objectSchema({ summary: string, artifactIds: strings }) },
 ] as const;
 export type ToolName = typeof toolDefinitions[number]['name'];
 export function createCoordinatorTools(execute: (name: ToolName, args: Record<string, unknown>, signal: AbortSignal, call?: ToolCallContext) => Promise<unknown>): AgentTool[] {

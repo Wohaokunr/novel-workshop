@@ -12,7 +12,8 @@
     "build": "tsc -p tsconfig.electron.json && vite build --base=./ --outDir dist/renderer",
     "start": "electron .",
     "test": "tsc -p tsconfig.tests.json && node --test dist-tests/main/*.test.js",
-    "smoke": "node scripts/smoke.mjs"
+    "smoke": "node scripts/smoke.mjs",
+    "eval": "tsc -p tsconfig.tests.json && node dist-tests/main/eval/run.js"
   },
   "dependencies": {
     "@xyflow/react": "12.12.0",

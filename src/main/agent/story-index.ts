@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { Workspace } from '../../shared/types.js';
+import { objectNames } from '../../shared/story-elements.js';
 
 /** Zero-token index over prose: paragraph chunks, an inverted bigram index and entity mentions.
  * Rebuilt incrementally per scene; nothing here calls a model or leaves the process. */
@@ -71,12 +72,28 @@ export function sketchSimilarity(a: number[] | undefined, b: number[]): number {
 
 const cache = new Map<string, StoryIndex>();
 
+/** Names grouped by first character, longest first, so a scan takes the longest name at each position. */
+const byFirstCache = new WeakMap<StoryIndex['names'], Map<string, StoryIndex['names']>>();
+function namesByFirst(names: StoryIndex['names']) {
+  let grouped = byFirstCache.get(names);
+  if (grouped) return grouped;
+  grouped = new Map();
+  for (const entry of [...names].sort((a, b) => b.name.length - a.name.length)) {
+    const list = grouped.get(entry.name[0]!) ?? [];
+    list.push(entry); grouped.set(entry.name[0]!, list);
+  }
+  byFirstCache.set(names, grouped);
+  return grouped;
+}
+/** Mentions by name or alias. At each position the longest matching name wins, so 「李明」 is not found inside 「李明月」. */
 function mentionsOf(text: string, names: StoryIndex['names']): Map<string, Mention> {
-  const result = new Map<string, Mention>();
-  for (const { id, name } of names) {
-    let at = text.indexOf(name), count = 0, first = -1, last = -1;
-    while (at >= 0) { count++; if (first < 0) first = at; last = at; at = text.indexOf(name, at + name.length); }
-    if (count) result.set(id, { count, first, last });
+  const result = new Map<string, Mention>(), grouped = namesByFirst(names);
+  for (let at = 0; at < text.length;) {
+    const match = grouped.get(text[at]!)?.find(entry => text.startsWith(entry.name, at));
+    if (!match) { at++; continue; }
+    const mention = result.get(match.id);
+    if (mention) { mention.count++; mention.last = at; } else result.set(match.id, { count: 1, first: at, last: at });
+    at += match.name.length;
   }
   return result;
 }
@@ -103,7 +120,7 @@ export function storyIndex(workspace: Workspace): StoryIndex {
   cache.set(workspace.id, index);
   while (cache.size > MAX_CACHED_PROJECTS) cache.delete(cache.keys().next().value!);
 
-  const names = workspace.objects.filter(object => Array.from(object.name.trim()).length >= 2).map(object => ({ id: object.id, name: object.name.trim() }));
+  const names = workspace.objects.flatMap(object => objectNames(object).map(name => ({ id: object.id, name })));
   const namesKey = names.map(item => `${item.id}\u0000${item.name}`).join('\u0001');
   const renamed = namesKey !== index.namesKey;
   index.names = names; index.namesKey = namesKey;

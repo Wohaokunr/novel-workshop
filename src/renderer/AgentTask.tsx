@@ -193,7 +193,7 @@ export function PlanStepper({ run, live = false }: { run: AgentRun; live?: boole
     {plan.summary && <Markdown text={plan.summary} className="plan-summary"/>}
     <ol className="plan-stepper">{plan.nodes.map((node, index) => <li key={node.id} className={`step ${node.status}`} style={{ '--i': Math.min(index, 8) } as React.CSSProperties} data-testid="agent-plan-node" data-node-id={node.id} data-node-status={node.status}>
       <StepIcon status={node.status}/>
-      <div><strong>{roleNames[node.role]}</strong><span>{node.objective}</span>{node.status === 'running' && node.acceptance && <small>完成要求：{node.acceptance}</small>}</div>
+      <div><strong>{roleNames[node.role]}</strong><span>{node.objective}</span>{node.status === 'running' && node.acceptance && <small>完成要求：{node.acceptance}</small>}{node.status === 'failed' && node.error && <small>未完成：{node.error}</small>}</div>
       <span className="sr-only">{nodeStatuses[node.status]}</span>
     </li>)}</ol>
   </div>;

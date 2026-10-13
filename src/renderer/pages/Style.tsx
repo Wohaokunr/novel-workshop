@@ -235,12 +235,12 @@ function Learned({ workspace: w, style, update }: { workspace: Workspace; style:
   }, '采纳文风建议'));
   const dismiss = (suggestion: StyleSuggestion) => fire(update(current => ({ suggestions: current.suggestions.map(item => item.id === suggestion.id ? { ...item, status: 'dismissed' as const } : item) }), '忽略文风建议'));
   const avoid = (word: string) => fire(update(current => ({ avoidWords: [...new Set([...current.avoidWords, word])] }), '加入禁用词'));
-  const waiting = (status?.pendingEdits ?? 0) + (status?.pendingRejections ?? 0);
+  const waiting = (status?.pendingEdits ?? 0) + (status?.pendingRejections ?? 0) + (status?.pendingChoices ?? 0);
   const learn = () => { setError(''); fire(window.novel.learnStyle(w.id).then(setStatus).catch(reason => setError(reason instanceof Error ? reason.message : String(reason)))); };
   return <section className="panel style-learned" aria-labelledby="style-learned">
-    <div className="section-heading"><div><h2 id="style-learned">学到的偏好</h2><p className="muted">从你对 AI 正文的改稿和拒稿理由里学，采纳后才生效。</p></div></div>
+    <div className="section-heading"><div><h2 id="style-learned">学到的偏好</h2><p className="muted">从你对 AI 正文的改稿、拒稿理由，以及在创作伙伴几个方案之间的取舍里学，采纳后才生效。</p></div></div>
     <div className="style-learn-bar">
-      <span>{status ? waiting ? `${status.pendingEdits} 处改稿 · ${status.pendingRejections} 条拒稿理由待整理` : '暂无新的改稿可学习' : '正在统计…'}</span>
+      <span>{status ? waiting ? `${status.pendingEdits} 处改稿 · ${status.pendingRejections} 条拒稿理由 · ${status.pendingChoices} 次方案取舍待整理` : '暂无新的改稿可学习' : '正在统计…'}{status?.usage.provided ? ` · 本次启动用量 ${status.usage.total.toLocaleString()} tokens` : ''}</span>
       <button className="small" data-testid="style-learn" disabled={!waiting || status?.running} onClick={learn}>{status?.running ? <RefreshCw className="spin" aria-hidden="true"/> : <Sparkles aria-hidden="true"/>}{status?.running ? '整理中…' : '整理改稿偏好'}</button>
     </div>
     {!!status?.deletedWords.length && <div className="style-deleted"><span className="muted">你常删掉：</span><div className="chips">{status.deletedWords.map(item => <button key={item.word} className="chip" title="加入禁用词" onClick={() => avoid(item.word)}>{item.word}<small>×{item.count}</small><Plus aria-hidden="true"/></button>)}</div></div>}

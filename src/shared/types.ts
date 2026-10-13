@@ -10,7 +10,11 @@ export interface EventData {
   worldOrder: number; timeLabel: string; thread: string; participants: string[];
   causes: string[]; critical: boolean; observations: Record<string, string>;
 }
-export interface NovelObject { id: string; typeId: string; name: string; fields: Record<string, FieldValue>; event?: EventData }
+export interface NovelObject {
+  id: string; typeId: string; name: string; fields: Record<string, FieldValue>; event?: EventData;
+  /** Other names the prose uses (nicknames, titles, forms of address); used to find where the object appears. */
+  aliases?: string[];
+}
 export interface Chapter { id: string; title: string; order: number; actId?: string; summary?: string }
 /** A volume / act in the layered outline; chapters opt in through actId. */
 export interface Act { id: string; title: string; order: number; purpose: string; summary: string }
@@ -76,6 +80,8 @@ export interface AgentStep {
   id: string; agentId: string; label: string; status: RunStatus; input: unknown; output: string;
   structured?: unknown; tools: ToolActivity[]; usage: TokenUsage; startedAt: string; finishedAt?: string;
   contextSources: string[]; responseIds: string[];
+  /** Version (text hash) of the instructions this step ran with; see src/main/prompts. */
+  promptVersion?: string;
 }
 export type AssistTool = 'character' | 'world' | 'narrative' | 'canvas' | 'theme' | 'continuity';
 export interface RunRequest {
@@ -95,6 +101,10 @@ export interface ProviderSettings {
   summaryModel?: string;
   /** auto: digest prose in the background after edits; manual: only when the author asks. */
   storyMemory?: 'auto' | 'manual';
+  /** Output token cap per request, reasoning included; empty uses a default (see outputTokenLimit). Not applied to a separate summary model. */
+  maxOutputTokens?: number;
+  /** Optional embedding model: story memory then keeps a local semantic index and searches recall by meaning as well as by words. */
+  embeddingModel?: string;
 }
 export interface ProviderInput extends Omit<ProviderSettings, 'hasKey'> { apiKey?: string }
 export interface ProviderSecret extends Omit<ProviderSettings, 'hasKey'> { apiKey: string }

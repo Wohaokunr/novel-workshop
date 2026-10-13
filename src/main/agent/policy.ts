@@ -5,22 +5,29 @@ import { DomainValidationError, NOVEL_FIELDS, validateWorkspace } from '../domai
 import { STYLE_KEYS, styleProfile, type StyleKey } from '../../shared/style-types.js';
 
 export const MAX_PLAN_NODES = 12;
-export const ROLE_CAPABILITIES: Readonly<Record<AgentRole, { readAuthor: boolean; proposeCommands: boolean; directWrite: false }>> = Object.freeze({
-  coordinator: { readAuthor: true, proposeCommands: true, directWrite: false },
-  theme: { readAuthor: true, proposeCommands: true, directWrite: false },
-  planner: { readAuthor: true, proposeCommands: true, directWrite: false },
-  world: { readAuthor: true, proposeCommands: true, directWrite: false },
-  narrative: { readAuthor: true, proposeCommands: true, directWrite: false },
-  canvas: { readAuthor: true, proposeCommands: true, directWrite: false },
-  cast: { readAuthor: true, proposeCommands: true, directWrite: false },
-  writer: { readAuthor: true, proposeCommands: true, directWrite: false },
-  evolution: { readAuthor: true, proposeCommands: true, directWrite: false },
-  character: { readAuthor: false, proposeCommands: false, directWrite: false },
-  reader: { readAuthor: false, proposeCommands: false, directWrite: false },
-  continuity: { readAuthor: true, proposeCommands: false, directWrite: false },
+/** The one role list. plan: the coordinator may put the role in a plan (the stylist only runs inside candidate review);
+ * upstream: the role receives its plan dependencies' conclusions (character, reader, stylist and evolution keep bounded views). */
+export const ROLE_CAPABILITIES: Readonly<Record<AgentRole, { readAuthor: boolean; proposeCommands: boolean; plan: boolean; upstream: boolean; directWrite: false }>> = Object.freeze({
+  coordinator: { readAuthor: true, proposeCommands: true, plan: false, upstream: false, directWrite: false },
+  theme: { readAuthor: true, proposeCommands: true, plan: true, upstream: true, directWrite: false },
+  planner: { readAuthor: true, proposeCommands: true, plan: true, upstream: true, directWrite: false },
+  world: { readAuthor: true, proposeCommands: true, plan: true, upstream: true, directWrite: false },
+  narrative: { readAuthor: true, proposeCommands: true, plan: true, upstream: true, directWrite: false },
+  canvas: { readAuthor: true, proposeCommands: true, plan: true, upstream: true, directWrite: false },
+  cast: { readAuthor: true, proposeCommands: true, plan: true, upstream: true, directWrite: false },
+  writer: { readAuthor: true, proposeCommands: true, plan: true, upstream: true, directWrite: false },
+  evolution: { readAuthor: true, proposeCommands: true, plan: true, upstream: false, directWrite: false },
+  character: { readAuthor: false, proposeCommands: false, plan: true, upstream: false, directWrite: false },
+  reader: { readAuthor: false, proposeCommands: false, plan: true, upstream: false, directWrite: false },
+  continuity: { readAuthor: true, proposeCommands: false, plan: true, upstream: true, directWrite: false },
   // Reads prose and the style profile only, never world truth.
-  stylist: { readAuthor: false, proposeCommands: false, directWrite: false },
+  stylist: { readAuthor: false, proposeCommands: false, plan: false, upstream: false, directWrite: false },
 });
+const roleNames = Object.keys(ROLE_CAPABILITIES) as AgentRole[];
+/** Roles a plan node may name, in a stable order (also the tool schema's enum). */
+export const PLAN_ROLES = roleNames.filter(role => ROLE_CAPABILITIES[role].plan) as Array<PlanNode['role']>;
+export const UPSTREAM_ROLES: ReadonlySet<AgentRole> = new Set(roleNames.filter(role => ROLE_CAPABILITIES[role].upstream));
+export function isRole(role: string): role is AgentRole { return Object.hasOwn(ROLE_CAPABILITIES, role); }
 
 /** Prose needs independent review; settings, canvas, cast and outline changes go straight to one-click approval. */
 export function touchesProse(candidate: { changes: Change[] }): boolean {
@@ -65,7 +72,8 @@ export function scopedScenes(workspace: Workspace, request: RunRequest): Narrati
 /** Reused by specialist construction; dependencies are validated separately by validatePlan. */
 export function validatePlanTarget(node: PlanNode, workspace: Workspace, request: RunRequest): void {
   requirePlan(workspace.id === request.projectId, '任务与项目不匹配');
-  requirePlan(node && Object.hasOwn(ROLE_CAPABILITIES, node.role) && node.role !== ('coordinator' as string), '角色无效');
+  // Any specialist: review builds reader and stylist nodes too. Whether the coordinator may plan a role is checked by set_plan (PLAN_ROLES).
+  requirePlan(node && isRole(node.role) && (node.role as string) !== 'coordinator', '角色无效');
   const sceneId = node.sceneId ?? request.sceneId;
   const chapterId = node.chapterId ?? request.chapterId;
   const scene = sceneId ? workspace.scenes.find(item => item.id === sceneId) : undefined;
@@ -125,6 +133,33 @@ export function validatePlan(nodes: PlanNode[], workspace: Workspace, request: R
     visiting.delete(node.id); visited.add(node.id);
   };
   for (const node of nodes) visit(node);
+}
+
+/** Writer nodes run in reading order, each after the previous one, so every scene is written after the prose it follows.
+ * Only edges that cannot form a cycle are added (nodes already ordered either way are left alone). Returns how many were added. */
+export function chainWriterNodes(nodes: PlanNode[], workspace: Workspace, request: RunRequest): number {
+  const chapters = new Map([...workspace.chapters].sort((a, b) => a.order - b.order).map((chapter, index) => [chapter.id, index]));
+  const position = (node: PlanNode) => {
+    const scene = workspace.scenes.find(item => item.id === (node.sceneId ?? request.sceneId));
+    return scene ? [chapters.get(scene.chapterId) ?? Infinity, scene.order] : [Infinity, Infinity];
+  };
+  const writers = nodes.filter(node => node.role === 'writer').map(node => ({ node, at: position(node) }))
+    .sort((a, b) => a.at[0]! - b.at[0]! || a.at[1]! - b.at[1]!).map(item => item.node);
+  const byId = new Map(nodes.map(node => [node.id, node]));
+  const reaches = (from: PlanNode, target: string, seen = new Set<string>()): boolean => from.dependsOn.some(id => {
+    if (id === target) return true;
+    if (seen.has(id)) return false;
+    seen.add(id);
+    const next = byId.get(id);
+    return !!next && reaches(next, target, seen);
+  });
+  let added = 0;
+  for (let index = 1; index < writers.length; index++) {
+    const previous = writers[index - 1]!, node = writers[index]!;
+    if (reaches(node, previous.id) || reaches(previous, node.id)) continue;
+    node.dependsOn.push(previous.id); added++;
+  }
+  return added;
 }
 
 const collections = ['objectTypes', 'objects', 'acts', 'chapters', 'scenes', 'facts', 'knowledge', 'characterStates', 'cards', 'canvasLinks'] as const;

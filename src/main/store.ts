@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import type { AgentRun, CanvasCard, Change, Command, CommandRequest, OperationBatch, ProjectSummary, Workspace } from '../shared/types.js';
-import type { AgentDecision, AgentMemory, AgentReceipt, AgentSession, AgentState, EvidenceSource } from '../shared/agent-types.js';
+import type { AgentDecision, AgentMemory, AgentReceipt, AgentSession, AgentState, EvidenceSource, StoredAgentState } from '../shared/agent-types.js';
 import { applyCommands, cardContent, createWorkspace, hasSemanticChanges, NOVEL_FIELDS, validateWorkspace } from './domain.js';
 import { migrateDatabase } from './migrations.js';
 import { STYLE_KEYS, styleProfile, type StyleKey } from '../shared/style-types.js';
@@ -109,8 +109,20 @@ function restore(workspace: Workspace, change: Change, preserveCardLayout: boole
   }
 }
 
+/** Finished runs whose base snapshots are kept; older ones are deleted by pruneAgentSnapshots. */
+export const KEEP_FINISHED_SNAPSHOTS = 3;
+const TERMINAL_RUN = "json_extract(data,'$.status') IN ('completed','failed','cancelled') AND json_extract(data,'$.finishedAt') IS NOT NULL";
+
+/** The persisted form of a state: no base snapshot (stored once in agent_snapshots) and no candidate workspaces (rebuilt on load). */
+function storedState(state: AgentState | StoredAgentState): StoredAgentState {
+  const { baseWorkspace: _base, candidates, ...rest } = state as AgentState;
+  return { ...rest, candidates: candidates.map(({ workspace: _workspace, ...candidate }) => candidate) };
+}
+
 export class NovelStore {
   private db: DatabaseSync;
+  /** Base snapshots already written, by object identity: a save rewrites one only when the runtime replaced it. */
+  private persistedBases = new WeakMap<Workspace, string>();
 
   constructor(filename: string) {
     this.db = new DatabaseSync(filename);
@@ -118,10 +130,15 @@ export class NovelStore {
     catch (error) { this.db.close(); throw error; }
   }
 
+  private afterCommit: Array<() => void> = [];
   private transaction<T>(action: () => T): T {
     this.db.exec('BEGIN IMMEDIATE');
-    try { const result = action(); this.db.exec('COMMIT'); return result; }
-    catch (error) { this.db.exec('ROLLBACK'); throw error; }
+    try {
+      const result = action(); this.db.exec('COMMIT');
+      for (const settle of this.afterCommit) settle();
+      return result;
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+    finally { this.afterCommit = []; }
   }
 
   private save(workspace: Workspace): void {
@@ -135,6 +152,11 @@ export class NovelStore {
 
   createProject(title: string): Workspace {
     const workspace = createWorkspace(title); this.save(workspace); return workspace;
+  }
+
+  /** Existence only. getProject parses the whole book, which the agent-state path must not do on every save. */
+  private requireProject(id: string): void {
+    if (!this.db.prepare('SELECT 1 FROM projects WHERE id=?').get(id)) throw new Error('项目不存在');
   }
 
   getProject(id: string): Workspace {
@@ -234,6 +256,15 @@ export class NovelStore {
       if (hasSemanticChanges(before, next)) next.revision++;
       try { validateWorkspace(next); } catch (error) { throw new Error(`UNDO_CONFLICT：后续内容依赖本次修改，撤销未执行。${(error as Error).message}`); }
       for (const batch of batches) { batch.undone = true; this.db.prepare('UPDATE operations SET data=? WHERE id=?').run(JSON.stringify(batch), batch.id); }
+      // A run's experience ("已写入正式作品") stops being true once everything it applied has been undone.
+      for (const taskId of new Set(batches.flatMap(batch => batch.taskId ? [batch.taskId] : []))) {
+        if (history.some(batch => batch.taskId === taskId && !batch.undone)) continue;
+        const row = this.db.prepare('SELECT data FROM agent_memories WHERE project_id=? AND id=?').get(projectId, `experience-${taskId}`) as Row | undefined;
+        const memory = row ? JSON.parse(row.data) as AgentMemory : undefined;
+        if (memory?.kind !== 'experience' || memory.status !== 'active') continue;
+        const updatedAt = new Date().toISOString();
+        this.db.prepare('UPDATE agent_memories SET updated_at=?,data=? WHERE project_id=? AND id=?').run(updatedAt, json({ ...memory, status: 'stale', updatedAt }), projectId, memory.id);
+      }
       this.save(next); return next;
     });
   }
@@ -252,7 +283,7 @@ export class NovelStore {
 
   saveRun(run: AgentRun): void {
     requireId(run.id, '运行 ID');
-    this.getProject(run.projectId);
+    this.requireProject(run.projectId);
     const previous = this.getRun(run.id);
     if (previous && previous.projectId !== run.projectId) throw new Error('运行记录不能转移到其他项目');
     this.db.prepare('INSERT INTO runs(id,project_id,started_at,data) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data')
@@ -264,11 +295,11 @@ export class NovelStore {
     const run = this.getRun(runId);
     if (!run) throw new Error('运行记录不存在');
     if (projectId !== undefined && run.projectId !== projectId) throw new Error('运行记录不属于此项目');
-    this.getProject(run.projectId);
+    this.requireProject(run.projectId);
     return run;
   }
 
-  private validateAgentState(state: AgentState): void {
+  private validateAgentState(state: AgentState, writeBase: boolean): void {
     if (state.version !== 1) throw new Error('不支持的智能体状态版本');
     this.requireRun(state.runId, state.projectId);
     const previous = this.db.prepare('SELECT project_id FROM agent_states WHERE run_id=?').get(state.runId) as { project_id: string } | undefined;
@@ -276,15 +307,15 @@ export class NovelStore {
     const session = this.db.prepare('SELECT project_id FROM agent_sessions WHERE id=?').get(state.sessionId) as { project_id: string } | undefined;
     if (!session || session.project_id !== state.projectId) throw new Error('智能体会话不属于此项目');
     if (state.baseWorkspace.id !== state.projectId) throw new Error('智能体基础快照不属于此项目');
-    validateWorkspace(state.baseWorkspace);
+    if (writeBase) validateWorkspace(state.baseWorkspace);
     const candidateIds = new Set<string>();
     for (const candidate of state.candidates) {
       requireId(candidate.id, '候选 ID'); requireId(candidate.hash, '候选 hash');
       if (candidateIds.has(candidate.id)) throw new Error('候选 ID 重复');
       candidateIds.add(candidate.id);
-      if (candidate.runId !== state.runId || candidate.projectId !== state.projectId || candidate.workspace.id !== state.projectId) throw new Error('候选不属于此项目或运行');
+      // Candidate workspaces are not stored: they are rebuilt from the base and commands, and applyCommands validates them.
+      if (candidate.runId !== state.runId || candidate.projectId !== state.projectId || (candidate.workspace && candidate.workspace.id !== state.projectId)) throw new Error('候选不属于此项目或运行');
       if (!Number.isSafeInteger(candidate.baseRevision) || candidate.baseRevision < 0) throw new Error('候选基础修订号无效');
-      validateWorkspace(candidate.workspace);
       checkSources(candidate.sources, state.projectId);
       for (const review of candidate.reviews) checkSources(review.sources, state.projectId);
     }
@@ -300,34 +331,86 @@ export class NovelStore {
       if (run.id !== state.runId || run.projectId !== state.projectId) throw new Error('智能体状态与运行作用域不一致');
       this.saveRun(run);
     }
-    this.validateAgentState(state);
+    const writeBase = this.persistedBases.get(state.baseWorkspace) !== state.runId;
+    this.validateAgentState(state, writeBase);
     if (receipt) {
       if (receipt.runId !== state.runId || receipt.projectId !== state.projectId) throw new Error('智能体状态与回执作用域不一致');
       this.saveAgentReceiptInTransaction(receipt);
     }
+    if (writeBase) this.db.prepare('INSERT INTO agent_snapshots(run_id,project_id,updated_at,data) VALUES(?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET updated_at=excluded.updated_at,data=excluded.data')
+      .run(state.runId, state.projectId, state.updatedAt, json(state.baseWorkspace));
     this.db.prepare('INSERT INTO agent_states(run_id,project_id,updated_at,data) VALUES(?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET updated_at=excluded.updated_at,data=excluded.data')
-      .run(state.runId, state.projectId, state.updatedAt, json(state));
+      .run(state.runId, state.projectId, state.updatedAt, json(storedState(state)));
+    // Recorded only once the write is part of this transaction; a rollback must not leave the snapshot marked as written.
+    if (writeBase) this.afterCommit.push(() => this.persistedBases.set(state.baseWorkspace, state.runId));
   }
 
   saveAgentState(state: AgentState, run?: AgentRun, receipt?: AgentReceipt): void {
     this.transaction(() => this.saveAgentStateInTransaction(state, run, receipt));
   }
 
-  getAgentState(runId: string): AgentState | undefined {
+  private storedRow(runId: string): (StoredAgentState & Partial<Pick<AgentState, 'baseWorkspace'>>) | undefined {
     const row = this.db.prepare('SELECT project_id,data FROM agent_states WHERE run_id=?').get(runId) as ScopedRow | undefined;
     if (!row) return undefined;
-    const state = JSON.parse(row.data) as AgentState;
+    const state = JSON.parse(row.data) as StoredAgentState & Partial<Pick<AgentState, 'baseWorkspace'>>;
     if (state.runId !== runId || state.projectId !== row.project_id) throw new Error('智能体状态项目作用域不一致');
     this.requireRun(runId, state.projectId);
     return state;
   }
 
-  listAgentStates(projectId?: string): AgentState[] {
-    if (projectId !== undefined) this.getProject(projectId);
+  /** A run's state as persisted: plan, checkpoints, candidates' commands and changes, but neither copy of the book. */
+  getStoredAgentState(runId: string): StoredAgentState | undefined {
+    const state = this.storedRow(runId);
+    return state && storedState(state as AgentState);
+  }
+
+  /** The runtime's working state: the base snapshot plus every candidate's workspace, rebuilt from the base and its commands. */
+  getAgentState(runId: string): AgentState | undefined {
+    const state = this.storedRow(runId);
+    if (!state) return undefined;
+    // Rows written before snapshots carry the base and candidate workspaces inline.
+    let base = state.baseWorkspace;
+    if (!base) {
+      const snapshot = this.db.prepare('SELECT data FROM agent_snapshots WHERE run_id=?').get(runId) as Row | undefined;
+      if (!snapshot) throw new Error('这条已结束任务的基础快照已清理，只能查看记录');
+      base = JSON.parse(snapshot.data) as Workspace;
+      this.persistedBases.set(base, runId);
+    }
+    const candidates = state.candidates.map(candidate => ({ ...candidate,
+      workspace: (candidate as Partial<Pick<AgentState['candidates'][number], 'workspace'>>).workspace ?? this.previewCommands(base, candidate.commands).workspace }));
+    return { ...state, baseWorkspace: base, candidates };
+  }
+
+  listAgentStates(projectId?: string): StoredAgentState[] {
+    if (projectId !== undefined) this.requireProject(projectId);
     const rows = (projectId === undefined
       ? this.db.prepare('SELECT run_id FROM agent_states ORDER BY updated_at DESC,rowid DESC').all()
       : this.db.prepare('SELECT run_id FROM agent_states WHERE project_id=? ORDER BY updated_at DESC,rowid DESC').all(projectId)) as Array<{ run_id: string }>;
-    return rows.map(row => this.getAgentState(row.run_id)!);
+    return rows.map(row => this.getStoredAgentState(row.run_id)!);
+  }
+
+  /** Finished runs never need their base snapshot again (approval and resume need an unfinished run); keep the newest few anyway. */
+  pruneAgentSnapshots(projectId: string, keepFinished = KEEP_FINISHED_SNAPSHOTS): number {
+    return this.transaction(() => Number(this.db.prepare(`DELETE FROM agent_snapshots WHERE project_id=? AND run_id IN (SELECT id FROM runs WHERE project_id=? AND ${TERMINAL_RUN}
+      ORDER BY started_at DESC, rowid DESC LIMIT -1 OFFSET ?)`).run(projectId, projectId, keepFinished).changes));
+  }
+
+  /** Rewrites rows saved before snapshots existed: the base moves to agent_snapshots (unfinished runs only) and candidate workspaces are dropped. */
+  compactLegacyAgentStates(): number {
+    const rows = this.db.prepare(`SELECT run_id FROM agent_states WHERE instr(data, '"baseWorkspace":') > 0 OR instr(data, '"workspace":') > 0`).all() as Array<{ run_id: string }>;
+    let compacted = 0;
+    for (const { run_id: runId } of rows) this.transaction(() => {
+      const state = this.storedRow(runId);
+      const legacy = state && (state.baseWorkspace !== undefined || state.candidates.some(candidate => 'workspace' in candidate));
+      if (!state || !legacy) return;
+      const run = this.requireRun(runId, state.projectId);
+      const finished = ['completed', 'failed', 'cancelled'].includes(run.status) && !!run.finishedAt;
+      if (state.baseWorkspace && !finished) this.db.prepare('INSERT OR IGNORE INTO agent_snapshots(run_id,project_id,updated_at,data) VALUES(?,?,?,?)')
+        .run(runId, state.projectId, state.updatedAt, json(state.baseWorkspace));
+      this.db.prepare('UPDATE agent_states SET data=? WHERE run_id=?').run(json(storedState(state as AgentState)), runId);
+      compacted++;
+    });
+    return compacted;
   }
 
   getAgentReceipt(key: string): AgentReceipt | undefined {
@@ -361,7 +444,8 @@ export class NovelStore {
 
   getSession(projectId: string): AgentSession {
     return this.transaction(() => {
-      const project = this.getProject(projectId);
+      const project = this.db.prepare('SELECT title FROM projects WHERE id=?').get(projectId) as { title: string } | undefined;
+      if (!project) throw new Error('项目不存在');
       const row = this.db.prepare('SELECT id,data FROM agent_sessions WHERE project_id=?').get(projectId) as (Row & { id: string }) | undefined;
       if (row) {
         const session = JSON.parse(row.data) as AgentSession;
@@ -376,7 +460,7 @@ export class NovelStore {
   }
 
   private saveSessionInTransaction(session: AgentSession): void {
-    requireId(session.id, '会话 ID'); this.getProject(session.projectId);
+    requireId(session.id, '会话 ID'); this.requireProject(session.projectId);
     const previous = this.db.prepare('SELECT id,project_id FROM agent_sessions WHERE id=? OR project_id=?').all(session.id, session.projectId) as Array<{ id: string; project_id: string }>;
     if (previous.some(row => row.id !== session.id || row.project_id !== session.projectId)) throw new Error('会话不能更换 ID 或转移到其他项目');
     const ids = new Set<string>();
@@ -413,7 +497,7 @@ export class NovelStore {
   }
 
   getAgentMemories(projectId: string): AgentMemory[] {
-    this.getProject(projectId);
+    this.requireProject(projectId);
     const rows = this.db.prepare('SELECT id,data FROM agent_memories WHERE project_id=? ORDER BY updated_at DESC,rowid DESC').all(projectId) as (Row & { id: string })[];
     return rows.map(row => {
       const memory = JSON.parse(row.data) as AgentMemory;
@@ -424,7 +508,7 @@ export class NovelStore {
 
   putAgentMemory(memory: AgentMemory): void {
     this.transaction(() => {
-      requireId(memory.id, '记忆 ID'); this.getProject(memory.projectId);
+      requireId(memory.id, '记忆 ID'); this.requireProject(memory.projectId);
       if (!['preference', 'constraint', 'summary', 'experience'].includes(memory.kind) || !['active', 'suggested', 'stale'].includes(memory.status) || typeof memory.content !== 'string' || typeof memory.confirmed !== 'boolean') throw new Error('记忆格式无效');
       checkSources(memory.sources, memory.projectId);
       const previous = this.db.prepare('SELECT project_id FROM agent_memories WHERE id=?').get(memory.id) as { project_id: string } | undefined;
@@ -439,7 +523,7 @@ export class NovelStore {
   }
 
   getCompanionThreads(projectId: string): CompanionThread[] {
-    this.getProject(projectId);
+    this.requireProject(projectId);
     const rows = this.db.prepare('SELECT id,data FROM companion_threads WHERE project_id=? ORDER BY updated_at DESC,rowid DESC').all(projectId) as (Row & { id: string })[];
     return rows.map(row => {
       const thread = JSON.parse(row.data) as CompanionThread;
@@ -457,7 +541,7 @@ export class NovelStore {
 
   saveCompanionThread(thread: CompanionThread): void {
     this.transaction(() => {
-      requireId(thread.id, '对话 ID'); this.getProject(thread.projectId);
+      requireId(thread.id, '对话 ID'); this.requireProject(thread.projectId);
       if (!Array.isArray(thread.turns) || thread.turns.some(turn => !['author', 'companion'].includes(turn.role) || typeof turn.text !== 'string')) throw new Error('创作伙伴对话格式无效');
       const previous = this.db.prepare('SELECT project_id FROM companion_threads WHERE id=?').get(thread.id) as { project_id: string } | undefined;
       if (previous && previous.project_id !== thread.projectId) throw new Error('对话不能转移到其他项目');
@@ -468,7 +552,7 @@ export class NovelStore {
 
   deleteCompanionThread(projectId: string, id: string): void {
     this.transaction(() => {
-      this.getProject(projectId); requireId(id, '对话 ID');
+      this.requireProject(projectId); requireId(id, '对话 ID');
       const previous = this.db.prepare('SELECT project_id FROM companion_threads WHERE id=?').get(id) as { project_id: string } | undefined;
       if (previous && previous.project_id !== projectId) throw new Error('对话不属于此项目');
       this.db.prepare('DELETE FROM companion_threads WHERE project_id=? AND id=?').run(projectId, id);
@@ -477,14 +561,14 @@ export class NovelStore {
 
   /** Derived story memory: outside the workspace, so it never bumps revisions, enters undo history or backups. */
   getStoryDigests(projectId: string): StoryDigest[] {
-    this.getProject(projectId);
+    this.requireProject(projectId);
     return (this.db.prepare('SELECT data FROM story_digests WHERE project_id=?').all(projectId) as Row[]).map(row => JSON.parse(row.data) as StoryDigest);
   }
 
   putStoryDigests(projectId: string, digests: StoryDigest[]): void {
     if (!digests.length) return;
     this.transaction(() => {
-      this.getProject(projectId);
+      this.requireProject(projectId);
       const statement = this.db.prepare('INSERT INTO story_digests(project_id,kind,target_id,updated_at,data) VALUES(?,?,?,?,?) ON CONFLICT(project_id,kind,target_id) DO UPDATE SET updated_at=excluded.updated_at,data=excluded.data');
       for (const digest of digests) {
         const target = digest.kind === 'scene' ? digest.sceneId : digest.targetId;
@@ -504,13 +588,36 @@ export class NovelStore {
     });
   }
 
+  /** Optional semantic index over paragraph chunks: derived and local like story digests, keyed by chunk start. */
+  getStoryVectors(projectId: string, model: string): Array<{ sceneId: string; start: number; end: number; textHash: string; vector: Float32Array }> {
+    const rows = this.db.prepare('SELECT scene_id,start,end,text_hash,vector FROM story_vectors WHERE project_id=? AND model=?').all(projectId, model) as Array<{ scene_id: string; start: number; end: number; text_hash: string; vector: Uint8Array }>;
+    // Copy into an aligned buffer: SQLite hands back blobs at arbitrary offsets.
+    return rows.map(row => ({ sceneId: row.scene_id, start: row.start, end: row.end, textHash: row.text_hash, vector: new Float32Array(Uint8Array.from(row.vector).buffer) }));
+  }
+  putStoryVectors(projectId: string, model: string, rows: Array<{ sceneId: string; start: number; end: number; textHash: string; vector: Float32Array }>): void {
+    if (!rows.length) return;
+    this.transaction(() => {
+      this.requireProject(projectId);
+      const statement = this.db.prepare('INSERT INTO story_vectors(project_id,scene_id,start,end,text_hash,model,vector) VALUES(?,?,?,?,?,?,?) ON CONFLICT(project_id,scene_id,start) DO UPDATE SET end=excluded.end,text_hash=excluded.text_hash,model=excluded.model,vector=excluded.vector');
+      for (const row of rows) statement.run(projectId, row.sceneId, row.start, row.end, row.textHash, model, new Uint8Array(row.vector.buffer, row.vector.byteOffset, row.vector.byteLength));
+    });
+  }
+  /** Keep only the given chunks (`sceneId:start`) of the current model. */
+  pruneStoryVectors(projectId: string, model: string, live: Set<string>): void {
+    this.transaction(() => {
+      const rows = this.db.prepare('SELECT scene_id,start,model FROM story_vectors WHERE project_id=?').all(projectId) as Array<{ scene_id: string; start: number; model: string }>;
+      const remove = this.db.prepare('DELETE FROM story_vectors WHERE project_id=? AND scene_id=? AND start=?');
+      for (const row of rows) if (row.model !== model || !live.has(`${row.scene_id}:${row.start}`)) remove.run(projectId, row.scene_id, row.start);
+    });
+  }
+
   /** Edits and rejections already turned into style suggestions; local learning state, not part of a backup. */
   getStyleObservations(projectId: string): Set<string> {
     return new Set((this.db.prepare('SELECT key FROM style_observations WHERE project_id=?').all(projectId) as Array<{ key: string }>).map(row => row.key));
   }
 
   putStyleObservations(projectId: string, keys: string[]): void {
-    this.getProject(projectId);
+    this.requireProject(projectId);
     this.transaction(() => {
       const statement = this.db.prepare('INSERT OR IGNORE INTO style_observations(project_id,key,at) VALUES(?,?,?)'), at = new Date().toISOString();
       for (const key of keys) { requireId(key, '文风观察'); statement.run(projectId, key, at); }
@@ -519,7 +626,7 @@ export class NovelStore {
 
   deleteAgentMemory(projectId: string, id: string): void {
     this.transaction(() => {
-      this.getProject(projectId); requireId(id, '记忆 ID');
+      this.requireProject(projectId); requireId(id, '记忆 ID');
       const previous = this.db.prepare('SELECT project_id FROM agent_memories WHERE id=?').get(id) as { project_id: string } | undefined;
       if (previous && previous.project_id !== projectId) throw new Error('记忆不属于此项目');
       this.db.prepare('DELETE FROM agent_memories WHERE project_id=? AND id=?').run(projectId, id);
@@ -533,7 +640,7 @@ export class NovelStore {
       const state = this.getAgentState(decision.runId);
       if (!state) throw new Error('智能体状态不存在');
       const run = this.requireRun(state.runId, state.projectId);
-      this.validateAgentState(state);
+      this.validateAgentState(state, false);
       const candidate = state.candidates.find(item => item.id === decision.candidateId);
       if (!candidate || candidate.hash !== decision.candidateHash) throw new Error('候选 ID/hash 不匹配');
       if (candidate.status === 'applied' || candidate.status === 'rejected') {

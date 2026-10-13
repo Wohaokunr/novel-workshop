@@ -25,6 +25,11 @@ export class ProviderStore {
     const next: StoredProvider = { name: input.name.trim() || '我的模型', baseURL: url.toString().replace(/\/$/, ''), model: input.model.trim(), mode: input.mode, encryptedKey };
     if (input.reasoningEffort) next.reasoningEffort = input.reasoningEffort;
     if (input.summaryModel?.trim()) next.summaryModel = input.summaryModel.trim();
+    if (input.embeddingModel?.trim()) next.embeddingModel = input.embeddingModel.trim();
+    if (input.maxOutputTokens !== undefined && input.maxOutputTokens !== null) {
+      if (!Number.isSafeInteger(input.maxOutputTokens) || input.maxOutputTokens < 1000 || input.maxOutputTokens > 200_000) throw new Error('单次输出上限应为 1000–200000 之间的整数');
+      next.maxOutputTokens = input.maxOutputTokens;
+    }
     if (input.storyMemory !== undefined && input.storyMemory !== 'auto' && input.storyMemory !== 'manual') throw new Error('故事记忆模式无效');
     // Absent means auto; only an explicit choice is persisted.
     const storyMemory = input.storyMemory ?? this.value.storyMemory;

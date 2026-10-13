@@ -6,7 +6,8 @@ import { diffText } from '../../shared/text-diff.js';
 import { styleProfile } from '../../shared/style-types.js';
 import { buildCharacterContext, buildReaderContext, resolveReferences } from '../context.js';
 import { cardContent, DomainValidationError } from '../domain.js';
-import { canReadAuthor } from './policy.js';
+import { canReadAuthor, isRole } from './policy.js';
+import type { SemanticHit } from './semantic.js';
 import { searchChunks, sceneMentions } from './story-index.js';
 import { storyOverview, StoryView } from './story-view.js';
 
@@ -96,6 +97,24 @@ export function sourcesForWorkspace(workspace: Workspace): EvidenceSource[] {
   return [sourceFor(workspace, 'project', workspace.id)!, sourceFor(workspace, 'novel', workspace.id)!,
     ...Object.entries(entities).flatMap(([kind, collection]) => (workspace[collection] ?? []).map(item => sourceFor(workspace, kind, item.id)!))];
 }
+const bookSourceCache = new WeakMap<Workspace, EvidenceSource[]>();
+/** Whole-book provenance in two fingerprints (the semantic project and the novel fields): any edit to the book invalidates it.
+ * Memoized per snapshot object, since hashing the project reads every scene. */
+export function bookSources(workspace: Workspace): EvidenceSource[] {
+  let sources = bookSourceCache.get(workspace);
+  if (!sources) bookSourceCache.set(workspace, sources = [sourceFor(workspace, 'project', workspace.id)!, sourceFor(workspace, 'novel', workspace.id)!]);
+  return sources;
+}
+const kindOfCollection = new Map<string, string>(Object.entries(entities).map(([kind, collection]) => [collection, kind]));
+/** Evidence for a candidate: the book fingerprint plus the base version of every existing entity it changes. */
+export function changeSources(workspace: Workspace, changes: Change[]): EvidenceSource[] {
+  const touched = changes.flatMap(change => {
+    const kind = change.collection === 'metadata' ? 'novel' : change.collection === 'style' ? 'style' : kindOfCollection.get(change.collection);
+    const source = kind ? sourceFor(workspace, kind, kind === 'novel' || kind === 'style' ? workspace.id : change.key) : undefined;
+    return source ? [source] : [];
+  });
+  return [...new Map([...bookSources(workspace), ...touched].map(source => [`${source.kind}\u0000${source.id}`, source])).values()];
+}
 export function sourceValid(workspace: Workspace, source: EvidenceSource): boolean {
   if (!source || source.projectId !== workspace.id || typeof source.kind !== 'string' || typeof source.id !== 'string') return false;
   const current = sourceFor(workspace, source.kind, source.id);
@@ -171,7 +190,7 @@ function authorDocuments(workspace: Workspace, scenes?: Set<string>): SearchDocu
   }
   return result;
 }
-function filteredScenes(workspace: Workspace, filter: SearchFilter): Set<string> | undefined {
+export function filteredScenes(workspace: Workspace, filter: SearchFilter): Set<string> | undefined {
   if (!filter.chapterFrom && !filter.chapterTo && !filter.entityId) return undefined;
   const chapters = [...workspace.chapters].sort((a, b) => a.order - b.order);
   const from = filter.chapterFrom ? chapters.findIndex(chapter => chapter.id === filter.chapterFrom) : 0;
@@ -194,9 +213,11 @@ function queryTerms(query: string): string[] {
 }
 
 /** Filter the corpus before matching. Query words never grant access to an author or future document.
- * Scene prose comes from the paragraph-chunk index (BM25, at most two chunks per scene); small records are scored directly. */
-export function searchContext(workspace: Workspace, query: string, limit = 6, role: AgentRole = 'coordinator', anchor: ContextAnchor = {}, filter: SearchFilter = {}): SearchChunk[] {
-  if (!Object.hasOwn(ROLE_SEARCH, role)) throw new DomainValidationError('检索角色无效');
+ * Scene prose comes from the paragraph-chunk index (BM25, at most two chunks per scene); small records are scored directly.
+ * `semantic`: chunks nearest in meaning (optional vector index); they join the prose results and lift keyword hits they overlap. */
+export function searchContext(workspace: Workspace, query: string, limit = 6, role: AgentRole = 'coordinator', anchor: ContextAnchor = {}, filter: SearchFilter = {},
+  semantic: SemanticHit[] = []): SearchChunk[] {
+  if (!isRole(role)) throw new DomainValidationError('检索角色无效');
   const scoped = role === 'reader' || role === 'character' ? undefined : filteredScenes(workspace, filter);
   const allowed = role === 'reader' ? readerScenes(workspace, anchor) : role === 'character' ? new Set<string>() : scoped;
   const documents = role === 'reader' ? [] : role === 'character' ? characterDocuments(workspace, anchor) : authorDocuments(workspace, scoped);
@@ -234,10 +255,19 @@ export function searchContext(workspace: Workspace, query: string, limit = 6, ro
       matches.push({ source: { ...sourceFor(workspace, 'scene:text', scene.id)!, start: hit.start, end }, title: title.slice(0, 160),
         text: scene.text.slice(hit.start, end), score, index: documents.length + view.positionOf(scene.id) });
     }
+    for (const hit of semantic) {
+      const scene = view.scene(hit.sceneId);
+      if (!scene || (allowed && !allowed.has(scene.id))) continue;
+      const source = sourceFor(workspace, 'scene:text', scene.id)!;
+      const overlapping = matches.find(match => match.source.kind === source.kind && match.source.id === scene.id && match.source.start! < hit.end && hit.start < match.source.end!);
+      if (overlapping) { overlapping.score += hit.similarity * 10; continue; }
+      const title = role === 'reader' ? chapterTitles.get(scene.chapterId) ?? '' : scene.title, end = Math.min(hit.end, hit.start + MAX_SEARCH_CHUNK_CHARS);
+      matches.push({ source: { ...source, start: hit.start, end }, title: title.slice(0, 160), text: scene.text.slice(hit.start, end), score: hit.similarity * 30,
+        index: documents.length + view.positionOf(scene.id) });
+    }
   }
   return matches.sort((a, b) => b.score - a.score || a.index - b.index).slice(0, requested).map(({ index: _index, ...chunk }) => chunk);
 }
-const ROLE_SEARCH: Record<AgentRole, true> = { coordinator: true, theme: true, planner: true, world: true, narrative: true, canvas: true, cast: true, writer: true, character: true, evolution: true, reader: true, continuity: true, stylist: true };
 
 /** A shared output cap for model context, with explicit omission paths instead of silent whole-book truncation. */
 export function boundedContext(context: Record<string, unknown>, maxChars = MAX_CONTEXT_CHARS, priority: string[] = []): Record<string, unknown> {
@@ -306,12 +336,30 @@ export function refreshMemories(workspace: Workspace, memories: AgentMemory[]): 
   });
 }
 
+/** Character budget for confirmed author rules in any context; a fixed count silently dropped the oldest rules. */
+export const AUTHOR_RULES_CHARS = 6000;
+const AUTHOR_RULE_CHARS = 1000;
+/** Active, confirmed preferences and constraints: constraints first, then newest first (the store's order), within a character budget. */
+export function selectAuthorRules(memories: AgentMemory[], maxChars = AUTHOR_RULES_CHARS): { rules: AgentMemory[]; omitted: number } {
+  const active = memories.filter(memory => memory.status === 'active' && memory.confirmed && (memory.kind === 'constraint' || memory.kind === 'preference'));
+  const ordered = [...active.filter(memory => memory.kind === 'constraint'), ...active.filter(memory => memory.kind === 'preference')];
+  const rules: AgentMemory[] = [];
+  let remaining = maxChars;
+  for (const memory of ordered) {
+    const content = memory.content.length > AUTHOR_RULE_CHARS ? `${memory.content.slice(0, AUTHOR_RULE_CHARS)}…` : memory.content;
+    if (content.length > remaining) continue;
+    remaining -= content.length; rules.push({ ...memory, content });
+  }
+  return { rules, omitted: ordered.length - rules.length };
+}
+
 /** Coordinator overview: small catalogs centred on the target + layered story memory, never JSON.stringify(the entire book). */
 export function collectContext(workspace: Workspace, request: RunRequest, memories: AgentMemory[], story?: StoryView): unknown {
   if (workspace.id !== request.projectId) throw new DomainValidationError('上下文项目与任务不匹配');
   const materials = resolveReferences(workspace, request.references);
   const active = refreshMemories(workspace, memories).filter(memory => memory.projectId === workspace.id && memory.status === 'active');
   const take = <T>(items: T[], limit: number) => items.slice(0, limit);
+  const authorRules = selectAuthorRules(active);
   const briefScene = (scene: Workspace['scenes'][number]) => ({ id: scene.id, chapterId: scene.chapterId, title: scene.title,
     order: scene.order, povId: scene.povId, castIds: scene.castIds ?? [], settingIds: scene.settingIds ?? [], eventIds: scene.eventIds, outline: scene.outline.slice(0, 1000), text: scene.text.slice(0, 1800),
     omitted: { outlineChars: Math.max(0, scene.outline.length - 1000), textChars: Math.max(0, scene.text.length - 1800) } });
@@ -337,8 +385,7 @@ export function collectContext(workspace: Workspace, request: RunRequest, memori
     scope: { stage: request.stage, tool: request.tool, sceneId: request.sceneId, chapterId: request.chapterId, selection: request.selection,
       references: request.references ?? [], referencesAreWriteAuthorization: false,
       writeRule: request.stage === 'rewrite' ? '只允许目标正文选区；保护前后缀，不附带任何设定修改。' : request.stage === 'chapter' ? '只写目标场景/章节空白场景；保护正式正文，人物状态仅用同范围的合法场景证据。' : '可提出项目领域修改候选；必须经校验/审阅/作者批准，AI 不移动人工布局。' },
-    confirmedAuthorRules: take(active.filter(memory => memory.confirmed && (memory.kind === 'preference' || memory.kind === 'constraint')), 12)
-      .map(memory => ({ id: memory.id, kind: memory.kind, content: memory.content.slice(0, 1000), sourceMessageId: memory.sourceMessageId, sources: memory.sources.slice(0, 8) })),
+    confirmedAuthorRules: authorRules.rules.map(memory => ({ id: memory.id, kind: memory.kind, content: memory.content, sourceMessageId: memory.sourceMessageId, sources: memory.sources.slice(0, 8) })),
     storyMemory: storyOverview(view, anchorChapter),
     targetScenes: take(scoped, 12).map(briefScene),
     materials: { cards: take(materials.cards, 12).map(card => ({ ...cardContent(card), content: card.content.slice(0, 1200) })),
@@ -351,7 +398,7 @@ export function collectContext(workspace: Workspace, request: RunRequest, memori
       id: memory.id, kind: memory.kind, content: memory.content.slice(0, 700), formalTruth: false, notice: '摘要/经验仅是辅助，正式事实以仍有效的原始正文与领域记录为准。' })),
     omitted: { materialCards: Math.max(0, materials.cards.length - 12), materialObjects: Math.max(0, materials.objects.length - 12), materialScenes: Math.max(0, materials.scenes.length - 12),
       catalogObjects: Math.max(0, workspace.objects.length - 60), catalogScenes: Math.max(0, workspace.scenes.length - Math.min(60, nearScenes.length)),
-      catalogChapters: focus.omitted,
+      catalogChapters: focus.omitted, authorRules: authorRules.omitted,
       unselectedSceneBodies: workspace.scenes.filter(scene => !scoped.includes(scene) && !materials.scenes.some(item => item.id === scene.id)).length,
       notice: '非选定场景正文未载入；目录以目标章节为中心，其余章节只给骨架。逐层放大：read_story_memory 看章节/场景摘要或人物时间线，search_context 检索片段，read_text 读原文窗口。' },
   }, MAX_CONTEXT_CHARS, ['project', 'scope', 'confirmedAuthorRules', 'targetScenes', 'materials', 'storyMemory']);

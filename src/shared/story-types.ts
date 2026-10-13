@@ -1,7 +1,8 @@
 import type { TokenUsage } from './types.js';
 
-/** A thread (伏笔 / 悬念 / 承诺) the prose has opened. Ids are assigned locally, never by the model. */
-export interface StoryThread { id: string; title: string }
+/** A thread (伏笔 / 悬念 / 承诺) the prose has opened. Ids are assigned locally, never by the model: from the opening scene and the
+ * wording, kept across a re-digest of that scene, so later closures keep pointing at the same thread. major: bears on the main line. */
+export interface StoryThread { id: string; title: string; major?: boolean }
 
 /** Model-written digest of one scene. Derived from prose only, so it is safe for reader-side use up to that scene. */
 export interface SceneDigest {
@@ -25,6 +26,8 @@ export interface StoryMemoryStatus {
   /** Auto mode found a backlog too large to spend on silently; the author starts it explicitly. */
   awaitingConfirmation: boolean;
   lastError?: string; usage: TokenUsage; updatedAt?: string;
+  /** Present when an embedding model is set: paragraph chunks with a vector for their current text. */
+  vectors?: { model: string; indexed: number; total: number };
 }
 
 export interface StoryMemoryAPI {

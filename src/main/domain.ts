@@ -107,6 +107,10 @@ export function validateWorkspace(workspace: Workspace): void {
   const isEvent = (id: string) => objects.get(id)?.typeId === 'event';
   for (const object of objects.values()) {
     text(object.name, '对象名称', true); text(object.typeId, '对象类型 ID', true);
+    if (object.aliases !== undefined) {
+      strings(object.aliases, '对象别名');
+      check(object.aliases.length <= 20 && object.aliases.every(alias => alias.trim() && alias.length <= 40), `对象 ${object.name} 的别名无效：最多 20 个，每个 1–40 字`);
+    }
     const type = types.get(object.typeId); check(type, `对象 ${object.name} 的类型不存在`);
     record(object.fields, '对象字段');
     for (const [key, value] of Object.entries(object.fields)) {
@@ -233,7 +237,7 @@ function validateStyle(style: StyleProfile, isCharacter: (id: string) => boolean
   const rules = ids(style.rules, '文风规则');
   check(rules.size <= STYLE_LIMITS.rules, `文风规则最多 ${STYLE_LIMITS.rules} 条`);
   const suggestions = ids(style.suggestions, '文风建议');
-  const origins = ['author', 'samples', 'edits', 'rejection', 'blindtest'];
+  const origins = ['author', 'samples', 'edits', 'rejection', 'blindtest', 'choice'];
   for (const rule of [...rules.values(), ...suggestions.values()]) {
     check(rule.kind === 'do' || rule.kind === 'avoid', '文风规则类型无效'); text(rule.content, '文风规则内容', true);
     check(origins.includes(rule.origin), '文风规则来源无效'); if (rule.evidence !== undefined) text(rule.evidence, '文风规则依据');

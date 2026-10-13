@@ -1,12 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import type { AgentMemory, AgentRole, PlanNode, SpecialistRequest } from '../shared/agent-types.js';
+import type { AgentMemory, AgentRole, PlanNode, SpecialistRequest, UpstreamResult } from '../shared/agent-types.js';
 import type { AgentStep, CharacterState, Command, NovelObject, RunRequest, Workspace } from '../shared/types.js';
 import { applyCommands, createWorkspace } from './domain.js';
 import { emptyUsage } from './responses.js';
-import { boundedContext, collectContext, fingerprint, MAX_CONTEXT_CHARS, refreshMemories, searchContext, sourceFor, sourceValid, sourcesForWorkspace } from './agent/memory.js';
-import { assertWriteScope, canReadAuthor, createBudget, validatePlan } from './agent/policy.js';
+import { boundedContext, collectContext, fingerprint, MAX_CONTEXT_CHARS, refreshMemories, searchContext, selectAuthorRules, sourceFor, sourceValid, sourcesForWorkspace } from './agent/memory.js';
+import { assertWriteScope, canReadAuthor, chainWriterNodes, createBudget, PLAN_ROLES, ROLE_CAPABILITIES, UPSTREAM_ROLES, validatePlan } from './agent/policy.js';
+import { toolDefinitions } from './agent/tools.js';
 import { reviewSchema, specialistDefinition } from './agent/specialists.js';
+import { keepCompleted } from './agent/runtime.js';
 
 function fixture(id = 'project-a'): Workspace {
   const original = createWorkspace('雾港小说', id);
@@ -241,4 +243,77 @@ test('plan validation enforces real role targets, acceptance, bounded node count
   assert.throws(() => validatePlan(Array.from({ length: 13 }, (_, index) => node('theme', { id: `n${index}` })), workspace, run), /1–12/);
   assert.deepEqual(createBudget(), { maxModelCalls: 36, maxToolCalls: 100, maxChildren: 16, maxParallel: 2, maxReplans: 2, maxRevisions: 2, maxActiveMs: 1_800_000, maxTokens: 500_000,
     modelCalls: 0, toolCalls: 0, children: 0, replans: 0, revisions: 0, activeMs: 0, tokens: 0, usageUnknown: false });
+});
+
+test('写作节点按阅读顺序串联，不改变已有反向顺序，也不会成环', () => {
+  const workspace = fixture();
+  const nodes = [node('writer', { id: 'late', sceneId: 'blank', dependsOn: [] }), node('writer', { id: 'early', sceneId: 'target', dependsOn: [] }),
+    node('writer', { id: 'mid', sceneId: 'mixed', dependsOn: [] }), node('theme', { id: 'theme', dependsOn: [] })];
+  assert.equal(chainWriterNodes(nodes, workspace, request(workspace)), 2);
+  assert.deepEqual(Object.fromEntries(nodes.map(item => [item.id, item.dependsOn])), { late: ['mid'], early: [], mid: ['early'], theme: [] });
+  validatePlan(nodes, workspace, request(workspace));
+  // The author's plan already orders the later scene first: keep it, and never add the reverse edge.
+  const reversed = [node('writer', { id: 'a', sceneId: 'target', dependsOn: ['b'] }), node('writer', { id: 'b', sceneId: 'blank', dependsOn: [] })];
+  assert.equal(chainWriterNodes(reversed, workspace, request(workspace)), 0);
+  assert.deepEqual(reversed.map(item => item.dependsOn), [['b'], []]);
+});
+
+test('前置结论只交给作者侧专长；角色代入、读者与人物演进保持各自有界视角', () => {
+  const workspace = fixture();
+  const upstream: UpstreamResult[] = [{ nodeId: 'theme', role: 'theme', label: '立意', objective: '深化', result: { conclusion: '上游作者剧透：幕后凶手是林舟的师父' } }];
+  const build = (role: SpecialistRequest['role'], patch: Partial<PlanNode> = {}) => JSON.stringify(specialistDefinition({ project: workspace, role, node: node(role, patch), request: request(workspace), upstream }).context);
+  assert.match(build('writer', { sceneId: 'blank' }), /上游作者剧透/);
+  assert.match(build('planner'), /上游作者剧透/);
+  assert.match(build('continuity', { sceneId: 'target' }), /上游作者剧透/);
+  for (const [role, patch] of [['character', { characterId: 'person', eventId: 'now' }], ['evolution', { characterId: 'person', eventId: 'now' }],
+    ['reader', { sceneId: 'target' }]] as const) assert.doesNotMatch(build(role, patch), /上游作者剧透/, role);
+});
+
+test('作者规则按字数预算而不是固定条数选取，约束优先，超出预算时报告省略数', () => {
+  const workspace = fixture();
+  const rule = (index: number, kind: AgentMemory['kind'], content = `规则${index}`) => memory(workspace, { id: `rule-${index}`, kind, content, sources: [], confirmed: true, sourceMessageId: 'author-message' });
+  const many = Array.from({ length: 20 }, (_, index) => rule(index, index === 19 ? 'constraint' : 'preference'));
+  const selected = selectAuthorRules(many);
+  assert.equal(selected.rules.length, 20); assert.equal(selected.omitted, 0);
+  assert.equal(selected.rules[0]!.id, 'rule-19', '约束排在偏好之前');
+  const overview = collectContext(workspace, request(workspace), many) as { confirmedAuthorRules: unknown[]; omitted: { authorRules: number } };
+  assert.equal(overview.confirmedAuthorRules.length, 20); assert.equal(overview.omitted.authorRules, 0);
+  const crowded = selectAuthorRules([rule(1, 'preference', '长'.repeat(900)), rule(2, 'constraint', '短约束'), rule(3, 'preference', '再长'.repeat(400))], 1000);
+  assert.deepEqual(crowded.rules.map(item => item.id), ['rule-2', 'rule-1']); assert.equal(crowded.omitted, 1);
+  assert.equal(selectAuthorRules([{ ...rule(4, 'preference'), confirmed: false }, { ...rule(5, 'constraint'), status: 'stale' }, rule(6, 'summary')]).rules.length, 0);
+});
+
+test('作者确认的规则交给所有作者侧专长，角色代入与读者看不到', () => {
+  const workspace = fixture(), authorRules = [{ kind: 'constraint', content: '作者约束：全书不出现穿越元素' }];
+  const build = (role: SpecialistRequest['role'], patch: Partial<PlanNode> = {}) => JSON.stringify(specialistDefinition({ project: workspace, role, node: node(role, patch), request: request(workspace), authorRules }).context);
+  for (const [role, patch] of [['planner', {}], ['world', {}], ['narrative', {}], ['canvas', {}], ['cast', {}], ['theme', {}], ['continuity', { sceneId: 'target' }],
+    ['evolution', { characterId: 'person', eventId: 'now' }], ['writer', { sceneId: 'blank' }]] as const) assert.match(build(role, patch), /全书不出现穿越元素/, role);
+  for (const [role, patch] of [['character', { characterId: 'person', eventId: 'now' }], ['reader', { sceneId: 'target' }]] as const) assert.doesNotMatch(build(role, patch), /穿越/, role);
+});
+
+test('重新规划沿用未改动的已完成节点；改动的节点及依赖它的节点重新执行', () => {
+  const node = (id: string, patch: Partial<PlanNode> = {}): PlanNode => ({ id, role: 'planner', objective: id, dependsOn: [], acceptance: '完成', status: 'pending', ...patch });
+  const previous = { version: 1, summary: '旧计划', nodes: [
+    node('a', { status: 'completed', artifactId: 'artifact-a' }), node('b', { dependsOn: ['a'], status: 'completed', artifactId: 'artifact-b' }),
+    node('c', { status: 'completed', artifactId: 'artifact-c' }), node('d', { dependsOn: ['c'], status: 'completed', artifactId: 'artifact-d' }),
+    node('e', { status: 'failed', error: '失败' }), node('f', { status: 'completed', artifactId: 'artifact-f', sceneId: 's1' }),
+  ] };
+  const next = [node('a'), node('b', { dependsOn: ['a'] }), node('c', { objective: '改过的目标' }), node('d', { dependsOn: ['c'] }), node('e'), node('f', { sceneId: 's2' }), node('g')];
+  assert.deepEqual(keepCompleted(next, previous).sort(), ['a', 'b']);
+  assert.deepEqual(next.map(item => [item.id, item.status, item.artifactId]), [
+    ['a', 'completed', 'artifact-a'], ['b', 'completed', 'artifact-b'], ['c', 'pending', undefined], ['d', 'pending', undefined],
+    ['e', 'pending', undefined], ['f', 'pending', undefined], ['g', 'pending', undefined],
+  ]);
+  assert.deepEqual(keepCompleted([node('a')], undefined), []);
+  const again = [node('a'), node('b', { dependsOn: ['a'] })];
+  assert.deepEqual(keepCompleted(again, previous, new Set(['artifact-a'])), [], '作者拒绝过的结果不沿用，依赖它的节点也重做');
+});
+
+test('角色清单只在 ROLE_CAPABILITIES 定义一次：计划角色与工具枚举一致，文风审阅只在审查中运行', () => {
+  assert.ok(!PLAN_ROLES.includes('stylist' as never) && !PLAN_ROLES.includes('coordinator' as never));
+  assert.deepEqual([...PLAN_ROLES].sort(), Object.keys(ROLE_CAPABILITIES).filter(role => !['coordinator', 'stylist'].includes(role)).sort());
+  const planTool = toolDefinitions.find(tool => tool.name === 'set_plan')!;
+  const nodeSchema = (planTool.parameters as { properties: { nodes: { items: { properties: { role: { enum: string[] } } } } } }).properties.nodes.items.properties.role;
+  assert.deepEqual(nodeSchema.enum, PLAN_ROLES);
+  assert.deepEqual([...UPSTREAM_ROLES].sort(), ['canvas', 'cast', 'continuity', 'narrative', 'planner', 'theme', 'world', 'writer']);
 });

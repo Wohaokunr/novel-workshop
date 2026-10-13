@@ -1,12 +1,24 @@
-import OpenAI from 'openai';
+import OpenAI, { APIConnectionError, APIError, APIUserAbortError } from 'openai';
 import { toResponseInputItems } from 'openai/lib/responses/ResponseInputItems';
 import type { ResponseInputItem, ResponseOutputItem, ResponseStreamEvent } from 'openai/resources/responses/responses';
 import type { ReasoningEffort } from 'openai/resources/shared';
 import type { AgentStep, ProviderSecret, TokenUsage } from '../shared/types.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { DomainValidationError } from './domain.js';
+import { promptVersion } from './prompts/prompt.js';
 
-class ToolValidationError extends Error {}
+export class ToolValidationError extends Error {}
+/** The service reported an error, so the request produced nothing: sending it again repeats no billed result. */
+export class ModelServiceError extends Error {
+  constructor(message: string, readonly status?: number) {
+    super(message);
+    this.name = 'ModelServiceError';
+  }
+}
+/** The model answered with nothing usable (a refusal, a content filter); the same input tends to get the same answer. */
+export class ModelOutputError extends Error {}
+/** The answer hit the output token limit. Plain-text answers are continued instead; anything else reports this error. */
+export class OutputLimitError extends ModelOutputError {}
 
 export type JsonSchema = Record<string, unknown>;
 export interface ToolCallContext {
@@ -31,6 +43,10 @@ export interface AgentCheckpoint {
   pendingCalls: ResponseOutputItem[];
   cursor: number;
   uncertain?: boolean;
+  /** Input items already written to the turn log; the next turn's record starts at `end` (see the runtime's turnRecord). */
+  logged?: { turn: number; from: number; end: number };
+  /** Text of a plain-text answer cut at the output limit; the continuation's output is appended to it. */
+  continued?: string;
 }
 export interface AgentTool {
   name: string;
@@ -74,6 +90,16 @@ export interface ResponseTransport {
 }
 
 export const MAX_AGENT_TURNS = 12;
+/** Retries before any output, for connection errors, 408/409/429 and 5xx; the SDK backs off and honours Retry-After. */
+export const MODEL_RETRIES = 4;
+/** Continuation requests for a plain-text answer cut at the output limit. */
+export const MAX_OUTPUT_CONTINUATIONS = 2;
+export const CONTINUE_NOTICE = '运行时提示：上一条回复达到单次输出上限被截断。请从上一条回复的最后一个字之后直接接着写，不要重复已写内容，不要加任何说明。';
+/** Reasoning tokens count toward the cap, so a reasoning configuration gets more room. Neither default exceeds what current
+ * models accept; a service with a lower ceiling sets its own limit in the model settings. */
+export function outputTokenLimit(provider: Pick<ProviderSecret, 'maxOutputTokens' | 'reasoningEffort'>): number {
+  return provider.maxOutputTokens ?? (provider.reasoningEffort ? 32_000 : 16_000);
+}
 export const emptyUsage = (): TokenUsage => ({ input: 0, output: 0, total: 0, reasoning: 0, cached: 0, provided: false });
 export function addUsage(target: TokenUsage, source: TokenUsage): void {
   target.input += source.input;
@@ -125,27 +151,110 @@ export function validateSchema(value: unknown, schema: JsonSchema, path = '结�
   throw new ToolValidationError(`${path}不符合约定类型`);
 }
 
+/** Background requests (story memory) to one endpoint go one at a time, and only while none of the author's requests is in
+ * flight; the author's requests never wait. Digests then add little to the rate limits a running task is using. */
+export class RequestGate {
+  private foreground = 0;
+  private background = false;
+  private readonly waiting: Array<() => void> = [];
+  async enter(background: boolean, signal: AbortSignal): Promise<() => void> {
+    checkCancelled(signal);
+    if (!background) {
+      this.foreground++;
+      return once(() => { this.foreground--; this.wake(); });
+    }
+    if (this.background || this.foreground) {
+      await new Promise<void>((resolve, reject) => {
+        const start = () => { signal.removeEventListener('abort', cancel); resolve(); };
+        const cancel = () => { this.waiting.splice(this.waiting.indexOf(start), 1); reject(new Error('任务已取消')); };
+        signal.addEventListener('abort', cancel, { once: true });
+        this.waiting.push(start);
+      });
+    } else this.background = true;
+    return once(() => { this.background = false; this.wake(); });
+  }
+  private wake() {
+    if (this.background || this.foreground) return;
+    const next = this.waiting.shift();
+    if (next) { this.background = true; next(); }
+  }
+}
+function once(action: () => void) {
+  let done = false;
+  return () => { if (!done) { done = true; action(); } };
+}
+const gates = new Map<string, RequestGate>();
+function gateFor(baseURL: string) {
+  let gate = gates.get(baseURL);
+  if (!gate) gates.set(baseURL, gate = new RequestGate());
+  return gate;
+}
+/** Errors the service itself reported. Connection failures keep their meaning (the outcome is unknown), as do cancellations. */
+function serviceError(error: unknown, retries: number): unknown {
+  if (!(error instanceof APIError) || error instanceof APIConnectionError || error instanceof APIUserAbortError) return error;
+  const status = error.status, retried = retries > 0 && status !== undefined && (status === 408 || status === 409 || status === 429 || status >= 500);
+  return new ModelServiceError(`模型服务出错${retried ? `（已自动重试 ${retries} 次）` : ''}：${error.message}`, status);
+}
+
 export class OpenAIResponseTransport implements ResponseTransport {
   private readonly client: OpenAI;
-  constructor(private readonly provider: ProviderSecret) {
-    this.client = new OpenAI({ baseURL: provider.baseURL, apiKey: provider.apiKey, maxRetries: 0 });
+  private readonly retries: number;
+  /** `retries: 0` suits the connection test, which should report a wrong address at once rather than back off. */
+  constructor(private readonly provider: ProviderSecret, private readonly options: { background?: boolean; retries?: number } = {}) {
+    this.retries = options.retries ?? MODEL_RETRIES;
+    this.client = new OpenAI({ baseURL: provider.baseURL, apiKey: provider.apiKey, maxRetries: this.retries });
   }
-  stream(request: ModelRequest, signal: AbortSignal): ModelStream {
+  async stream(request: ModelRequest, signal: AbortSignal): Promise<ModelStream> {
     checkCancelled(signal);
-    const stream = this.client.responses.stream({
-      model: this.provider.model,
-      instructions: request.instructions,
-      input: request.input,
-      tools: request.tools,
-      store: false,
-      parallel_tool_calls: false,
-      max_output_tokens: 12000,
-      ...(this.provider.reasoningEffort ? { reasoning: { effort: this.provider.reasoningEffort as ReasoningEffort } } : {}),
-      ...(request.outputSchema ? {
-        text: { format: { type: 'json_schema' as const, name: 'agent_result', schema: request.outputSchema, strict: true } },
-      } : {}),
-    }, { signal });
-    return { events: stream, finalResponse: () => stream.finalResponse() };
+    const exit = await gateFor(this.provider.baseURL).enter(!!this.options.background, signal);
+    const release = () => { signal.removeEventListener('abort', release); exit(); };
+    signal.addEventListener('abort', release, { once: true });
+    let stream: ReturnType<OpenAI['responses']['stream']>;
+    try {
+      stream = this.client.responses.stream({
+        model: this.provider.model,
+        instructions: request.instructions,
+        // With store: false the service keeps nothing, so a reasoning item can only be replayed with its encrypted content.
+        input: request.input.filter(item => item.type !== 'reasoning' || !!item.encrypted_content),
+        tools: request.tools,
+        store: false,
+        parallel_tool_calls: false,
+        max_output_tokens: outputTokenLimit(this.provider),
+        ...(this.provider.reasoningEffort ? {
+          reasoning: { effort: this.provider.reasoningEffort as ReasoningEffort }, include: ['reasoning.encrypted_content' as const],
+        } : {}),
+        ...(request.outputSchema ? {
+          text: { format: { type: 'json_schema' as const, name: 'agent_result', schema: request.outputSchema, strict: true } },
+        } : {}),
+      }, { signal });
+    } catch (error) {
+      release();
+      throw serviceError(error, this.retries);
+    }
+    const retries = this.retries;
+    const events = (async function* () {
+      try { for await (const event of stream) yield event; } catch (error) { throw serviceError(error, retries); } finally { release(); }
+    })();
+    return { events, finalResponse: () => stream.finalResponse().catch(error => { throw serviceError(error, retries); }).finally(release) };
+  }
+}
+
+/** Turns texts into vectors for the optional semantic index. Usage is reported in tokens. */
+export interface EmbeddingTransport { embed(texts: string[], signal: AbortSignal): Promise<{ vectors: number[][]; tokens: number }> }
+export class OpenAIEmbeddingTransport implements EmbeddingTransport {
+  private readonly client: OpenAI;
+  constructor(private readonly provider: ProviderSecret & { embeddingModel: string }, private readonly options: { background?: boolean } = {}) {
+    this.client = new OpenAI({ baseURL: provider.baseURL, apiKey: provider.apiKey, maxRetries: MODEL_RETRIES });
+  }
+  async embed(texts: string[], signal: AbortSignal) {
+    checkCancelled(signal);
+    const exit = await gateFor(this.provider.baseURL).enter(!!this.options.background, signal);
+    try {
+      const response = await this.client.embeddings.create({ model: this.provider.embeddingModel, input: texts }, { signal });
+      return { vectors: [...response.data].sort((a, b) => a.index - b.index).map(item => item.embedding), tokens: response.usage?.prompt_tokens ?? 0 };
+    } catch (error) {
+      throw serviceError(error, MODEL_RETRIES);
+    } finally { exit(); }
   }
 }
 
@@ -176,6 +285,14 @@ export interface RunAgentOptions {
   onCheckpoint?(cp: AgentCheckpoint): void;
   beforeRequest?(): void | Promise<void>;
   maxTurns?: number;
+  /** Deterministic work in place of the next model turn: calls to execute as if the model had made them (recorded in the
+   * conversation like its own), `true` to finish without another request, or nothing to ask the model. */
+  next?(cp: AgentCheckpoint): RuntimeCall[] | true | undefined;
+}
+export interface RuntimeCall { name: string; arguments: Record<string, unknown> }
+/** Runtime-owned calls carry no item id: the service validates ids it issued, and these were never issued by it. */
+export function runtimeCalls(calls: RuntimeCall[]): FunctionCall[] {
+  return calls.map(call => ({ type: 'function_call', call_id: `runtime-${randomUUID()}`, name: call.name, arguments: JSON.stringify(call.arguments) }));
 }
 
 type FunctionCall = Extract<ResponseOutputItem, { type: 'function_call' }>;
@@ -239,6 +356,21 @@ export function settleCheckpointTool(cp: AgentCheckpoint, callId: string, result
   return next;
 }
 
+function isContinuation(item: ResponseInputItem): boolean {
+  return 'role' in item && item.role === 'user' && item.content === CONTINUE_NOTICE;
+}
+/** A continuation sometimes restates the last few characters before going on; drop that overlap. */
+export function joinContinuation(previous: string, next: string): string {
+  for (let size = Math.min(200, previous.length, next.length); size >= 8; size--) {
+    if (previous.endsWith(next.slice(0, size))) return previous + next.slice(size);
+  }
+  return previous + next;
+}
+function limitReason(response: ModelResponse): string {
+  const output = response.usage?.output_tokens, reasoning = response.usage?.output_tokens_details?.reasoning_tokens;
+  return `模型输出达到单次上限被截断${output ? `（本次输出 ${output} tokens${reasoning ? `，其中推理 ${reasoning}` : ''}）` : ''}`;
+}
+
 /** One bounded runtime serves planners, writers, independent characters, readers and demo mode. */
 export async function runAgent(definition: AgentDefinition, options: RunAgentOptions): Promise<AgentStep> {
   const durable = !!(options.checkpoint || options.onCheckpoint);
@@ -248,7 +380,7 @@ export async function runAgent(definition: AgentDefinition, options: RunAgentOpt
       id: randomUUID(), agentId: definition.id, label: definition.label, status: 'running',
       input: { instructions: definition.instructions, context: options.context, objective: options.objective, turns: newTurns },
       output: '', tools: [], usage: emptyUsage(), startedAt: new Date().toISOString(),
-      contextSources: options.contextSources, responseIds: [],
+      contextSources: options.contextSources, responseIds: [], promptVersion: promptVersion(definition.instructions),
     },
     input: [{ role: 'user', content: JSON.stringify({ context: options.context, objective: options.objective }) }],
     turn: 0, phase: 'ready', pendingCalls: [], cursor: 0,
@@ -264,6 +396,9 @@ export async function runAgent(definition: AgentDefinition, options: RunAgentOpt
   const save = () => {
     try { options.onCheckpoint?.(cp); } catch (error) { checkpointWriteFailed = true; throw error; }
   };
+  // A durable run waits for the author instead of failing; resuming sends the turn again.
+  const unusable = (error: ModelServiceError | ModelOutputError) => durable
+    ? new AgentSuspended(`${error.message}${error instanceof ModelServiceError ? '。这一轮没有产生结果' : ''}；恢复任务会重新发送这一轮`) : error;
   step.status = 'running';
   delete step.finishedAt;
   publish();
@@ -333,6 +468,27 @@ export async function runAgent(definition: AgentDefinition, options: RunAgentOpt
         save();
         continue;
       }
+      if (options.next) {
+        const work = options.next(cp);
+        if (work === true) {
+          step.status = 'completed';
+          step.finishedAt = new Date().toISOString();
+          cp.phase = 'completed';
+          save();
+          publish();
+          return step;
+        }
+        if (work?.length) {
+          const calls = runtimeCalls(work);
+          cp.input.push(...calls);
+          cp.pendingCalls = calls;
+          cp.cursor = 0;
+          cp.phase = 'tools';
+          save();
+          publish();
+          continue;
+        }
+      }
       if (cp.turn >= maxTurns) {
         const reason = `智能体达到 ${maxTurns} 轮上限，请缩小本次任务`;
         if (durable) throw new AgentSuspended(reason);
@@ -344,41 +500,70 @@ export async function runAgent(definition: AgentDefinition, options: RunAgentOpt
       // Durable history keeps each native response once, not an ever-growing copy of all replay input.
       const trace: AgentTrace = durable ? { turn: cp.turn } : { input: requestInput };
       turns.push(trace);
-      step.output = '';
+      step.output = cp.continued ?? '';
       cp.phase = 'requesting';
       cp.uncertain = true;
       publish();
       save();
-      const stream = await options.transport.stream({
-        agentId: definition.id, instructions: definition.instructions, input: requestInput,
-        tools: tools.map(({ name, description, parameters }) => ({ type: 'function', name, description, parameters, strict: true })),
-        ...(definition.outputSchema ? { outputSchema: definition.outputSchema } : {}),
-      }, options.signal);
-      for await (const event of stream.events) {
-        checkCancelled(options.signal);
-        if (event.type === 'response.output_text.delta') {
-          step.output += event.delta;
-          options.onDelta?.(step.id, event.delta);
-        } else if (event.type === 'error') {
-          throw new Error(event.message);
+      let response: ModelResponse;
+      try {
+        const stream = await options.transport.stream({
+          agentId: definition.id, instructions: definition.instructions, input: requestInput,
+          tools: tools.map(({ name, description, parameters }) => ({ type: 'function', name, description, parameters, strict: true })),
+          ...(definition.outputSchema ? { outputSchema: definition.outputSchema } : {}),
+        }, options.signal);
+        for await (const event of stream.events) {
+          checkCancelled(options.signal);
+          if (event.type === 'response.output_text.delta') {
+            step.output += event.delta;
+            options.onDelta?.(step.id, event.delta);
+          } else if (event.type === 'error') {
+            throw new ModelServiceError(`模型服务出错：${event.message}`);
+          }
         }
+        response = await stream.finalResponse();
+      } catch (error) {
+        if (!(error instanceof ModelServiceError) || options.signal.aborted) throw error;
+        // The service turned the request down: nothing was generated, so sending this turn again needs no cost confirmation.
+        cp.phase = 'ready';
+        cp.uncertain = false;
+        throw unusable(error);
       }
-      const response = await stream.finalResponse();
       trace.output = structuredClone(response);
       step.responseIds.push(response.id);
       addUsage(step.usage, usageOf(response));
-      step.output = responseText(response);
+      const text = responseText(response);
+      step.output = cp.continued === undefined ? text : joinContinuation(cp.continued, text);
       const refusal = response.output.flatMap(item => item.type === 'message'
         ? item.content.flatMap(part => part.type === 'refusal' ? [part.refusal] : []) : []);
       if (response.status !== 'completed' || refusal.length) {
-        // Keep untrusted/incomplete calls out of the executable checkpoint, even across a restart.
+        // The answer is settled but unusable: keep its calls out of the executable checkpoint, even across a restart,
+        // and send any further request as a new turn so each logged turn keeps a single response.
+        cp.turn++;
+        cp.phase = 'ready';
+        cp.uncertain = false;
+        cp.pendingCalls = [];
+        cp.cursor = 0;
+        const truncated = response.status === 'incomplete' && response.incomplete_details?.reason === 'max_output_tokens';
+        if (truncated && !definition.outputSchema && !response.output.some(item => item.type === 'function_call') && text.trim()
+          && cp.input.filter(isContinuation).length < MAX_OUTPUT_CONTINUATIONS) {
+          cp.continued = step.output;
+          cp.input.push({ role: 'assistant', content: text }, { role: 'user', content: CONTINUE_NOTICE });
+          save();
+          publish();
+          continue;
+        }
+        delete cp.continued;
         save();
         publish();
         checkCancelled(options.signal);
-        throw new Error(response.status !== 'completed'
-          ? response.error?.message ?? `模型输出未完成：${response.incomplete_details?.reason ?? response.status}`
-          : `模型拒绝：${refusal.join('\n')}`);
+        if (truncated) throw new OutputLimitError(limitReason(response));
+        if (refusal.length) throw unusable(new ModelOutputError(`模型拒绝：${refusal.join('\n')}`));
+        throw unusable(response.status === 'incomplete'
+          ? new ModelOutputError(`模型输出未完成：${response.incomplete_details?.reason ?? response.status}`)
+          : new ModelServiceError(`模型服务出错：${response.error?.message ?? `响应状态 ${response.status}`}`));
       }
+      delete cp.continued;
       cp.input.push(...toResponseInputItems(response.output));
       cp.pendingCalls = structuredClone(response.output.filter(item => item.type === 'function_call'));
       cp.cursor = 0;

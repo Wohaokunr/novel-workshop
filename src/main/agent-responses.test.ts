@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import type { ResponseInputItem, ResponseOutputItem, ResponseStreamEvent } from 'openai/resources/responses/responses';
 import {
-  AgentSuspended, MAX_AGENT_TURNS, objectSchema, runAgent, settleCheckpointTool,
+  AgentSuspended, CONTINUE_NOTICE, joinContinuation, MAX_AGENT_TURNS, MAX_OUTPUT_CONTINUATIONS, ModelServiceError, objectSchema, OutputLimitError, runAgent, settleCheckpointTool,
   type AgentCheckpoint, type AgentDefinition, type ModelRequest, type ModelResponse,
   type ResponseTransport, type RunAgentOptions, type ToolCallContext,
 } from './responses.js';
@@ -354,13 +354,15 @@ test('拒绝和未完成响应即使 checkpoint 恢复也绝不执行工具；le
     let writes = 0;
     const definition = writer(() => { writes++; return {}; });
     const transport = new FixtureTransport([reply]);
-    await assert.rejects(runAgent(definition, options(transport, { onCheckpoint: saved.save })), /未完成|模型拒绝/);
-    assert.equal(saved.latest().step.status, 'failed');
+    // The answer arrived, so the outcome is known: the run waits for the author, and resuming sends a new turn without a cost confirmation.
+    await assert.rejects(runAgent(definition, options(transport, { onCheckpoint: saved.save })), (error: unknown) => error instanceof AgentSuspended && /未完成|模型拒绝/.test(error.message));
+    assert.equal(saved.latest().step.status, 'paused');
     assert.equal(saved.latest().pendingCalls.length, 0);
+    assert.deepEqual([saved.latest().phase, saved.latest().uncertain, saved.latest().turn], ['ready', false, 1]);
     assert.equal(writes, 0);
     await assert.rejects(runAgent(definition, options(transport, { checkpoint: saved.latest(), onCheckpoint: saved.save })), AgentSuspended);
     assert.equal(writes, 0);
-    assert.equal(transport.requests.length, 1);
+    assert.equal(transport.requests.length, 2);
   }
   let writes = 0;
   let lastStatus: string | undefined;
@@ -398,4 +400,60 @@ test('durable 保留严格 schema/领域校验反馈及未知工具/基础设施
     assert.equal(outputs(saved.latest().input).length, 0);
     assert.equal(transport.requests.length, 1);
   }
+});
+
+function cut(text: string, extra: ResponseOutputItem[] = []): ModelResponse {
+  const output: ResponseOutputItem[] = text ? [{ ...message(text), status: 'incomplete' } as ResponseOutputItem] : [];
+  return { id: `cut-${text.length}`, status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' }, output: [...output, ...extra],
+    usage: { input_tokens: 10, output_tokens: 16000, total_tokens: 16010, output_tokens_details: { reasoning_tokens: 9000 } } };
+}
+const prose: AgentDefinition = { id: 'writer', label: 'writer', instructions: 'write' };
+
+test('服务明确报错的请求不算结果不确定：durable 挂起后可直接重发同一轮，非 durable 原样报错', async () => {
+  let failing = true, requests = 0;
+  const flaky: ResponseTransport = { stream(request, signal) {
+    requests++;
+    if (failing) throw new ModelServiceError('模型服务出错（已自动重试 4 次）：429 Rate limit reached', 429);
+    return new FixtureTransport([response([message('ok')], 'after-retry')]).stream(request);
+  } };
+  await assert.rejects(runAgent(prose, options(flaky)), (error: unknown) => error instanceof ModelServiceError && error.status === 429);
+  const saved = journal();
+  await assert.rejects(runAgent(prose, options(flaky, { onCheckpoint: saved.save })),
+    (error: unknown) => error instanceof AgentSuspended && /429 Rate limit reached。这一轮没有产生结果；恢复任务会重新发送这一轮/.test(error.message));
+  assert.deepEqual([saved.latest().phase, saved.latest().uncertain, saved.latest().turn, saved.latest().step.status], ['ready', false, 0, 'paused']);
+  failing = false;
+  const step = await runAgent(prose, options(flaky, { checkpoint: saved.latest(), onCheckpoint: saved.save }));
+  assert.equal(step.output, 'ok');
+  assert.equal(saved.latest().turn, 0, 'a turn the service rejected had no response, so it is sent again as the same turn');
+  assert.equal(requests, 3);
+});
+
+test('纯文本回答达到输出上限时续写并去掉重叠；续写次数用尽或结构化输出被截断时报告上限', async () => {
+  const transport = new FixtureTransport([cut('第一段。直到雨停下来的时候'), cut('直到雨停下来的时候，她推开门。'), response([message('门外没有人。')])]);
+  const saved = journal();
+  const step = await runAgent(prose, options(transport, { onCheckpoint: saved.save }));
+  assert.equal(step.output, '第一段。直到雨停下来的时候，她推开门。门外没有人。');
+  assert.deepEqual(transport.requests[1]!.input.slice(-2), [{ role: 'assistant', content: '第一段。直到雨停下来的时候' }, { role: 'user', content: CONTINUE_NOTICE }]);
+  assert.equal(transport.requests[2]!.input.length, 5);
+  assert.equal(saved.latest().turn, 2);
+  assert.equal(saved.latest().continued, undefined);
+
+  const endless = new FixtureTransport([cut('又一段。')]);
+  await assert.rejects(runAgent(prose, options(endless)), (error: unknown) => error instanceof OutputLimitError
+    && error.message === '模型输出达到单次上限被截断（本次输出 16000 tokens，其中推理 9000）');
+  assert.equal(endless.requests.length, MAX_OUTPUT_CONTINUATIONS + 1);
+
+  const schema = objectSchema({ summary: { type: 'string' } });
+  for (const definition of [{ ...prose, outputSchema: schema }, writer(() => { throw new Error('must not execute'); })]) {
+    const structured = new FixtureTransport([cut('{"summary":"半', definition.tools ? [call('cut-call', '{"value":"')] : [])]);
+    const journalled = journal();
+    await assert.rejects(runAgent(definition, options(structured, { onCheckpoint: journalled.save })), OutputLimitError);
+    assert.equal(structured.requests.length, 1, 'a cut JSON answer or tool call cannot be continued');
+    assert.deepEqual([journalled.latest().phase, journalled.latest().uncertain, journalled.latest().turn, journalled.latest().pendingCalls.length], ['ready', false, 1, 0]);
+  }
+});
+
+test('续写拼接只去掉足够长的重叠', () => {
+  assert.equal(joinContinuation('她说：“走吧。”他站在门口没有回答。', '他站在门口没有回答。风更大了。'), '她说：“走吧。”他站在门口没有回答。风更大了。');
+  assert.equal(joinContinuation('一二三四五六七', '七八九'), '一二三四五六七七八九', 'a short coincidence is not an overlap');
 });

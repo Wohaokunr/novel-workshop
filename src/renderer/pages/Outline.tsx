@@ -1,7 +1,7 @@
 import type { MouseEvent } from 'react';
 import { BookOpenText, FilePlus2, Layers, ListTree, MessageCircleQuestion, Plus, Sparkles, Split, Trash2 } from 'lucide-react';
 import type { Chapter, SourceReference, Workspace } from '../../shared/types';
-import type { CompanionOp, OutlineNodeKind } from '../../shared/companion-types';
+import type { CompanionAskOptions, CompanionOp, OutlineNodeKind } from '../../shared/companion-types';
 import { companionCommands } from '../../shared/companion';
 import { outlineTemplate, outlineTemplates } from '../../shared/outline-templates';
 import { useCompanion } from '../Companion';
@@ -20,10 +20,10 @@ export function Outline({ workspace: w, commit, askDelete, onOpenReference }: {
   const chapters = [...w.chapters].sort((a, b) => a.order - b.order);
   const loose = chapters.filter(chapter => !chapter.actId);
   const template = outlineTemplate(w.structureTemplate);
-  const summon = (event: MouseEvent<HTMLElement>, kind: OutlineNodeKind, id: string | undefined, message: string, label: string) => {
+  const summon = (event: MouseEvent<HTMLElement>, kind: OutlineNodeKind, id: string | undefined, message: string, label: string, options?: CompanionAskOptions) => {
     const rect = event.currentTarget.getBoundingClientRect();
     companion.summon({ mode: 'outline', anchor: { surface: 'outline', references: kind === 'chapter' && id ? w.scenes.filter(scene => scene.chapterId === id).slice(0, 6).map(scene => ({ kind: 'scene' as const, id: scene.id })) : [], outlineNode: { kind, ...(id ? { id } : {}) } },
-      screen: { x: rect.left, y: rect.bottom }, message, label });
+      screen: { x: rect.left, y: rect.bottom }, message, label, ...(options ? { options } : {}) });
   };
   /** Manual additions share the companion's ordering rules, so a chapter added to an act lands after that act's chapters. */
   const add = (op: CompanionOp, label: string) => fire(commit(current => companionCommands(current, { ideas: [], ops: [{ proposal: { id: 'manual', title: '', summary: '', ops: [op] }, op }] },
@@ -66,7 +66,7 @@ export function Outline({ workspace: w, commit, askDelete, onOpenReference }: {
       </label>
       {template && <div className="template-stages"><p className="muted">{template.fit}</p><ol>{template.stages.map(stage => <li key={stage.name}><span className="stage-bar" style={{ width: `${Math.max(6, stage.share)}%` }}/><strong>{stage.name}</strong><small>{stage.purpose}</small></li>)}</ol></div>}
       <div className="outline-meta-actions">
-        <button className="primary" data-testid="outline-full-draft" onClick={event => summon(event, 'book', undefined, '生成全书草案：幕/卷 → 章节 → 场景节拍。', '全书草案')}><Sparkles aria-hidden="true"/>一键生成全书草案</button>
+        <button className="primary" data-testid="outline-full-draft" onClick={event => summon(event, 'book', undefined, '生成全书草案：幕/卷 → 章节 → 场景节拍。', '全书草案', { fullDraft: true })}><Sparkles aria-hidden="true"/>一键生成全书草案</button>
         <button onClick={event => summon(event, 'book', undefined, '把故事骨架展开成幕/卷。', '展开幕/卷')}><Split aria-hidden="true"/>展开幕/卷</button>
         <button className="ghost" onClick={event => summon(event, 'book', undefined, '先别展开，问我几个关键问题，帮我把故事骨架想清楚。', '追问 · 故事骨架')}><MessageCircleQuestion aria-hidden="true"/>追问我</button>
       </div>

@@ -71,9 +71,9 @@ const titleLike = (value: string) => /\p{Script=Han}/u.test(value) && Array.from
  * Guards: never deletes, never touches written scene text, new scenes start empty, unknown targets are skipped and reported;
  * a scene whose chapter does not exist yet gets a new chapter instead of being dropped.
  */
-export function companionCommands(workspace: Workspace, selection: CompanionSelection, options: CompanionPlacement): { commands: Command[]; skipped: string[]; refs: Record<string, string> } {
+export function companionCommands(workspace: Workspace, selection: CompanionSelection, options: CompanionPlacement): { commands: Command[]; skipped: string[]; skippedOps: Array<{ proposalId: string; opId: string; reason: string }>; refs: Record<string, string> } {
   const newId = options.newId ?? defaultId;
-  const skipped: string[] = [];
+  const skipped: string[] = [], skippedOps: Array<{ proposalId: string; opId: string; reason: string }> = [];
   const acts: Act[] = structuredClone(workspace.acts ?? []);
   const chapters: Chapter[] = structuredClone(workspace.chapters);
   const scenes: NarrativeScene[] = structuredClone(workspace.scenes);
@@ -255,7 +255,7 @@ export function companionCommands(workspace: Workspace, selection: CompanionSele
 
   for (const { proposal, op } of selection.ops) {
     const label = clean(op.title) || op.op;
-    const skip = (reason: string) => skipped.push(`${label}：${reason}`);
+    const skip = (reason: string) => { skipped.push(`${label}：${reason}`); skippedOps.push({ proposalId: proposal.id, opId: op.id, reason }); };
     switch (op.op) {
       case 'addAct': {
         const id = newId();
@@ -520,5 +520,5 @@ export function companionCommands(workspace: Workspace, selection: CompanionSele
   const changedCards = changed(workspace.cards, cards).sort((a, b) => Number(b.kind === 'group') - Number(a.kind === 'group'));
   for (const value of changedCards) commands.push({ type: 'putCard', value });
   for (const value of links) commands.push({ type: 'putCanvasLink', value });
-  return { commands, skipped, refs: Object.fromEntries([...refs].filter(([key]) => !known.has(key))) };
+  return { commands, skipped, skippedOps, refs: Object.fromEntries([...refs].filter(([key]) => !known.has(key))) };
 }
