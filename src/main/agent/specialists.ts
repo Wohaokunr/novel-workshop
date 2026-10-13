@@ -48,6 +48,10 @@ function definition(id: string, label: string, instructions: string, outputSchem
   // No direct writes and, critically, no read_project escape hatch for restricted roles.
   return { id, label, instructions, tools: [], ...(outputSchema ? { outputSchema } : {}) };
 }
+/** Roles that read or write prose see it with its paragraphs intact (see liftProse). */
+function proseDefinition(id: string, label: string, instructions: string, outputSchema?: JsonSchema): AgentDefinition {
+  return { ...definition(id, label, instructions, outputSchema), proseBlocks: true };
+}
 function result<T>(step: AgentStep, schema: JsonSchema): T {
   validateSchema(step.structured, schema);
   return step.structured as T;
@@ -121,7 +125,7 @@ export function specialistDefinition(specialist: SpecialistRequest & { story?: S
     const target = readerTarget(project, request, sceneId, node.chapterId);
     const context = buildReaderContext(project, target.chapterId, target.sceneId);
     const chapters = [...project.chapters].filter(chapter => chapter.order <= project.chapters.find(item => item.id === target.chapterId)!.order);
-    return { definition: definition('reader', '读者 · 正文审阅', readerPrompt.text, reviewSchema),
+    return { definition: proseDefinition('reader', '读者 · 正文审阅', readerPrompt.text, reviewSchema),
       context: boundedContext({ title: context.title, earlierStory: readerEarlierStory(story, context.sources, context.text.length), text: context.text.slice(-READER_TEXT_CHARS),
         omitted: { earlierVisibleChars: Math.max(0, context.text.length - READER_TEXT_CHARS), notice: '这里只包含已呈现正文；earlierStory 是较早已读正文的摘要。未读后文和作者目标/设定未提供。' } }, undefined, ['text']),
       objective: '从读者视角审阅可见正文，给出 pass/revise、具体问题与修订建议。',
@@ -131,7 +135,7 @@ export function specialistDefinition(specialist: SpecialistRequest & { story?: S
     const scene = structuredClone(project.scenes.find(item => item.id === sceneId)!);
     const selection = request.stage === 'rewrite' && request.sceneId === scene.id ? request.selection : undefined;
     const { sources: labels, ...context } = buildWriterContext(project, scene.id, request.references, story);
-    return { definition: definition(request.stage === 'rewrite' ? 'rewrite' : 'writer', `${scene.title} · 正文写作`, `${writerPrompt.text}\n${(selection ? writerScopePrompts.selection : writerScopePrompts.scene).text}`),
+    return { definition: proseDefinition(request.stage === 'rewrite' ? 'rewrite' : 'writer', `${scene.title} · 正文写作`, `${writerPrompt.text}\n${(selection ? writerScopePrompts.selection : writerScopePrompts.scene).text}`),
       context: boundedContext({ ...context, authorRules, ...(upstream ? { upstream } : {}), selectedText: selection ? scene.text.slice(selection.start, selection.end) : null }, WRITER_CONTEXT_CHARS, WRITER_PRIORITY), objective,
       sources: [...novelSources(project), ...sourcesForLabels(project, labels, role)],
       toCommands: step => {
@@ -179,7 +183,7 @@ export function specialistDefinition(specialist: SpecialistRequest & { story?: S
     const profile = styleProfile(project), baseline = styleBaseline(profile);
     const before = story.order[story.positionOf(scenes[0]!.id) - 1];
     const { notice: _notice, ...style } = writerStyle(project, scenes[0]!);
-    return { definition: definition('stylist', '文风 · 笔触审阅', stylistPrompt.text, reviewSchema),
+    return { definition: proseDefinition('stylist', '文风 · 笔触审阅', stylistPrompt.text, reviewSchema),
       context: boundedContext({ style,
         targetScenes: scenes.map(scene => ({ id: scene.id, title: scene.title, text: scene.text.length > EVIDENCE_TEXT_CHARS ? `${scene.text.slice(0, EVIDENCE_TEXT_CHARS / 2)}\n……\n${scene.text.slice(-EVIDENCE_TEXT_CHARS / 2)}` : scene.text,
           lint: styleLint(scene.text, profile, baseline).issues.map(issue => ({ message: issue.message, excerpt: issue.excerpt })) })),
