@@ -992,3 +992,62 @@ test('协调者的 search_context 在有语义索引时按意思召回原文；�
     } finally { store.close(); }
   }
 });
+
+test('失败的任务从检查点重试：已完成的节点直接沿用，只重做中断的部分；无法沿用时按原目标新建任务', { timeout: 20000 }, async () => {
+  const store = new NovelStore(':memory:');
+  try {
+    const project = scenes(store, ['人工正文']), planner: string[] = [];
+    let coordinatorTurns = 0, broken = true, runId = '';
+    const node = (id: string, objective: string, dependsOn: string[]) => ({ id, role: 'planner', objective, acceptance: '人物', dependsOn, sceneId: null, chapterId: null, characterId: null, eventId: null });
+    const h = harness(store, (request, signal, demo) => {
+      if (request.agentId === 'planner') {
+        const { objective } = JSON.parse(String((request.input[0] as { content: string }).content));
+        planner.push(objective);
+        return stream(reply({ summary: objective, commandsJson: '[]', opsJson: JSON.stringify([{ op: 'addCharacter', ref: 'c1', title: objective.slice(0, 2) }]) }));
+      }
+      if (request.agentId !== 'coordinator') return demo.stream(request, signal);
+      coordinatorTurns++;
+      if (coordinatorTurns === 1) return stream(tool('set_plan', { summary: '两个人物', nodes: [node('n1', '许砚', []), node('n2', '沈照', ['n1'])] }));
+      return stream(tool('finish_run', { summary: '两个人物都已建立。', artifactIds: [] }));
+    });
+    // An infrastructure error (not the model's) while the second node starts: the run fails with its checkpoint intact.
+    const digests = store.getStoryDigests.bind(store);
+    store.getStoryDigests = (projectId: string) => {
+      if (broken && store.getStoredAgentState(runId)?.plan?.nodes.find(value => value.id === 'n1')?.status === 'completed') { broken = false; throw new Error('磁盘读取失败'); }
+      return digests(projectId);
+    };
+    const run = h.start({ projectId: project.id, stage: 'agent', objective: '设计两个人物' }); runId = run.id;
+    const failed = await wait(store, run);
+    assert.equal(failed.status, 'failed', failed.runtime?.pauseReason ?? '');
+    assert.match(failed.error!, /磁盘读取失败/);
+    assert.deepEqual(planner, ['许砚']);
+    await assert.rejects(h.scheduler.retry(run.id, project.revision + 1), /REVISION_CONFLICT/);
+    const retried = await h.scheduler.retry(run.id, store.getProject(project.id).revision);
+    assert.equal(retried.id, run.id, '同一任务从检查点继续'); assert.equal(retried.error, undefined); assert.equal(retried.finishedAt, undefined);
+    const pending = await wait(store, run);
+    assert.equal(pending.status, 'awaitingApproval', pending.error ?? pending.runtime?.pauseReason ?? '');
+    assert.deepEqual(planner, ['许砚', '沈照'], '已完成的节点没有重做');
+    assert.equal(coordinatorTurns, 1, '重试不重新规划');
+    const done = await approve(store, h.scheduler, run);
+    assert.equal(done.status, 'completed', done.error ?? done.runtime?.pauseReason ?? '');
+    assert.deepEqual(store.getProject(project.id).objects.filter(object => object.typeId === 'character').map(object => object.name).sort(), ['沈照', '许砚'].sort());
+    await assert.rejects(h.scheduler.retry(run.id, store.getProject(project.id).revision), /只有已收尾的失败/);
+
+    // A failure before anything was sent (no API key) continues once the key is set; a different model service starts over instead.
+    let settings: ProviderSecret = { ...provider, mode: 'live', apiKey: '' };
+    const live = new NovelAgentScheduler(store, () => settings, () => {}, () => new DemoAgentTransport({ projectId: project.id, stage: 'agent', objective: '仅分析现有作品的问题，不要改动作品' }, store.getProject(project.id)));
+    const keyless = live.start({ projectId: project.id, stage: 'agent', objective: '仅分析现有作品的问题，不要改动作品' });
+    assert.match((await wait(store, keyless)).error!, /API Key/);
+    settings = { ...settings, apiKey: 'sk-fixture' };
+    const continued = await live.retry(keyless.id, store.getProject(project.id).revision);
+    assert.equal(continued.id, keyless.id);
+    assert.equal((await wait(store, keyless)).status, 'completed');
+    const state = store.getStoredAgentState(keyless.id)!;
+    store.saveRun({ ...store.getRun(keyless.id)!, status: 'failed', error: '模拟失败' });
+    settings = { ...settings, model: 'another' };
+    const restarted = await live.retry(keyless.id, store.getProject(project.id).revision);
+    assert.notEqual(restarted.id, keyless.id, '换了模型服务时不把旧会话发给新服务，而是按原目标新建任务');
+    assert.equal(restarted.objective, keyless.objective); assert.ok(state.providerFingerprint);
+    assert.equal((await wait(store, restarted)).status, 'completed');
+  } finally { store.close(); }
+});

@@ -63,7 +63,7 @@ export function TaskOutcome({ workspace, run, history, onOpenReference, onNextSt
   const RefIcon = (ref: SourceReference) => ref.kind === 'scene' ? Film : ref.kind === 'object' ? UserRound : StickyNote;
   const resultLink = (ref: SourceReference) => { const Icon = RefIcon(ref); return <button key={`${ref.kind}:${ref.id}`} data-testid={`open-result-${ref.id}`} onClick={() => onOpenReference(ref.kind, ref.id)}><Icon className="ref-icon" aria-hidden="true"/><span>{referenceLabel(workspace, ref)}</span><ArrowUpRight aria-hidden="true"/></button>; };
   const StatusIcon = run.status === 'completed' ? (review?.verdict === 'revise' ? CircleAlert : CircleCheck) : run.status === 'failed' ? CircleAlert : run.status === 'cancelled' ? CircleSlash : Hourglass;
-  const retryable = !!onRetry && !isAgentRun(run) && ['failed', 'cancelled'].includes(run.status);
+  const retryable = !!onRetry && (isAgentRun(run) ? run.status === 'failed' : ['failed', 'cancelled'].includes(run.status));
   return <section className={`task-outcome status-${run.status} ${bare ? 'bare' : ''}`} data-testid="task-outcome">
     {!bare && <header><span className="outcome-icon" aria-hidden="true"><StatusIcon/></span><div><span className="eyebrow">{taskLabel(run)}</span><StatusPill status={review?.verdict === 'revise' && run.status === 'completed' ? 'revise' : run.status}>{runStatus(run)}</StatusPill></div>
       <div className="button-row">{onMonitor && <button className="small ghost" onClick={() => onMonitor(run.id)}>查看记录</button>}{onDismiss && <button className="icon-button small ghost" aria-label="收起上次任务结果" title="收起" onClick={onDismiss}><X aria-hidden="true"/></button>}</div></header>}
@@ -80,7 +80,7 @@ export function TaskOutcome({ workspace, run, history, onOpenReference, onNextSt
     {refs.length > 4 && <details className="more-references"><summary>其他 {refs.length - 4} 项产出</summary><div className="outcome-links">{refs.slice(4).map(resultLink)}</div></details>}
     {(next || batches.length > 0 || retryable) && <div className="button-row task-actions">
       {run.status === 'completed' && next && onNextStage && <button className="small primary" data-testid="prepare-next-stage" disabled={disabled} onClick={() => onNextStage(next, refs)}>继续{stageNames[next]}<ChevronRight aria-hidden="true"/></button>}
-      {retryable && <button className="small" data-testid="retry-latest-run" disabled={disabled || !run.finishedAt} onClick={() => fire(onRetry!(run.id))}><RefreshCw aria-hidden="true"/>重试</button>}
+      {retryable && <button className="small" data-testid="retry-latest-run" disabled={disabled || !run.finishedAt} onClick={() => fire(onRetry!(run.id))} title={isAgentRun(run) ? '沿用已完成的步骤与产出，只重做中断的部分' : undefined}><RefreshCw aria-hidden="true"/>{isAgentRun(run) ? '从检查点重试' : '重试'}</button>}
       {batches.length > 0 && onUndo && <button className="small" data-testid="undo-result" disabled={disabled || isRunActive(run) || !changes.size} onClick={() => fire(onUndo(run.id))}><Undo2 aria-hidden="true"/>{changes.size ? '撤销本次修改' : '已撤销'}</button>}
     </div>}
   </section>;

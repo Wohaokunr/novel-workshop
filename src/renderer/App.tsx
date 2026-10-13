@@ -393,7 +393,17 @@ export default function App() {
   const retry = (id:string)=>protect(async()=>{
     await flushEdits();
     const previous=runsRef.current.find(r=>r.id===id);if(!previous)throw new Error('找不到任务');
-    if(isAgentRun(previous)||!['failed','cancelled'].includes(previous.status)||!previous.finishedAt)throw new Error('此任务不能使用旧版重试，请使用恢复任务。');
+    if(isAgentRun(previous)){
+      // Continues from the checkpoint; changes the author already approved stay in the work.
+      if(previous.status!=='failed'||!previous.finishedAt)throw new Error('只有失败的任务可以从检查点重试；暂停的任务请使用恢复。');
+      const current=await window.novel.loadProject(previous.projectId);
+      if(workspaceRef.current?.id!==current.id)throw new Error('作品已切换，请在原作品中重试。');
+      const run=await window.novel.retryRun(id,current.revision);
+      receiveRuns([run,...runsRef.current.filter(r=>r.id!==run.id)]);setSelectedRun(run.id);
+      notify(run.id===id?'已从检查点继续：已完成的步骤、产出和候选直接沿用，只重做中断的部分。':'原检查点无法沿用（已清理，或工具版本、模型服务已变化），已按原目标新建任务。');
+      return;
+    }
+    if(!['failed','cancelled'].includes(previous.status)||!previous.finishedAt)throw new Error('此任务不能重试。');
     const [current,batches]=await Promise.all([window.novel.loadProject(previous.projectId),window.novel.history(previous.projectId)]);
     const runAgain=()=>protect(async()=>{
       if(workspaceRef.current?.id!==current.id)throw new Error('作品已切换，请在原作品中重试。');

@@ -306,12 +306,43 @@ export class PersistentAgentRuntime {
       entry.stop = 'paused'; entry.state.interrupted = true; entry.state.pauseReason = '应用关闭，等待手动恢复'; entry.run.status = 'pausing'; this.publish(entry); entry.controller.abort(); await entry.done;
     }));
   }
-  retry(id: string, expectedRevision: number): AgentRun {
-    const previous = this.store.getRun(id);
-    if (!previous || !['failed', 'cancelled'].includes(previous.status) || !previous.finishedAt) throw new Error('只有已收尾的失败/停止任务可以重新生成');
+  /** A failed run continues from its checkpoint: completed specialist steps, artifacts, candidates (applied ones stay applied) and
+   * the plan are reused, and only the work in progress when it failed is done again. A stopped run, and a failed one whose checkpoint
+   * cannot be reused (base snapshot pruned, tools changed, or a different model service), start over as a new run with the same request. */
+  async retry(id: string, expectedRevision: number): Promise<AgentRun> {
+    const finished = () => {
+      const run = this.store.getRun(id);
+      if (this.active.has(id) || !run || !['failed', 'cancelled'].includes(run.status) || !run.finishedAt) throw new Error('只有已收尾的失败/停止任务可以重试');
+      return run;
+    };
+    let previous = finished();
+    const provider = previous.status === 'failed' ? await this.getProvider() : undefined;
+    previous = finished();
     if (this.store.getProject(previous.projectId).revision !== expectedRevision) throw new Error('REVISION_CONFLICT：作品已更新');
-    const { projectId, stage, tool, objective, chapterId, sceneId, selection, references } = previous;
-    return this.start({ projectId, stage, tool, objective, chapterId, sceneId, selection, references });
+    const entry = provider && previous.status === 'failed' ? this.reusable(id, provider) : undefined;
+    if (!entry) {
+      const { projectId, stage, tool, objective, chapterId, sceneId, selection, references } = previous;
+      return this.start({ projectId, stage, tool, objective, chapterId, sceneId, selection, references });
+    }
+    if (this.store.getRuns(previous.projectId).some(run => run.id !== id && (!terminal.has(run.status) || (run.status === 'cancelled' && !run.finishedAt)))
+      || [...this.active.values()].some(other => other.run.projectId === previous.projectId)) throw new Error('这部作品已有未结束任务，请恢复或结束当前任务');
+    // The failure ended the request or tool call in progress; the author's retry is the confirmation to send it again.
+    for (const value of Object.values(entry.state.checkpoints)) {
+      const cp = value as AgentCheckpoint;
+      if (cp.uncertain || cp.phase === 'requesting') { cp.phase = 'ready'; cp.uncertain = false; }
+    }
+    entry.state.pauseReason = undefined; entry.state.interrupted = false;
+    entry.run.status = 'queued'; delete entry.run.finishedAt; delete entry.run.error;
+    this.publish(entry); this.launch(entry);
+    return this.store.getRun(id)!;
+  }
+  /** The failed run's state when its checkpoint can continue: the base snapshot is still kept, the tools match this version and the
+   * model service is the one the conversation was sent to. */
+  private reusable(id: string, provider: ProviderSecret): Entry | undefined {
+    let state: AgentState | undefined;
+    try { state = this.store.getAgentState(id); } catch { return undefined; }
+    if (!state || state.toolVersion !== TOOL_VERSION || (state.providerFingerprint && state.providerFingerprint !== providerHash(provider))) return undefined;
+    return { run: this.store.getRun(id)!, state, controller: new AbortController() };
   }
 
   private async perform(entry: Entry) {

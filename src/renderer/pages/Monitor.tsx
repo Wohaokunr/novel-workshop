@@ -55,7 +55,8 @@ export function Monitor({ workspace, runs, history, selectedRun, onSelectedRun, 
         <header className="run-detail-head"><div><span className="eyebrow">{taskLabel(run)} · {time(run.startedAt)}</span><div className="run-title"><h2>{stageNames[run.stage]}</h2><StatusPill status={run.status}>{runStatus(run)}</StatusPill></div><p className="run-objective">{run.objective}</p></div>
           <div className="button-row">
             {!isAgentRun(run) && isRunActive(run) && <button className="small danger" disabled={run.status === 'cancelled'} onClick={() => fire(cancel(run.id))}><Square aria-hidden="true"/>{run.status === 'cancelled' ? '正在停止…' : '停止'}</button>}
-            {!isAgentRun(run) && (run.status === 'failed' || run.status === 'cancelled') && <button className="small" disabled={active || !run.finishedAt} onClick={() => fire(retry(run.id))}><RefreshCw aria-hidden="true"/>重试</button>}
+            {(isAgentRun(run) ? run.status === 'failed' : run.status === 'failed' || run.status === 'cancelled') && <button className="small" data-testid="retry-run" disabled={active || !run.finishedAt} onClick={() => fire(retry(run.id))}
+              title={isAgentRun(run) ? '沿用已完成的步骤与产出，只重做中断的部分' : undefined}><RefreshCw aria-hidden="true"/>{isAgentRun(run) ? '从检查点重试' : '重试'}</button>}
             <button className="small" data-testid="undo-task" disabled={active || !history.some(h => h.taskId === run.id && !h.undone)} onClick={() => fire(undo(run.id))}><Undo2 aria-hidden="true"/>撤销本次修改</button>
           </div>
         </header>

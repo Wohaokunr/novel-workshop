@@ -28,7 +28,7 @@ export class NovelAgentScheduler {
   getMemories(projectId: string) { return this.runtime.getMemories(projectId); }
   saveMemory(projectId: string, content: string, kind: AgentMemory['kind']) { return this.runtime.saveMemory(projectId, content, kind); }
   confirmMemory(projectId: string, id: string) { return this.runtime.confirmMemory(projectId, id); }
-  retry(id: string, revision: number): AgentRun {
+  async retry(id: string, revision: number): Promise<AgentRun> {
     if (this.store.getStoredAgentState(id)) return this.runtime.retry(id, revision);
     const previous = this.store.getRun(id);
     if (!previous || !['failed', 'cancelled'].includes(previous.status) || !previous.finishedAt) throw new Error('只有已结束的失败/停止任务可以重试');
