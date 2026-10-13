@@ -6,7 +6,7 @@ import { diffText } from '../../shared/text-diff.js';
 import { styleProfile } from '../../shared/style-types.js';
 import { buildCharacterContext, buildReaderContext, resolveReferences } from '../context.js';
 import { cardContent, DomainValidationError } from '../domain.js';
-import { canReadAuthor } from './policy.js';
+import { canReadAuthor, isRole } from './policy.js';
 import { searchChunks, sceneMentions } from './story-index.js';
 import { storyOverview, StoryView } from './story-view.js';
 
@@ -214,7 +214,7 @@ function queryTerms(query: string): string[] {
 /** Filter the corpus before matching. Query words never grant access to an author or future document.
  * Scene prose comes from the paragraph-chunk index (BM25, at most two chunks per scene); small records are scored directly. */
 export function searchContext(workspace: Workspace, query: string, limit = 6, role: AgentRole = 'coordinator', anchor: ContextAnchor = {}, filter: SearchFilter = {}): SearchChunk[] {
-  if (!Object.hasOwn(ROLE_SEARCH, role)) throw new DomainValidationError('检索角色无效');
+  if (!isRole(role)) throw new DomainValidationError('检索角色无效');
   const scoped = role === 'reader' || role === 'character' ? undefined : filteredScenes(workspace, filter);
   const allowed = role === 'reader' ? readerScenes(workspace, anchor) : role === 'character' ? new Set<string>() : scoped;
   const documents = role === 'reader' ? [] : role === 'character' ? characterDocuments(workspace, anchor) : authorDocuments(workspace, scoped);
@@ -255,7 +255,6 @@ export function searchContext(workspace: Workspace, query: string, limit = 6, ro
   }
   return matches.sort((a, b) => b.score - a.score || a.index - b.index).slice(0, requested).map(({ index: _index, ...chunk }) => chunk);
 }
-const ROLE_SEARCH: Record<AgentRole, true> = { coordinator: true, theme: true, planner: true, world: true, narrative: true, canvas: true, cast: true, writer: true, character: true, evolution: true, reader: true, continuity: true, stylist: true };
 
 /** A shared output cap for model context, with explicit omission paths instead of silent whole-book truncation. */
 export function boundedContext(context: Record<string, unknown>, maxChars = MAX_CONTEXT_CHARS, priority: string[] = []): Record<string, unknown> {

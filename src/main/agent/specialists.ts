@@ -5,7 +5,7 @@ import { buildCharacterContext, buildReaderContext, buildWriterContext, WRITER_C
 import { applyCommands, DomainValidationError } from '../domain.js';
 import { objectSchema, validateSchema, type AgentDefinition, type JsonSchema } from '../responses.js';
 import { boundedContext, collectContext, sourceFor, sourcesForLabels } from './memory.js';
-import { validatePlanTarget } from './policy.js';
+import { UPSTREAM_ROLES, validatePlanTarget } from './policy.js';
 import { sceneMentions } from './story-index.js';
 import { STORY_OPS, STORY_OPS_HELP, storyOpsCommands } from './story-ops.js';
 import type { CompanionOpKind } from '../../shared/companion-types.js';
@@ -118,9 +118,8 @@ function validateProposal(project: Workspace, role: ProposalRole, step: AgentSte
   return typed;
 }
 
-/** Author-side roles that build on earlier specialists' conclusions. Character, reader and stylist keep their own bounded view;
- * evolution reads the written prose of its event, which dependency folding already places in its workspace. */
-const UPSTREAM_ROLES: ReadonlySet<AgentRole> = new Set(['theme', 'planner', 'world', 'narrative', 'canvas', 'cast', 'writer', 'continuity']);
+/** Which roles build on earlier specialists' conclusions is ROLE_CAPABILITIES.upstream. Evolution reads the written prose of its
+ * event, which dependency folding already places in its workspace. */
 const UPSTREAM_NOTICE = '本任务中已完成的前置专长结论，在此基础上继续。角色代入是人物当时的主观理解，可能有误；与正式原文或作者设定冲突时以原文和设定为准。前置修改已并入工作区的，会直接体现在资料中，不要重复创建。';
 
 /** story: stored digests over this (possibly candidate) workspace; focusSceneIds: scenes a review must examine;

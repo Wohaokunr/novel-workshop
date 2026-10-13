@@ -5,22 +5,29 @@ import { DomainValidationError, NOVEL_FIELDS, validateWorkspace } from '../domai
 import { STYLE_KEYS, styleProfile, type StyleKey } from '../../shared/style-types.js';
 
 export const MAX_PLAN_NODES = 12;
-export const ROLE_CAPABILITIES: Readonly<Record<AgentRole, { readAuthor: boolean; proposeCommands: boolean; directWrite: false }>> = Object.freeze({
-  coordinator: { readAuthor: true, proposeCommands: true, directWrite: false },
-  theme: { readAuthor: true, proposeCommands: true, directWrite: false },
-  planner: { readAuthor: true, proposeCommands: true, directWrite: false },
-  world: { readAuthor: true, proposeCommands: true, directWrite: false },
-  narrative: { readAuthor: true, proposeCommands: true, directWrite: false },
-  canvas: { readAuthor: true, proposeCommands: true, directWrite: false },
-  cast: { readAuthor: true, proposeCommands: true, directWrite: false },
-  writer: { readAuthor: true, proposeCommands: true, directWrite: false },
-  evolution: { readAuthor: true, proposeCommands: true, directWrite: false },
-  character: { readAuthor: false, proposeCommands: false, directWrite: false },
-  reader: { readAuthor: false, proposeCommands: false, directWrite: false },
-  continuity: { readAuthor: true, proposeCommands: false, directWrite: false },
+/** The one role list. plan: the coordinator may put the role in a plan (the stylist only runs inside candidate review);
+ * upstream: the role receives its plan dependencies' conclusions (character, reader, stylist and evolution keep bounded views). */
+export const ROLE_CAPABILITIES: Readonly<Record<AgentRole, { readAuthor: boolean; proposeCommands: boolean; plan: boolean; upstream: boolean; directWrite: false }>> = Object.freeze({
+  coordinator: { readAuthor: true, proposeCommands: true, plan: false, upstream: false, directWrite: false },
+  theme: { readAuthor: true, proposeCommands: true, plan: true, upstream: true, directWrite: false },
+  planner: { readAuthor: true, proposeCommands: true, plan: true, upstream: true, directWrite: false },
+  world: { readAuthor: true, proposeCommands: true, plan: true, upstream: true, directWrite: false },
+  narrative: { readAuthor: true, proposeCommands: true, plan: true, upstream: true, directWrite: false },
+  canvas: { readAuthor: true, proposeCommands: true, plan: true, upstream: true, directWrite: false },
+  cast: { readAuthor: true, proposeCommands: true, plan: true, upstream: true, directWrite: false },
+  writer: { readAuthor: true, proposeCommands: true, plan: true, upstream: true, directWrite: false },
+  evolution: { readAuthor: true, proposeCommands: true, plan: true, upstream: false, directWrite: false },
+  character: { readAuthor: false, proposeCommands: false, plan: true, upstream: false, directWrite: false },
+  reader: { readAuthor: false, proposeCommands: false, plan: true, upstream: false, directWrite: false },
+  continuity: { readAuthor: true, proposeCommands: false, plan: true, upstream: true, directWrite: false },
   // Reads prose and the style profile only, never world truth.
-  stylist: { readAuthor: false, proposeCommands: false, directWrite: false },
+  stylist: { readAuthor: false, proposeCommands: false, plan: false, upstream: false, directWrite: false },
 });
+const roleNames = Object.keys(ROLE_CAPABILITIES) as AgentRole[];
+/** Roles a plan node may name, in a stable order (also the tool schema's enum). */
+export const PLAN_ROLES = roleNames.filter(role => ROLE_CAPABILITIES[role].plan) as Array<PlanNode['role']>;
+export const UPSTREAM_ROLES: ReadonlySet<AgentRole> = new Set(roleNames.filter(role => ROLE_CAPABILITIES[role].upstream));
+export function isRole(role: string): role is AgentRole { return Object.hasOwn(ROLE_CAPABILITIES, role); }
 
 /** Prose needs independent review; settings, canvas, cast and outline changes go straight to one-click approval. */
 export function touchesProse(candidate: { changes: Change[] }): boolean {
@@ -65,7 +72,8 @@ export function scopedScenes(workspace: Workspace, request: RunRequest): Narrati
 /** Reused by specialist construction; dependencies are validated separately by validatePlan. */
 export function validatePlanTarget(node: PlanNode, workspace: Workspace, request: RunRequest): void {
   requirePlan(workspace.id === request.projectId, '任务与项目不匹配');
-  requirePlan(node && Object.hasOwn(ROLE_CAPABILITIES, node.role) && node.role !== ('coordinator' as string), '角色无效');
+  // Any specialist: review builds reader and stylist nodes too. Whether the coordinator may plan a role is checked by set_plan (PLAN_ROLES).
+  requirePlan(node && isRole(node.role) && (node.role as string) !== 'coordinator', '角色无效');
   const sceneId = node.sceneId ?? request.sceneId;
   const chapterId = node.chapterId ?? request.chapterId;
   const scene = sceneId ? workspace.scenes.find(item => item.id === sceneId) : undefined;

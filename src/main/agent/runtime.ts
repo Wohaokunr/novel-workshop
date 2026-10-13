@@ -7,7 +7,7 @@ import { DomainValidationError, hasSemanticChanges } from '../domain.js';
 import type { ResponseInputItem } from 'openai/resources/responses/responses';
 import { addUsage, AgentSuspended, emptyUsage, OutputLimitError, runAgent, runtimeCalls, settleCheckpointTool, ToolValidationError, type AgentCheckpoint, type AgentDefinition, type ResponseTransport, type RunAgentOptions, type RuntimeCall, type ToolCallContext } from '../responses.js';
 import { bookSources, boundedContext, changeSources, collectContext, compactChanges, fingerprint, refreshMemories, searchContext, selectAuthorRules } from './memory.js';
-import { assertWriteScope, canProposeCommands, canReadAuthor, chainWriterNodes, createBudget, touchesProse, validatePlan } from './policy.js';
+import { assertWriteScope, canProposeCommands, canReadAuthor, chainWriterNodes, createBudget, PLAN_ROLES, touchesProse, validatePlan } from './policy.js';
 import { specialistDefinition, type SpecialistDefinition } from './specialists.js';
 import { createCoordinatorTools, type ToolName } from './tools.js';
 import { sceneMentions } from './story-index.js';
@@ -18,7 +18,6 @@ const SCENE_TEXT_PREVIEW = 4000, READ_TEXT_CHARS = 6000, READ_ENTITIES_CHARS = 1
 
 const TOOL_VERSION = 'novel-agent-2';
 const terminal = new Set(['completed', 'failed', 'cancelled']);
-const roles = new Set(['theme', 'planner', 'world', 'narrative', 'canvas', 'cast', 'writer', 'character', 'evolution', 'reader', 'continuity']);
 /** Steps the runtime carries on by itself once the coordinator has saved a plan or completed one of them. */
 const PIPELINE: ReadonlySet<string> = new Set(['set_plan', 'delegate_tasks', 'propose_changes', 'review_candidate', 'revise_candidate']);
 /** Model turns are few now that the runtime executes the plan; runtime-owned steps also advance the turn counter. */
@@ -560,7 +559,7 @@ export class PersistentAgentRuntime {
       case 'set_plan': {
         if (state.plan && state.budget.replans >= state.budget.maxReplans) throw new AgentSuspended('重规划预算耗尽；点击恢复任务可追加重规划额度');
         const nodes = (args.nodes as Array<Record<string, unknown>>).map(raw => Object.fromEntries(Object.entries(raw).filter(([, value]) => value !== null)) as unknown as PlanNode);
-        for (const node of nodes) { if (!roles.has(node.role)) fail('专长不存在'); node.status = 'pending'; }
+        for (const node of nodes) { if (!PLAN_ROLES.includes(node.role)) fail('专长不存在'); node.status = 'pending'; }
         validatePlan(nodes, this.workspace(entry), entry.run);
         const chained = chainWriterNodes(nodes, this.workspace(entry), entry.run);
         const kept = keepCompleted(nodes, state.plan, new Set(state.candidates.filter(candidate => candidate.status === 'rejected').flatMap(candidate => candidate.artifactIds ?? [])));

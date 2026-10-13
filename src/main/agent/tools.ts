@@ -1,10 +1,11 @@
 import { objectSchema, type AgentTool, type JsonSchema, type ToolCallContext } from '../responses.js';
+import { PLAN_ROLES } from './policy.js';
 
 const string: JsonSchema = { type: 'string' };
 const strings: JsonSchema = { type: 'array', items: string };
 const nullable: JsonSchema = { type: ['string', 'null'] };
 const node = objectSchema({
-  id: string, role: { type: 'string', enum: ['theme', 'planner', 'world', 'narrative', 'canvas', 'cast', 'writer', 'character', 'evolution', 'reader', 'continuity'] },
+  id: string, role: { type: 'string', enum: PLAN_ROLES },
   objective: string, dependsOn: strings, acceptance: string,
   sceneId: nullable, chapterId: nullable, characterId: nullable, eventId: nullable,
 });

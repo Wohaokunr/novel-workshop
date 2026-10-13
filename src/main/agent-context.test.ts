@@ -5,7 +5,8 @@ import type { AgentStep, CharacterState, Command, NovelObject, RunRequest, Works
 import { applyCommands, createWorkspace } from './domain.js';
 import { emptyUsage } from './responses.js';
 import { boundedContext, collectContext, fingerprint, MAX_CONTEXT_CHARS, refreshMemories, searchContext, selectAuthorRules, sourceFor, sourceValid, sourcesForWorkspace } from './agent/memory.js';
-import { assertWriteScope, canReadAuthor, chainWriterNodes, createBudget, validatePlan } from './agent/policy.js';
+import { assertWriteScope, canReadAuthor, chainWriterNodes, createBudget, PLAN_ROLES, ROLE_CAPABILITIES, UPSTREAM_ROLES, validatePlan } from './agent/policy.js';
+import { toolDefinitions } from './agent/tools.js';
 import { reviewSchema, specialistDefinition } from './agent/specialists.js';
 import { keepCompleted } from './agent/runtime.js';
 
@@ -306,4 +307,13 @@ test('重新规划沿用未改动的已完成节点；改动的节点及依赖�
   assert.deepEqual(keepCompleted([node('a')], undefined), []);
   const again = [node('a'), node('b', { dependsOn: ['a'] })];
   assert.deepEqual(keepCompleted(again, previous, new Set(['artifact-a'])), [], '作者拒绝过的结果不沿用，依赖它的节点也重做');
+});
+
+test('角色清单只在 ROLE_CAPABILITIES 定义一次：计划角色与工具枚举一致，文风审阅只在审查中运行', () => {
+  assert.ok(!PLAN_ROLES.includes('stylist' as never) && !PLAN_ROLES.includes('coordinator' as never));
+  assert.deepEqual([...PLAN_ROLES].sort(), Object.keys(ROLE_CAPABILITIES).filter(role => !['coordinator', 'stylist'].includes(role)).sort());
+  const planTool = toolDefinitions.find(tool => tool.name === 'set_plan')!;
+  const nodeSchema = (planTool.parameters as { properties: { nodes: { items: { properties: { role: { enum: string[] } } } } } }).properties.nodes.items.properties.role;
+  assert.deepEqual(nodeSchema.enum, PLAN_ROLES);
+  assert.deepEqual([...UPSTREAM_ROLES].sort(), ['canvas', 'cast', 'continuity', 'narrative', 'planner', 'theme', 'world', 'writer']);
 });
