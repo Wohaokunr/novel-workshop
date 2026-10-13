@@ -387,7 +387,7 @@ export async function runSmoke(window: BrowserWindow, store: NovelStore, schedul
       assert.equal(current.revision,report.revision);assert.equal(current.reading.scroll,report.scroll);
       await click('nav-read');
       await until(()=>ui<boolean>(`Math.abs(document.querySelector('.reader-scroll').scrollTop-${report.scroll})<2`),'阅读位置重启恢复');
-      assert.deepEqual(await ui<string[]>(`[document.documentElement.dataset.theme,document.documentElement.dataset.accent]`),['dark','teal'],'外观设置重启后保留');
+      assert.deepEqual(await ui<string[]>(`[document.documentElement.dataset.theme,document.documentElement.dataset.accent]`),['onedark','teal'],'外观设置重启后保留');
       await click('nav-settings');await click('theme-light');await click('accent-rose');
       assert.equal(await ui<string>(`document.documentElement.dataset.theme`),'light');
       await click('nav-home');await capture('overview-rose.png');
@@ -507,10 +507,21 @@ export async function runSmoke(window: BrowserWindow, store: NovelStore, schedul
     await click('nav-settings');await click('accent-teal');
     assert.equal(await ui<string>(`getComputedStyle(document.documentElement).getPropertyValue('--accent-base').trim()`),'#0e8174','配色方案切换');
     assert.equal(await ui<string>(`document.querySelector('[data-testid="theme-dark"]').getAttribute('aria-checked')`),'true');
-    await capture('dark-settings-teal.png');checks.push('深色模式切换、配色方案与重启保留');
+    await capture('dark-settings-teal.png');
+    await click('theme-onedark');await click('accent-indigo');
+    assert.equal(await ui<string>(`getComputedStyle(document.documentElement).backgroundColor`),'rgb(33, 37, 43)','One Dark 背景生效');
+    assert.equal(await ui<string>(`getComputedStyle(document.documentElement).getPropertyValue('--accent-base').trim()`),'#61afef','One Dark 强调色');
+    await capture('onedark-settings.png');
+    await click('theme-toggle');assert.equal(await ui<string>(`document.documentElement.dataset.theme`),'light');
+    await click('theme-toggle');assert.equal(await ui<string>(`document.documentElement.dataset.theme`),'onedark','侧栏切回上次的深色风格');
+    await click('nav-home');await capture('onedark-overview.png');
+    await click('nav-write');await capture('onedark-writer.png');
+    await click('nav-idea');await capture('onedark-canvas.png');
+    await click('nav-settings');await click('accent-teal');
+    checks.push('深色与 One Dark 切换、配色方案与重启保留');
     await click('nav-read');await ui(`document.querySelector('.reader-scroll').scrollTo({top:420,behavior:'instant'})`);await delay(80);await click('nav-home');
     const current=store.getProject(project.id);
-    writeFileSync(reportPath,JSON.stringify({projectId:project.id,revision:current.revision,scroll:current.reading.scroll,checks,screenshots:['overview.png','drawer-1080.png','writer.png','reader-dark.png','canvas-reduced-motion.png','overview-mobile.png','dark-overview.png','dark-writer.png','dark-canvas.png','dark-settings-teal.png','overview-rose.png'],callsRealModel:false},null,2),'utf8');
+    writeFileSync(reportPath,JSON.stringify({projectId:project.id,revision:current.revision,scroll:current.reading.scroll,checks,screenshots:['overview.png','drawer-1080.png','writer.png','reader-dark.png','canvas-reduced-motion.png','overview-mobile.png','dark-overview.png','dark-writer.png','dark-canvas.png','dark-settings-teal.png','onedark-settings.png','onedark-overview.png','onedark-writer.png','onedark-canvas.png','overview-rose.png'],callsRealModel:false},null,2),'utf8');
     await closeWindow();console.log(`前端交互检查通过：${checks.join('；')}。`);return;
   }
   if (process.env.NOVEL_SMOKE_FOCUS === 'evolution') {

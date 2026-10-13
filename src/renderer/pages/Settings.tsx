@@ -18,9 +18,9 @@ export function Settings({provider,save,test,workspace,backup,restore,exportText
 function AppearancePanel() {
   const appearance=useAppearance();
   return <section className="panel" data-testid="appearance"><div className="section-heading"><div><h2>外观</h2></div><span className="pill">仅保存在本机</span></div>
-    <p className="muted">深色模式适合夜间写作；配色方案会改变按钮、选中与进度等强调色。也可以用侧栏底部的按钮或 Ctrl K 快速切换。</p>
+    <p className="muted">深色模式适合夜间写作；One Dark 参照编程软件里常见的同名配色。配色方案会改变按钮、选中与进度等强调色。也可以用侧栏底部的按钮或 Ctrl K 快速切换。</p>
     <div className="segmented settings-mode appearance-modes" role="radiogroup" aria-label="外观模式">{modes.map(mode=><button key={mode.id} role="radio" aria-checked={appearance.mode===mode.id} data-testid={`theme-${mode.id}`} className={appearance.mode===mode.id?'active':''} onClick={()=>setAppearance({mode:mode.id})}>{mode.label}</button>)}</div>
-    <div className="field"><span>配色方案</span><div className="accent-swatches" role="radiogroup" aria-label="配色方案">{accents.map(accent=><button key={accent.id} role="radio" aria-checked={appearance.accent===accent.id} data-testid={`accent-${accent.id}`} className={appearance.accent===accent.id?'active':''} style={{'--swatch':accent.swatch} as React.CSSProperties} onClick={()=>setAppearance({accent:accent.id})}><i aria-hidden="true"/>{accent.label}{appearance.accent===accent.id&&<Check aria-hidden="true"/>}</button>)}</div></div>
+    <div className="field"><span>配色方案</span><div className="accent-swatches" role="radiogroup" aria-label="配色方案">{accents.map(accent=><button key={accent.id} role="radio" aria-checked={appearance.accent===accent.id} data-testid={`accent-${accent.id}`} className={appearance.accent===accent.id?'active':''} style={{'--swatch':appearance.theme==='onedark'?accent.onedark:accent.swatch} as React.CSSProperties} onClick={()=>setAppearance({accent:accent.id})}><i aria-hidden="true"/>{accent.label}{appearance.accent===accent.id&&<Check aria-hidden="true"/>}</button>)}</div></div>
   </section>;
 }
 
