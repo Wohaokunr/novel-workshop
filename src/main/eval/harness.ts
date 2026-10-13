@@ -7,6 +7,7 @@ import { StoryView } from '../agent/story-view.js';
 import { PROMPTS, PROMPT_SET_VERSION } from '../prompts/index.js';
 import { BENCHMARK, type BenchCase, type BenchTask } from './bench.js';
 import { absent, filled, present, proseFormat, styleCheck, type CheckResult } from './checks.js';
+import { formatJudge, type JudgeReport } from './judge.js';
 
 export interface TaskResult {
   caseId: string; taskId: string; label: string; role: BenchTask['role']; attempt: number;
@@ -15,6 +16,8 @@ export interface TaskResult {
 export interface BenchReport {
   at: string; mode: string; model?: string; promptSet: string; prompts: Array<{ id: string; version: string }>;
   repeat: number; results: TaskResult[];
+  /** Blind A/B comparison of the writer's prose against the baseline (`--judge`). */
+  judge?: JudgeReport;
 }
 export interface Regression { caseId: string; taskId: string; checkId: string; label: string; before: number; after: number }
 
@@ -52,7 +55,7 @@ export async function runTask(benchCase: BenchCase, task: BenchTask, transport: 
   const checks = contextChecks(benchCase, task, project, JSON.stringify(spec.context));
   try {
     const step = await runAgent(spec.definition, { transport: transport(project, request), context: spec.context, objective: spec.objective, contextSources: [], signal });
-    const text = task.role === 'writer' ? step.output : Object.values((step.structured ?? {}) as Record<string, unknown>).flat().join('\n');
+    const text = task.role === 'writer' ? step.output : Object.values((step.structured ?? {}) as Record<string, unknown>).flat().map(value => typeof value === 'string' ? value : JSON.stringify(value)).join('\n');
     return { ...base, promptVersion: step.promptVersion, checks: [...checks, ...outputChecks(benchCase, task, project, text, step.structured)], usage: step.usage, output: task.role === 'writer' ? text : JSON.stringify(step.structured) };
   } catch (error) {
     return { ...base, checks, usage: emptyUsage(), output: '', error: error instanceof Error ? error.message : String(error) };
@@ -122,5 +125,6 @@ export function formatReport(report: BenchReport, baseline?: BenchReport): strin
     lines.push(regressions.length ? `通过率下降 ${regressions.length} 项：` : '没有检查的通过率下降。');
     for (const item of regressions) lines.push(`    ↓ ${item.caseId}/${item.taskId} ${item.label}：${percent(item.before)} → ${percent(item.after)}`);
   }
+  if (report.judge) lines.push(formatJudge(report.judge));
   return lines.join('\n');
 }

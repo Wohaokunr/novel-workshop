@@ -131,8 +131,9 @@ export default function Assistant(props: AssistantProps) {
   const needsFollowUp = lastHuman && (!latest?.finishedAt || lastHuman.at > latest.finishedAt) && !active;
   const followUpRefs = workspace && lastHuman ? taskReferences(workspace, [{ ...lastHuman, taskId: lastHuman.id }], lastHuman.id) : [];
   const validSelection = !!scene && !!selection && Number.isSafeInteger(selection.start) && Number.isSafeInteger(selection.end)
-    && selection.start >= 0 && selection.end > selection.start && selection.end <= scene.text.length
+    && selection.start >= 0 && selection.end >= selection.start && selection.end <= scene.text.length
     && scene.text.slice(selection.start, selection.end) === selection.text;
+  const continuing = stage === 'rewrite' && !!selection && selection.start === selection.end;
   const hasMissingReference = !!workspace && references.some(ref => !(ref.kind === 'card' ? workspace.cards : ref.kind === 'object' ? workspace.objects : workspace.scenes).some(item => item.id === ref.id));
   let blocker = !workspace ? '先创建或打开一部作品。' : hasMissingReference ? '引用资料已删除，请移除后继续。' : !draft.objective.trim() ? '填写本次创作目标后即可开始。' : '';
   if (!blocker && (stage === 'chapter' || stage === 'rewrite')) {
@@ -154,8 +155,8 @@ export default function Assistant(props: AssistantProps) {
     else props.onPrepare(value as RunRequest['stage'], references, undefined, chapterScope);
   };
   const changeScene = (id: string) => props.onDraftChange({ sceneId: id, selection: undefined });
-  const description = stage === 'assist' ? assistTools[tool].objective : stage === 'chapter' ? (chapterScope === 'chapter' ? '依次完成本章所有空白场景，保留已有正文。' : '根据场景大纲与人物视角，为目标空白场景生成正文。') : descriptions[stage];
-  const startLabel = stage === 'assist' ? `开始${assistTools[tool].label}` : { agent: '开始目标任务', idea: '开始构思', outline: '开始编排', chapter: '开始生成', rewrite: '开始改写' }[stage];
+  const description = continuing ? '从光标处接着写，写好的内容经审阅后由你批准插入。' : stage === 'assist' ? assistTools[tool].objective : stage === 'chapter' ? (chapterScope === 'chapter' ? '依次完成本章所有空白场景，保留已有正文。' : '根据场景大纲与人物视角，为目标空白场景生成正文。') : descriptions[stage];
+  const startLabel = stage === 'assist' ? `开始${assistTools[tool].label}` : continuing ? '开始续写' : { agent: '开始目标任务', idea: '开始构思', outline: '开始编排', chapter: '开始生成', rewrite: '开始改写' }[stage];
   const canStart = !blocker && !active && !props.busy;
   const start = () => { if (canStart) fire(props.onStart()); };
   const referenceChip = (ref: SourceReference) => workspace ? <span className="reference-chip" key={`${ref.kind}:${ref.id}`}><button onClick={() => props.onOpenReference(ref.kind, ref.id)} title="打开这项资料">{referenceLabel(workspace, ref)}</button><button aria-label={`移除${referenceLabel(workspace, ref)}`} onClick={() => props.onDraftChange({ references: references.filter(r => r.kind !== ref.kind || r.id !== ref.id) })}><X aria-hidden="true"/></button></span> : null;
@@ -215,7 +216,8 @@ export default function Assistant(props: AssistantProps) {
             <span>{stage === 'chapter' && chapterScope === 'chapter' ? '目标章节' : '目标场景'}</span>
             {stage === 'chapter' && chapterScope === 'chapter' ? <select data-testid="target-chapter" aria-label="目标章节" value={scene?.chapterId || ''} onChange={e => { const target = workspace && orderedScenes(workspace).find(s => s.chapterId === e.target.value); if (target) changeScene(target.id); }}><option value="" disabled>选择章节</option>{workspace && orderedChapters(workspace).map(c => <option key={c.id} value={c.id} disabled={!workspace.scenes.some(s => s.chapterId === c.id)}>{c.title}</option>)}</select> : <select data-testid="target-scene" aria-label="目标场景" value={scene?.id || ''} onChange={e => changeScene(e.target.value)}><option value="" disabled>选择场景</option>{workspace && orderedScenes(workspace).map(s => <option key={s.id} value={s.id}>{workspace.chapters.find(c => c.id === s.chapterId)?.title} · {s.title}</option>)}</select>}
             {stage === 'chapter' && chapterScope === 'chapter' && chapter && <small>将生成 {workspace?.scenes.filter(s => s.chapterId === chapter.id && !s.text.trim()).length} 个空白场景</small>}
-            {stage === 'rewrite' && selection && <div className="selection-preview"><span><FileText aria-hidden="true"/>选中 {selection.end - selection.start} 字</span><blockquote>{selection.text.slice(0, 180)}{selection.text.length > 180 ? '…' : ''}</blockquote></div>}
+            {continuing && scene && <div className="selection-preview"><span><FileText aria-hidden="true"/>{selection!.end >= scene.text.length ? '接在本场结尾续写' : `从第 ${selection!.end.toLocaleString()} 字处续写`}</span>{!!scene.text.slice(0, selection!.end).trim() && <blockquote>…{scene.text.slice(Math.max(0, selection!.end - 120), selection!.end)}</blockquote>}</div>}
+            {stage === 'rewrite' && selection && !continuing && <div className="selection-preview"><span><FileText aria-hidden="true"/>选中 {selection.end - selection.start} 字</span><blockquote>{selection.text.slice(0, 180)}{selection.text.length > 180 ? '…' : ''}</blockquote></div>}
           </div>}
           <div className="reference-sources" data-testid="reference-sources">
             <span className="context-label">参考资料</span>

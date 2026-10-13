@@ -4,7 +4,7 @@ import { BookOpen, Check, ChevronRight, ChevronsUpDown, CircleAlert, Feather, Fi
 import Board from './Board';
 import Assistant, { TaskOutcome } from './Assistant';
 import AgentTask, { type AgentMemoryActions, type AgentTaskActions } from './AgentTask';
-import { ActionCancelled, Dialog, Toast, SaveFeedbackContext, Empty, Kbd, uid, fire, assistTools, taskObjective, canResumeRun, orderedChapters, orderedScenes, sceneFor, events, isAgentRun, isRunActive, type Commit, type TaskDraft } from './ui';
+import { ActionCancelled, Dialog, Toast, SaveFeedbackContext, Empty, Kbd, uid, fire, assistTools, taskObjective, CONTINUE_OBJECTIVE, canResumeRun, orderedChapters, orderedScenes, sceneFor, events, isAgentRun, isRunActive, type Commit, type TaskDraft } from './ui';
 import { useMediaQuery, useModalFocus } from './interaction';
 import type { Workspace, Command, ProjectSummary, NovelObject, ObjectType, NarrativeScene, AgentRun, ProviderSettings, ProviderInput, OperationBatch, RunRequest, FieldValue, SourceReference, AssistTool } from '../shared/types';
 import type { AgentDecision, AgentMemory, AgentSession } from '../shared/agent-types';
@@ -346,12 +346,22 @@ export default function App() {
         const scene=current.scenes.find(scene=>scene.id===id);
         setTask({stage,tool,objective:taskObjective(stage,tool,chapterScope),references,chapterScope,
           ...((stage==='chapter'||stage==='rewrite')?{sceneId:scene?.id}:{}),
-          ...(stage==='rewrite'&&selection&&scene&&selection.sceneId===scene.id?{selection:{start:selection.start,end:selection.end,text:selection.text}}:{}),
+          ...(stage==='rewrite'&&selection&&scene&&selection.sceneId===scene.id&&selection.end>selection.start?{selection:{start:selection.start,end:selection.end,text:selection.text}}:{}),
         });setDismissedRun(runsRef.current.find(isRunActive)?.id??runsRef.current[0]?.id??'');setAiTab('task');showPanel('ai',opener);
       }finally{setBusy(false);}
     }));
   };
   const prepareStage = (next:RunRequest['stage'],sources:SourceReference[])=>prepareTask(next,sources);
+  /** One click from the writer: write the empty scene, or continue the prose at the cursor (the end of the scene when there is none),
+   * without stopping at the task form. The task still ends with the author approving the candidate. */
+  const quickWrite = (mode:'scene'|'continue')=>fire(protect(async()=>{
+    await flushEdits();const current=workspaceRef.current,scene=current&&sceneFor(current,selectedScene);if(!current||!scene)return;
+    const at=selection&&selection.sceneId===scene.id&&selection.end<=scene.text.length?selection.end:scene.text.length;
+    const draft:TaskDraft=mode==='scene'?{stage:'chapter',tool:'canvas',objective:taskObjective('chapter'),references:[{kind:'scene',id:scene.id}],chapterScope:'scene',sceneId:scene.id}
+      :{stage:'rewrite',tool:'canvas',objective:CONTINUE_OBJECTIVE,references:[{kind:'scene',id:scene.id}],chapterScope:'scene',sceneId:scene.id,selection:{start:at,end:at,text:''}};
+    setTask(draft);setAiTab('task');
+    await start(draft);
+  }));
   const prepareAssist:AssistAction = (tool,sources)=>prepareTask('assist',sources,tool);
   const openMonitor = (id:string)=>{setSelectedRun(id);navigate('monitor');};
   const openCanvas:OpenCanvas = (kind,id)=>fire(protect(async()=>{
@@ -365,24 +375,24 @@ export default function App() {
     }
     openReference('card',card.id);
   }));
-  const start = ()=>protect(async()=>{
+  const start = (override?:TaskDraft)=>{const draft=override??task;return protect(async()=>{
     setBusy(true);
     try{
       await flushEdits();const current=workspaceRef.current;if(!current)return;
       if(runsRef.current.some(isRunActive))throw new Error('当前任务尚未结束，请先恢复、审批、回答或停止任务。');
-      if(!task.objective.trim())throw new Error('请填写本次创作目标。');
-      const scene=current.scenes.find(scene=>scene.id===task.sceneId);
-      for(const ref of task.references){const collection=ref.kind==='card'?current.cards:ref.kind==='object'?current.objects:current.scenes;if(!collection.some(item=>item.id===ref.id))throw new Error('引用资料已被删除，请移除失效引用后再开始。');}
-      if((task.stage==='chapter'||task.stage==='rewrite')&&!scene)throw new Error('请先选择有效的目标场景。');
-      if(task.stage==='chapter'&&(task.chapterScope==='scene'?!!scene!.text.trim():!current.scenes.some(item=>item.chapterId===scene!.chapterId&&!item.text.trim())))throw new Error('目标已有正文，请选择空白场景，或选中文字进行改写。');
-      if(task.stage==='rewrite'&&(!task.selection||scene!.text.slice(task.selection.start,task.selection.end)!==task.selection.text))throw new Error('选段已变化，请在正文中重新选取文字并准备改写。');
+      if(!draft.objective.trim())throw new Error('请填写本次创作目标。');
+      const scene=current.scenes.find(scene=>scene.id===draft.sceneId);
+      for(const ref of draft.references){const collection=ref.kind==='card'?current.cards:ref.kind==='object'?current.objects:current.scenes;if(!collection.some(item=>item.id===ref.id))throw new Error('引用资料已被删除，请移除失效引用后再开始。');}
+      if((draft.stage==='chapter'||draft.stage==='rewrite')&&!scene)throw new Error('请先选择有效的目标场景。');
+      if(draft.stage==='chapter'&&(draft.chapterScope==='scene'?!!scene!.text.trim():!current.scenes.some(item=>item.chapterId===scene!.chapterId&&!item.text.trim())))throw new Error('目标已有正文，请选择空白场景，或选中文字进行改写。');
+      if(draft.stage==='rewrite'&&(!draft.selection||scene!.text.slice(draft.selection.start,draft.selection.end)!==draft.selection.text))throw new Error('选段已变化，请在正文中重新选取文字并准备改写。');
       const run=await window.novel.startRun({
-        projectId:current.id,stage:task.stage,
-        objective:task.objective.trim(),
-        ...((task.stage==='chapter'||task.stage==='rewrite')?{chapterId:scene!.chapterId}:{}),
-        ...(task.stage==='assist'?{tool:task.tool}:{}),references:task.references,
-        ...(task.stage==='chapter'&&task.chapterScope==='scene'?{sceneId:scene!.id}:{}),
-        ...(task.stage==='rewrite'?{sceneId:scene!.id,selection:{start:task.selection!.start,end:task.selection!.end}}:{}),
+        projectId:current.id,stage:draft.stage,
+        objective:draft.objective.trim(),
+        ...((draft.stage==='chapter'||draft.stage==='rewrite')?{chapterId:scene!.chapterId}:{}),
+        ...(draft.stage==='assist'?{tool:draft.tool}:{}),references:draft.references,
+        ...(draft.stage==='chapter'&&draft.chapterScope==='scene'?{sceneId:scene!.id}:{}),
+        ...(draft.stage==='rewrite'?{sceneId:scene!.id,selection:{start:draft.selection!.start,end:draft.selection!.end}}:{}),
       });
       if(workspaceRef.current?.id!==run.projectId)return;
       const existing=runsRef.current.find(item=>item.id===run.id);
@@ -390,7 +400,7 @@ export default function App() {
       setSelectedRun(run.id);setAiTab('task');showPanel('ai');
       notify(provider?.mode==='mock'?'演示任务已启动，不会连接真实模型；正式写入前仍需审批。':'任务已启动；候选生成后由你审批，批准前不会写入作品。');
     }finally{setBusy(false);}
-  });
+  });};
   const undo = (id:string)=>protect(async()=>{await flushEdits();const current=workspaceRef.current;if(!current)return;const next=await window.novel.undo(current.id,id);receive(next);await refreshDetails(next.id);notify('修改已撤销。');});
   const retry = (id:string)=>protect(async()=>{
     await flushEdits();
@@ -513,7 +523,8 @@ export default function App() {
       onOpenReference={openReference} onPrepare={prepareStage} onAssist={prepareAssist} onOpenCanvas={openCanvas} showInspector={inspectorVisible} onInspectorChange={changeInspector} inspectorHost={inspectorHost}/>}
     {view==='outline'&&<Outline workspace={workspace} commit={commit} askDelete={askDelete} onOpenReference={openReference}/>}
     {view==='write'&&<Writer workspace={workspace} scene={currentScene} selectScene={selectScene} registerFlush={registerFlush} addChapter={addChapter} addScene={addScene} commit={commit} askDelete={askDelete} onAssist={prepareAssist} onOpenCanvas={openCanvas} beforeChange={()=>protect(flushEdits)}
-      onSelection={picked=>setSelection(picked&&currentScene?{...picked,sceneId:currentScene.id}:undefined)} hasSelection={!!selection&&selection.sceneId===currentScene?.id}
+      onSelection={picked=>setSelection(picked&&currentScene?{...picked,sceneId:currentScene.id}:undefined)} hasSelection={!!selection&&selection.sceneId===currentScene?.id&&selection.end>selection.start}
+      onQuickWrite={()=>quickWrite('scene')} onContinue={()=>quickWrite('continue')} runs={runs}
       onRewrite={()=>prepareTask('rewrite',currentScene?[{kind:'scene',id:currentScene.id}]:[])} onPinSample={()=>pinSample()} onPrepare={(stage,refs,scope)=>prepareTask(stage,refs,'canvas',scope)} onDetails={()=>changeInspector(!inspectorOpen)} detailsOpen={inspectorVisible}
       focusMode={focusMode} onFocusMode={setFocusMode}/>}
     {view==='style'&&<Style workspace={workspace} commit={commit} history={history} sceneId={currentScene?.id} onOpenScene={id=>openReference('scene',id)}/>}

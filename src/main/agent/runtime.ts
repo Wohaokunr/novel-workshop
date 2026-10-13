@@ -8,8 +8,8 @@ import type { ResponseInputItem } from 'openai/resources/responses/responses';
 import { addUsage, AgentSuspended, emptyUsage, OutputLimitError, runAgent, runtimeCalls, settleCheckpointTool, ToolValidationError, type AgentCheckpoint, type AgentDefinition, type EmbeddingTransport, type ResponseTransport, type RunAgentOptions, type RuntimeCall, type ToolCallContext } from '../responses.js';
 import { bookSources, boundedContext, changeSources, collectContext, compactChanges, filteredScenes, fingerprint, refreshMemories, searchContext, selectAuthorRules } from './memory.js';
 import { nearestChunks, type SemanticHit } from './semantic.js';
-import { assertWriteScope, canProposeCommands, canReadAuthor, chainWriterNodes, createBudget, PLAN_ROLES, touchesProse, validatePlan } from './policy.js';
-import { specialistDefinition, type SpecialistDefinition } from './specialists.js';
+import { assertWriteScope, canProposeCommands, canReadAuthor, chainWriterNodes, createBudget, PLAN_ROLES, touchesProse, validatePlan, validatePlanTarget } from './policy.js';
+import { reviewOutcome, specialistDefinition, type SpecialistDefinition } from './specialists.js';
 import { createCoordinatorTools, toolDefinitions, type ToolName } from './tools.js';
 import { sceneMentions } from './story-index.js';
 import { StoryView } from './story-view.js';
@@ -35,6 +35,10 @@ export const MAX_OUTPUT_REPAIRS = 2;
 const REPAIR_NOTICE = '运行时校验未通过：';
 /** Dependency conclusions handed to a dependent node: the nearest few, each clipped. */
 const MAX_UPSTREAM = 6, UPSTREAM_TEXT_CHARS = 1500;
+/** Automatic revisions of reviewed prose before the candidate goes to the author; the coordinator may still revise up to maxRevisions. */
+export const AUTO_REVISIONS = 1;
+/** Chapters a candidate's reader review covers, latest first. */
+const READER_REVIEW_CHAPTERS = 3;
 function commandsOf(artifact: AgentArtifact): Command[] { return (artifact.structured as { commands?: Command[] } | undefined)?.commands ?? []; }
 function clipText(text: string, length: number) { return text.length > length ? `${text.slice(0, length)}…` : text; }
 /** A dependency's conclusion without its raw commands; writer prose is pointed to in the workspace when it was folded in. */
@@ -172,7 +176,7 @@ export class PersistentAgentRuntime {
     const scene = project.scenes.find(scene => scene.id === request.sceneId);
     if (scene && request.chapterId && scene.chapterId !== request.chapterId) fail('场景不属于目标章节');
     if (request.selection && !allowWrittenTargets && (!scene || !Number.isSafeInteger(request.selection.start) || !Number.isSafeInteger(request.selection.end)
-      || request.selection.start < 0 || request.selection.end <= request.selection.start || request.selection.end > scene.text.length)) fail('改写选区无效');
+      || request.selection.start < 0 || request.selection.end < request.selection.start || request.selection.end > scene.text.length)) fail('改写选区无效');
     if (request.stage === 'rewrite' && !scene) fail('请选择要改写的场景');
     if (request.selection && request.stage !== 'rewrite') fail('只有改写任务可设置选区');
     if (request.stage === 'assist' ? !request.tool || !['character', 'world', 'narrative', 'canvas', 'theme', 'continuity'].includes(request.tool) : request.tool !== undefined) fail('辅助工具与任务类型不匹配');
@@ -734,6 +738,18 @@ export class PersistentAgentRuntime {
     const state = entry.state;
     if (state.finalSummary) return true;
     if (state.waiting) return undefined;
+    const quick = this.quickPlan(entry);
+    if (quick) {
+      const last = lastCall(cp);
+      if (!state.plan && !last && !cp.input.some(item => item.type === 'function_call')) return [quick];
+      // The author's decision on the single candidate ends a quick run; anything unexpected goes back to the coordinator.
+      if (last?.name === 'commit_candidate' && (last.output.ok === true || last.output.reason === 'author_declined') && !this.nextStep(entry)) {
+        const artifactIds = state.artifacts.map(artifact => artifact.id);
+        return [{ name: 'finish_run', arguments: { artifactIds, summary: last.output.ok
+          ? '已按目标生成正文，经审阅后由作者批准写入作品。'
+          : '作者拒绝了这次生成的正文；作品保持不变，草稿与审阅意见保留在任务记录里。' } }];
+      }
+    }
     if (!anyTime) {
       const last = lastCall(cp);
       if (!last || !PIPELINE.has(last.name) || last.output.ok === false) return undefined;
@@ -742,6 +758,25 @@ export class PersistentAgentRuntime {
     }
     const call = this.nextStep(entry);
     return call && !failedBefore(cp, call) ? [call] : undefined;
+  }
+  /** Writing one scene or rewriting / continuing at one place needs no planning: the runtime saves the plan itself, so the coordinator
+   * model is only consulted when something goes wrong. Chapter writing also follows the viewpoint character through the scene's events. */
+  private quickPlan(entry: Entry): RuntimeCall | undefined {
+    const run = entry.run;
+    if (!run.sceneId || (run.stage !== 'rewrite' && run.stage !== 'chapter')) return undefined;
+    const workspace = entry.state.baseWorkspace, scene = workspace.scenes.find(item => item.id === run.sceneId);
+    if (!scene) return undefined;
+    const target = { sceneId: scene.id, chapterId: scene.chapterId };
+    const nodes: Array<Record<string, unknown>> = [{ id: 'write', role: 'writer', objective: run.objective, dependsOn: [], acceptance: run.stage === 'rewrite'
+      ? '只写入选区或光标处，保留其余正文' : '写出本场完整正文，落实场景大纲的每个节拍', ...target, characterId: null, eventId: null }];
+    if (run.stage === 'chapter' && scene.povId) {
+      for (const eventId of scene.eventIds.slice(0, 2)) {
+        const node = { id: `evolve-${eventId}`, role: 'evolution', objective: '依据本场正文跟进视角人物在这个事件之后的视角、心理与动机。', dependsOn: ['write'],
+          acceptance: '变化有正文依据', ...target, characterId: scene.povId, eventId };
+        try { validatePlanTarget({ ...node, status: 'pending' } as PlanNode, workspace, run); nodes.push(node); } catch { /* The viewpoint character is not part of this event. */ }
+      }
+    }
+    return { name: 'set_plan', arguments: { summary: run.stage === 'rewrite' ? '在目标位置改写或续写，审阅后交作者批准。' : `写作「${clipText(scene.title, 30)}」，审阅后交作者批准。`, nodes } };
   }
   private nextStep(entry: Entry): RuntimeCall | undefined {
     const state = entry.state, ready = this.readyNodes(entry);
@@ -833,29 +868,32 @@ export class PersistentAgentRuntime {
       const node: PlanNode = { id: `review-${candidate.hash}`, role: 'continuity', objective: '检查这组候选修改的因果、人物认知、正文与设定一致性；只报告可指出依据的实际问题。', dependsOn: [], acceptance: '给出具体问题和 pass/revise', status: 'running' };
       const changed = candidate.changes.filter(change => change.collection === 'scenes' && change.after !== undefined).map(change => change.key);
       const artifact = await this.specialist(entry, node, `review:${candidate.hash}:continuity`, candidate.workspace, changed);
-      const review = artifact.structured as { verdict: 'pass' | 'revise'; issues: string[]; recommendation: string };
-      candidate.reviews = [{ candidateHash: candidate.hash, role: 'continuity', ...review, sources: artifact.sources, stepId: artifact.stepId }];
+      candidate.reviews = [{ candidateHash: candidate.hash, role: 'continuity', ...reviewOutcome(artifact.structured), sources: artifact.sources, stepId: artifact.stepId }];
+      const story = this.story(candidate.workspace);
       const scenes = candidate.workspace.scenes.filter(scene => candidate.changes.some(change => change.collection === 'scenes' && change.key === scene.id
-        && (change.before as { text?: string } | undefined)?.text !== scene.text && scene.text.trim()));
+        && (change.before as { text?: string } | undefined)?.text !== scene.text && scene.text.trim()))
+        .sort((a, b) => story.positionOf(a.id) - story.positionOf(b.id));
       if (scenes.length) {
-        const scene = scenes[0]!;
-        const readerNode: PlanNode = { ...node, id: `reader-${candidate.hash}`, role: 'reader', sceneId: scene.id, chapterId: scene.chapterId };
-        const reader = await this.specialist(entry, readerNode, `review:${candidate.hash}:reader`, candidate.workspace);
-        const opinion = reader.structured as typeof review;
-        candidate.reviews.push({ candidateHash: candidate.hash, role: 'reader', ...opinion, sources: reader.sources, stepId: reader.stepId });
+        // A reader sees a chapter up to its target scene, so the last rewritten scene of each chapter covers the ones before it.
+        const lastPerChapter = [...new Map(scenes.map(scene => [scene.chapterId, scene])).values()].slice(-READER_REVIEW_CHAPTERS);
+        for (const [index, scene] of lastPerChapter.entries()) {
+          const readerNode: PlanNode = { ...node, id: `reader-${candidate.hash}${index ? `-${index}` : ''}`, role: 'reader', sceneId: scene.id, chapterId: scene.chapterId };
+          const reader = await this.specialist(entry, readerNode, `review:${candidate.hash}:reader${index ? `:${scene.chapterId}` : ''}`, candidate.workspace);
+          candidate.reviews.push({ candidateHash: candidate.hash, role: 'reader', ...reviewOutcome(reader.structured), sources: reader.sources, stepId: reader.stepId });
+        }
         // The author's voice is reviewed separately from story logic: does this read like them?
-        const styleNode: PlanNode = { ...node, id: `style-${candidate.hash}`, role: 'stylist', sceneId: scene.id, chapterId: scene.chapterId };
+        const styleNode: PlanNode = { ...node, id: `style-${candidate.hash}`, role: 'stylist', sceneId: scenes[0]!.id, chapterId: scenes[0]!.chapterId };
         const stylist = await this.specialist(entry, styleNode, `review:${candidate.hash}:style`, candidate.workspace, scenes.map(item => item.id));
-        const voice = stylist.structured as typeof review;
-        candidate.reviews.push({ candidateHash: candidate.hash, role: 'style', ...voice, sources: stylist.sources, stepId: stylist.stepId });
+        candidate.reviews.push({ candidateHash: candidate.hash, role: 'style', ...reviewOutcome(stylist.structured), sources: stylist.sources, stepId: stylist.stepId });
       }
       const needsRevision = candidate.reviews.some(review => review.verdict === 'revise');
       const remaining = Math.max(0, entry.state.budget.maxRevisions - entry.state.budget.revisions);
-      if (!needsRevision || !scenes.length || !remaining) return { candidateId: candidate.id, hash: candidate.hash, candidateHash: candidate.hash, reviews: candidate.reviews,
+      // One automatic pass on the must-fix issues; anything still open goes to the author with the reviews rather than another rewrite.
+      if (!needsRevision || !scenes.length || !remaining || entry.state.budget.revisions >= AUTO_REVISIONS) return { candidateId: candidate.id, hash: candidate.hash, candidateHash: candidate.hash, reviews: candidate.reviews,
         revisionsRemaining: remaining, nextAction: needsRevision && !scenes.length && remaining ? 'revise_candidate' : 'commit_candidate' };
-      const writers: PlanNode[] = scenes.map(scene => ({ id: `write-${scene.id}`, role: 'writer', objective: entry.run.objective,
+      const writers: PlanNode[] = scenes.map(scene => ({ id: `write-${scene.id}`, role: 'writer', objective: entry.run.objective, mode: 'patch',
         sceneId: scene.id, chapterId: scene.chapterId, dependsOn: [], acceptance: '落实当前候选的自动审查意见，保留授权范围以外的正文', status: 'pending' }));
-      await this.reviseCandidate(entry, candidate, writers, '根据 candidateReviews 中的一致性、读者与文风审查意见修订当前正文，保留成立的情节、作者方向与其他场景；文风意见落实到具体句子。', revisionCall);
+      await this.reviseCandidate(entry, candidate, writers, '按 candidateReviews 中【必须】的意见局部修订本场正文：只改被指出的句段，保留其余原文、成立的情节与作者方向；【建议】的意见有把握才改。', revisionCall);
       candidate = entry.state.candidates.at(-1)!;
     }
   }

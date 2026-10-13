@@ -60,6 +60,8 @@ export interface AgentDefinition {
   instructions: string;
   tools?: AgentTool[];
   outputSchema?: JsonSchema;
+  /** Send long multi-paragraph strings (prose, style samples) as plain text after the JSON instead of escaped inside it. */
+  proseBlocks?: boolean;
 }
 export interface ModelResponse {
   id: string;
@@ -375,6 +377,49 @@ function limitReason(response: ModelResponse): string {
   return `模型输出达到单次上限被截断${output ? `（本次输出 ${output} tokens${reasoning ? `，其中推理 ${reasoning}` : ''}）` : ''}`;
 }
 
+/** Strings this long with a paragraph break are prose: worth keeping their line breaks visible to the model. */
+export const PROSE_BLOCK_CHARS = 200;
+/** Moves prose out of the context into numbered plain-text blocks, leaving a pointer in its place. JSON escapes every line
+ * break as \n, which hides exactly the paragraphing and rhythm a writer is asked to imitate or continue. */
+export function liftProse(context: unknown): { context: unknown; blocks: Array<{ label: string; path: string; text: string }> } {
+  const blocks: Array<{ label: string; path: string; text: string }> = [];
+  const walk = (value: unknown, path: string): unknown => {
+    if (typeof value === 'string') {
+      if (value.length < PROSE_BLOCK_CHARS || !value.includes('\n')) return value;
+      const label = `原文${blocks.length + 1}`;
+      blocks.push({ label, path, text: value });
+      return `〔见下方【${label}】〕`;
+    }
+    if (Array.isArray(value)) return value.map((item, index) => walk(item, `${path}[${index}]`));
+    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, walk(item, `${path}.${key}`)]));
+    return value;
+  };
+  return { context: walk(context, 'context'), blocks };
+}
+const PROSE_HEADER = '以下是上面资料中引用的原文，按原样分段：';
+/** The context a proseBlocks request carried, with each pointer replaced by its text again (offline fixtures read it). */
+export function restoreProse(input: ResponseInputItem[]): Record<string, any> {
+  const messages = input.filter(item => 'role' in item && item.role === 'user' && typeof item.content === 'string') as Array<{ content: string }>;
+  if (!messages[0]) return {};
+  const context = JSON.parse(messages[0].content).context ?? {};
+  const blocks = messages[1]?.content.startsWith(PROSE_HEADER) ? messages[1].content.slice(PROSE_HEADER.length).split(/\n\n(?=【原文\d+】context)/) : [];
+  const texts = new Map(blocks.map(block => { const match = block.trim().match(/^【(原文\d+)】context\S*\n([\s\S]*)$/); return match ? [match[1]!, match[2]!] : ['', '']; }));
+  const walk = (value: unknown): unknown => {
+    if (typeof value === 'string') { const label = value.match(/^〔见下方【(原文\d+)】〕$/)?.[1]; return label && texts.has(label) ? texts.get(label) : value; }
+    if (Array.isArray(value)) return value.map(walk);
+    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, walk(item)]));
+    return value;
+  };
+  return walk(context) as Record<string, any>;
+}
+function userInput(definition: AgentDefinition, context: unknown, objective: string): ResponseInputItem[] {
+  if (!definition.proseBlocks) return [{ role: 'user', content: JSON.stringify({ context, objective }) }];
+  const lifted = liftProse(context);
+  const input: ResponseInputItem[] = [{ role: 'user', content: JSON.stringify({ context: lifted.context, objective }) }];
+  if (lifted.blocks.length) input.push({ role: 'user', content: `${PROSE_HEADER}\n\n${lifted.blocks.map(block => `【${block.label}】${block.path}\n${block.text}`).join('\n\n')}` });
+  return input;
+}
+
 /** One bounded runtime serves planners, writers, independent characters, readers and demo mode. */
 export async function runAgent(definition: AgentDefinition, options: RunAgentOptions): Promise<AgentStep> {
   const durable = !!(options.checkpoint || options.onCheckpoint);
@@ -386,7 +431,7 @@ export async function runAgent(definition: AgentDefinition, options: RunAgentOpt
       output: '', tools: [], usage: emptyUsage(), startedAt: new Date().toISOString(),
       contextSources: options.contextSources, responseIds: [], promptVersion: promptVersion(definition.instructions),
     },
-    input: [{ role: 'user', content: JSON.stringify({ context: options.context, objective: options.objective }) }],
+    input: userInput(definition, options.context, options.objective),
     turn: 0, phase: 'ready', pendingCalls: [], cursor: 0,
   };
   const step = cp.step;

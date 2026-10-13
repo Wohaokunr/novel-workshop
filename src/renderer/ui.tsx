@@ -21,7 +21,10 @@ export const assistTools: Record<AssistTool, { label: string; objective: string 
   theme: { label: '深化立意', objective: '从当前创意与正文提炼可通过人物选择和代价呈现的立意，保持作者题材、语言风格和娱乐性，避免说教。' },
   continuity: { label: '一致性跟进', objective: '跟进引用内容的修改，检查世界因果、人物心理和认知、叙述顺序与构思画布的关联，修正相关设定与大纲，保留作者正文。' },
 };
-export const taskLabel = (run: AgentRun) => run.stage === 'assist' && run.tool ? assistTools[run.tool].label : stageNames[run.stage];
+export const CONTINUE_OBJECTIVE = '从光标处接着写，承接前文的情节、语气与人物状态，与后文自然衔接。';
+/** A rewrite with an empty selection continues the prose at that point. */
+export const isContinuation = (request: Pick<RunRequest, 'stage' | 'selection'>) => request.stage === 'rewrite' && !!request.selection && request.selection.start === request.selection.end;
+export const taskLabel = (run: AgentRun) => run.stage === 'assist' && run.tool ? assistTools[run.tool].label : isContinuation(run) ? '续写' : stageNames[run.stage];
 export const statuses: Record<AgentRun['status'],string> = { queued:'等待中', running:'创作中', pausing:'正在暂停', paused:'已暂停', awaitingApproval:'等待作者审批', awaitingInput:'等待作者回答', completed:'已完成', failed:'失败', cancelled:'已停止' };
 export const taskObjective = (stage: RunRequest['stage'], tool: AssistTool = 'canvas', scope: 'scene' | 'chapter' = 'scene') => ({
   agent: '', idea: '根据作品设定和引用资料发散构思，形成可发展的小说方向。',

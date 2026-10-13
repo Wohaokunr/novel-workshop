@@ -14,6 +14,7 @@ if (process.argv.includes('--evolution')) env.NOVEL_SMOKE_FOCUS = 'evolution';
 if (process.argv.includes('--interaction')) env.NOVEL_SMOKE_FOCUS = 'interaction';
 if (process.argv.includes('--companion')) env.NOVEL_SMOKE_FOCUS = 'companion';
 if (process.argv.includes('--style')) env.NOVEL_SMOKE_FOCUS = 'style';
+if (process.argv.includes('--writer')) { env.NOVEL_SMOKE_FOCUS = 'writer'; env.NOVEL_DEMO_PACE_MS = '250'; }
 delete env.ELECTRON_RUN_AS_NODE; delete env.NOVEL_DEV_URL;
 async function launch(extra = {}) {
   const child = spawn(require('electron'), ['.'], { stdio: 'inherit', env: { ...env, ...extra } });

@@ -63,6 +63,22 @@ test('Responses 完整回放推理、phase 与工具结果，用量只按响应�
   assert.ok(replay.some(item => item.type === 'function_call_output' && item.call_id === 'call-id' && item.output === '{"saved":true}'));
 });
 
+test('写正文的角色收到原样分段的原文，JSON 里只留指向；其他角色仍是单条 JSON', async () => {
+  const prose = `${'雾从江面漫上来。'.repeat(30)}\n\n许砚把钥匙攥在手心。`;
+  const context = { recentText: [{ title: '失窃', text: prose }], note: '短字段\n不搬' };
+  const transport = new FixtureTransport([response([message('正文')])]);
+  await runAgent({ id: 'writer', label: 'fixture', instructions: 'fixture', proseBlocks: true }, { transport, context, objective: '写', contextSources: [], signal: new AbortController().signal });
+  const [json, blocks] = transport.requests[0]!.input as Array<{ content: string }>;
+  const parsed = JSON.parse(json!.content);
+  assert.equal(parsed.context.recentText[0].text, '〔见下方【原文1】〕');
+  assert.equal(parsed.context.note, '短字段\n不搬');
+  assert.ok(blocks!.content.includes(`【原文1】context.recentText[0].text\n${prose}`));
+  const plain = new FixtureTransport([response([message('ok')])]);
+  await runAgent({ id: 'other', label: 'fixture', instructions: 'fixture' }, { transport: plain, context, objective: '写', contextSources: [], signal: new AbortController().signal });
+  assert.equal(plain.requests[0]!.input.length, 1);
+  assert.equal(JSON.parse((plain.requests[0]!.input[0] as { content: string }).content).context.recentText[0].text, prose);
+});
+
 test('未完成、拒绝及取消响应都不能执行写工具', async () => {
   const refusal: ResponseOutputItem = { type: 'message', id: 'refusal', role: 'assistant', status: 'completed', content: [{ type: 'refusal', refusal: '拒绝' }] };
   for (const scenario of ['incomplete', 'refusal', 'cancel'] as const) {

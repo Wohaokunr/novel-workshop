@@ -11,6 +11,7 @@ import { StoryView } from './agent/story-view.js';
 
 export async function runSmoke(window: BrowserWindow, store: NovelStore, scheduler: NovelAgentScheduler) {
   if (process.env.NOVEL_SMOKE_FOCUS === 'agent') { const { runAgentSmoke } = await import('./agent-smoke.js'); return runAgentSmoke(window, store); }
+  if (process.env.NOVEL_SMOKE_FOCUS === 'writer') { const { runWriterSmoke } = await import('./writer-smoke.js'); return runWriterSmoke(window, store); }
   if (process.env.NOVEL_SMOKE_FOCUS === 'style') { const { runStyleSmoke } = await import('./style-smoke.js'); return runStyleSmoke(window, store); }
   if (process.env.NOVEL_SMOKE_FOCUS === 'companion') { const { runCompanionSmoke } = await import('./companion-smoke.js'); return runCompanionSmoke(window, store); }
   const output = process.env.NOVEL_SMOKE_OUTPUT!;

@@ -271,7 +271,8 @@ export function searchContext(workspace: Workspace, query: string, limit = 6, ro
 
 /** A shared output cap for model context, with explicit omission paths instead of silent whole-book truncation. */
 export function boundedContext(context: Record<string, unknown>, maxChars = MAX_CONTEXT_CHARS, priority: string[] = []): Record<string, unknown> {
-  const cap = Math.max(2000, Math.min(MAX_CONTEXT_CHARS, Math.floor(maxChars)));
+  // MAX_CONTEXT_CHARS is the default; the writer asks for more room on purpose (WRITER_CONTEXT_CHARS).
+  const cap = Math.max(2000, Math.floor(maxChars));
   let remaining = cap - 1800, omittedCount = 0;
   const paths: string[] = [];
   const omit = (path: string) => { omittedCount++; if (paths.length < 12) paths.push(path.slice(0, 100)); };

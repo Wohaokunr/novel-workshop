@@ -1,9 +1,9 @@
 import { useCallback, useContext, useEffect, useId, useRef, useState } from 'react';
-import { ArrowDown, ArrowUp, BookMarked, FileText, Lightbulb, Maximize2, Minimize2, PanelLeftClose, PanelLeftOpen, PanelRight, Plus, Sparkles, Trash2 } from 'lucide-react';
-import { ActionMenu, Dialog, SaveFeedbackContext, Field, Empty, fire, characters, orderedChapters, type Commit } from '../ui';
+import { ArrowDown, ArrowUp, BookMarked, FileText, Lightbulb, Maximize2, Minimize2, PanelLeftClose, PanelLeftOpen, PanelRight, PenLine, Plus, Sparkles, Trash2 } from 'lucide-react';
+import { ActionMenu, Dialog, SaveFeedbackContext, Field, Empty, fire, characters, orderedChapters, isContinuation, isRunActive, type Commit } from '../ui';
 import { styleProfile } from '../../shared/style-types';
 import { styleBaseline, styleLint } from '../../shared/style-metrics';
-import type { NarrativeScene, RunRequest, SourceReference, Workspace } from '../../shared/types';
+import type { AgentRun, NarrativeScene, RunRequest, SourceReference, Workspace } from '../../shared/types';
 import { useCompanion } from '../Companion';
 import { canvasAction, type RegisterFlush, type AssistAction, type OpenCanvas, type AskDelete } from '../types';
 
@@ -13,7 +13,7 @@ const sessionBase=new Map<string,number>();
 const fontSizeKey='novel.writer.fontSize';
 const storedFontSize=()=>{const value=Number(localStorage.getItem(fontSizeKey));return value>=14&&value<=28?value:18;};
 
-export function Writer({workspace:w,scene,selectScene,addChapter,addScene,commit,askDelete,onSelection,hasSelection,onRewrite,onPinSample,registerFlush,onAssist,onOpenCanvas,onPrepare,onDetails,detailsOpen,beforeChange,focusMode,onFocusMode}:{beforeChange:()=>Promise<void>;registerFlush:RegisterFlush;onAssist:AssistAction;onOpenCanvas:OpenCanvas;workspace:Workspace;scene?:NarrativeScene;selectScene:(id:string)=>void;addChapter:()=>Promise<string>;addScene:(chapterId?:string)=>Promise<string|undefined>;commit:Commit;askDelete:AskDelete;onSelection:(s:{start:number;end:number;text:string}|undefined)=>void;hasSelection:boolean;onRewrite:()=>void;onPinSample:()=>void;onPrepare:(stage:RunRequest['stage'],refs:SourceReference[],scope?:'scene'|'chapter')=>void;onDetails:()=>void;detailsOpen:boolean;focusMode:boolean;onFocusMode:(value:boolean)=>void}) {
+export function Writer({workspace:w,scene,selectScene,addChapter,addScene,commit,askDelete,onSelection,hasSelection,onRewrite,onPinSample,registerFlush,onAssist,onOpenCanvas,onPrepare,onDetails,detailsOpen,beforeChange,focusMode,onFocusMode,onQuickWrite,onContinue,runs}:{onQuickWrite:()=>void;onContinue:()=>void;runs:AgentRun[];beforeChange:()=>Promise<void>;registerFlush:RegisterFlush;onAssist:AssistAction;onOpenCanvas:OpenCanvas;workspace:Workspace;scene?:NarrativeScene;selectScene:(id:string)=>void;addChapter:()=>Promise<string>;addScene:(chapterId?:string)=>Promise<string|undefined>;commit:Commit;askDelete:AskDelete;onSelection:(s:{start:number;end:number;text:string}|undefined)=>void;hasSelection:boolean;onRewrite:()=>void;onPinSample:()=>void;onPrepare:(stage:RunRequest['stage'],refs:SourceReference[],scope?:'scene'|'chapter')=>void;onDetails:()=>void;detailsOpen:boolean;focusMode:boolean;onFocusMode:(value:boolean)=>void}) {
   const [chaptersOpen,setChaptersOpen]=useState(true);
   const [renaming,setRenaming]=useState('');
   const [focusScene,setFocusScene]=useState('');
@@ -26,6 +26,7 @@ export function Writer({workspace:w,scene,selectScene,addChapter,addScene,commit
   const chapters=orderedChapters(w);
   const showChapters=chaptersOpen&&!focusMode;
   const pov=scene?.povId?characters(w).find(c=>c.id===scene.povId)?.name:undefined;
+  const active=runs.find(run=>run.projectId===w.id&&isRunActive(run)),busy=!!active;
   const total=w.scenes.reduce((sum,s)=>sum+wordCount(s.text),0);
   if(!sessionBase.has(w.id))sessionBase.set(w.id,total);
   const delta=total-sessionBase.get(w.id)!;
@@ -50,15 +51,32 @@ export function Writer({workspace:w,scene,selectScene,addChapter,addScene,commit
       <button className="icon-button ghost" data-testid="toggle-chapters" disabled={focusMode} aria-label={showChapters?'收起章节目录':'展开章节目录'} title={showChapters?'收起章节目录':'展开章节目录'} aria-expanded={showChapters} onClick={()=>fire(beforeChange().then(()=>setChaptersOpen(!chaptersOpen)))}>{showChapters?<PanelLeftClose/>:<PanelLeftOpen/>}</button>
       {scene&&<><div className="writer-title"><span className="eyebrow">{w.chapters.find(c=>c.id===scene.chapterId)?.title}</span><h2>{scene.title}</h2></div><div className="button-row">
         <button className={`ghost ${detailsOpen?'selected':''}`} aria-pressed={detailsOpen} title="场景大纲、视角与关联事件" onClick={onDetails}><PanelRight aria-hidden="true"/>场景大纲</button>
-        {!scene.text.trim()&&<button className="primary" data-testid="prepare-chapter" onClick={()=>onPrepare('chapter',[{kind:'scene',id:scene.id}])}><Sparkles aria-hidden="true"/>生成当前场景</button>}
+        {!scene.text.trim()&&<button className="primary" data-testid="prepare-chapter" disabled={busy} title={busy?'已有任务在进行，先在右侧处理它':'按场景大纲直接生成，写好后由你审批'} onClick={onQuickWrite}><Sparkles aria-hidden="true"/>生成当前场景</button>}
+        {!!scene.text.trim()&&<button className="ghost" data-testid="continue-writing" disabled={busy} title={busy?'已有任务在进行，先在右侧处理它':'从光标处接着写；没有放光标时接在本场结尾'} onClick={onContinue}><PenLine aria-hidden="true"/>续写</button>}
         <button className="ghost" data-testid="writer-beat" title="卡文时，让创作伙伴给出几个可以直接写下去的下一拍" onClick={event=>{const rect=event.currentTarget.getBoundingClientRect();fire(beforeChange().then(()=>companion.summon({mode:'beat',anchor:{surface:'writer',references:[{kind:'scene',id:scene.id}],sceneId:scene.id},screen:{x:rect.left,y:rect.bottom},label:scene.title,message:scene.text.trim()?'我写到这里卡住了，接下来可以发生什么？':'这一场还没开始写，给我几个开场的切入点。'})));}}><Lightbulb aria-hidden="true"/>卡文了？</button>
         {hasSelection&&<button className="ghost" data-testid="pin-style-sample" title="把选中的文字加入范文库，AI 写作时会参照它的笔触" onClick={()=>fire(beforeChange().then(onPinSample))}><BookMarked aria-hidden="true"/>设为范文</button>}
         <button className={scene.text.trim()?'primary':''} data-testid="prepare-rewrite" disabled={!hasSelection} title={hasSelection?'准备改写所选文字':'先在正文中选择需要改写的文字'} onClick={onRewrite}><Sparkles aria-hidden="true"/>改写选段</button>
         <button className="icon-button ghost" data-testid="toggle-focus" aria-pressed={focusMode} title={focusMode?'退出专注模式（Esc）':'专注模式（Ctrl+Shift+F）'} aria-label={focusMode?'退出专注模式':'专注模式'} onClick={()=>onFocusMode(!focusMode)}>{focusMode?<Minimize2/>:<Maximize2/>}</button>
         <ActionMenu key={scene.id} label="更多场景操作"><button role="menuitem" onClick={()=>onAssist('character',[{kind:'scene',id:scene.id}])}>分析人物心理</button><button role="menuitem" onClick={()=>onAssist('continuity',[{kind:'scene',id:scene.id}])}>检查本场一致性</button><button role="menuitem" data-testid="style-check" disabled={!scene.text.trim()} onClick={()=>fire(beforeChange().then(()=>setChecking(true)))}>文风体检</button><button role="menuitem" onClick={()=>onOpenCanvas('scene',scene.id)}>{canvasAction(w,'scene',scene.id)}</button><button role="menuitem" data-testid="prepare-chapter-all" onClick={()=>onPrepare('chapter',[{kind:'scene',id:scene.id}],'chapter')}>完成本章空白场景</button><button role="menuitem" className="text-danger" onClick={()=>fire(askDelete({type:'deleteScene',id:scene.id},`删除「${scene.title}」`))}><Trash2 aria-hidden="true"/>删除场景</button></ActionMenu>
       </div></>}
-    </div>{checking&&scene&&<StyleCheck workspace={w} text={scene.text} title={scene.title} onClose={()=>setChecking(false)}/>}{scene?<SceneComposer key={scene.id} scene={scene} pov={pov} commit={commit} registerFlush={registerFlush} onSelection={onSelection} fontSize={fontSize} onFontSize={setFontSize}/>:<Empty title="开始写下第一个场景" description="手动创建章节和场景，或在情节规划中让 AI 根据素材编排。" action={<button className="primary" onClick={()=>createScene()}><Plus aria-hidden="true"/>创建第一个场景</button>}/>}</div>
+    </div>{scene&&<LiveDraft run={active} scene={scene}/>}{checking&&scene&&<StyleCheck workspace={w} text={scene.text} title={scene.title} onClose={()=>setChecking(false)}/>}{scene?<SceneComposer key={scene.id} scene={scene} pov={pov} commit={commit} registerFlush={registerFlush} onSelection={onSelection} fontSize={fontSize} onFontSize={setFontSize}/>:<Empty title="开始写下第一个场景" description="手动创建章节和场景，或在情节规划中让 AI 根据素材编排。" action={<button className="primary" onClick={()=>createScene()}><Plus aria-hidden="true"/>创建第一个场景</button>}/>}</div>
   </div>;
+}
+
+/** The prose the AI is writing for this scene, shown where the author is looking while it streams. Read-only: nothing reaches the
+ * scene until the author approves the candidate. */
+function LiveDraft({run,scene}:{run?:AgentRun;scene:NarrativeScene}) {
+  const step=run&&[...run.steps].reverse().find(step=>step.status==='running'&&(step.agentId==='writer'||step.agentId==='rewrite')&&step.label.startsWith(`${scene.title} · `));
+  const box=useRef<HTMLDivElement>(null);
+  useEffect(()=>{const element=box.current;if(element)element.scrollTop=element.scrollHeight;},[step?.output]);
+  if(!run||!step)return null;
+  const continuing=isContinuation(run)&&run.sceneId===scene.id,at=run.selection?.end??0;
+  // The end of the paragraph the continuation picks up from, faded, so the new prose reads on from it.
+  const before=continuing?scene.text.slice(Math.max(0,at-60),at).split('\n').at(-1)!.trim():'';
+  return <section className="live-draft" data-testid="live-draft" aria-live="polite" aria-busy="true">
+    <header><i className="live-dot" aria-hidden="true"/>{continuing?'AI 正在续写':'AI 正在写这一场'}<span>还没写入作品，审阅后由你批准</span></header>
+    <div ref={box} className="live-draft-text">{before&&<span className="live-draft-before">…{before}</span>}{step.output||<span className="live-draft-wait">正在读前文与设定…</span>}</div>
+  </section>;
 }
 
 /** Zero-token check of this scene against the author's style profile. */
@@ -95,7 +113,8 @@ export function SceneComposer({scene,pov,commit,onSelection,registerFlush,fontSi
   useEffect(()=>{registerFlush(flush);return()=>{registerFlush(null);fire(flush());};},[flush,registerFlush]);
   useEffect(()=>{if(scene.text===baseline.current)return;if(scene.text===local.current){baseline.current=scene.text;setConflict(false);setStatus('已保存');reportSave(saveId,null);}else if(local.current===baseline.current){baseline.current=scene.text;setText(scene.text);setStatus('已保存');reportSave(saveId,null);}else if(!saving.current){conflictRef.current=true;setConflict(true);setStatus('草稿已保留 · 有新版本');reportSave(saveId,'conflict');}},[scene.text]);
   useEffect(()=>{if(text===baseline.current||conflict||composing)return;setStatus('待保存…');const timer=setTimeout(()=>fire(flush()),600);return()=>clearTimeout(timer);},[text,conflict,composing,flush]);
-  const pick=()=>{const element=editor.current;if(!element)return;onSelection(element.selectionEnd>element.selectionStart?{start:element.selectionStart,end:element.selectionEnd,text:element.value.slice(element.selectionStart,element.selectionEnd)}:undefined);};
+  // A collapsed selection is reported too: it is where 续写 continues.
+  const pick=()=>{const element=editor.current;if(!element)return;onSelection({start:element.selectionStart,end:element.selectionEnd,text:element.value.slice(element.selectionStart,element.selectionEnd)});};
   const count=wordCount(text);
   return <><div className="editor-meta"><span>{pov?`${pov} 视角`:'外部视角'}</span><span className="editor-meta-end"><span data-status={conflict?'conflict':status==='已保存'?'saved':'pending'}>{count.toLocaleString()} 字{status!=='已保存'&&<> · {status}</>}</span><span className="font-steps"><button className="ghost" disabled={fontSize<=14} aria-label="缩小正文字号" title="缩小正文字号" onClick={()=>onFontSize(fontSize-1)}>A−</button><span>{fontSize}px</span><button className="ghost" disabled={fontSize>=28} aria-label="放大正文字号" title="放大正文字号" onClick={()=>onFontSize(fontSize+1)}>A＋</button></span></span></div>{conflict&&<div className="conflict-banner" role="alert"><strong>正文有新的修改，你的草稿仍在这里。</strong><div><button className="small" onClick={()=>{baseline.current=scene.text;local.current=scene.text;setText(scene.text);conflictRef.current=false;setConflict(false);setStatus('已保存');reportSave(saveId,null);}}>使用当前保存内容</button><button className="small" onClick={()=>{baseline.current=scene.text;conflictRef.current=false;setConflict(false);setStatus('待保存…');reportSave(saveId,'editing');}}>以当前草稿继续</button></div></div>}<textarea ref={editor} data-testid="prose-editor" className="prose-editor" aria-label="场景正文" style={{'--prose-size':`${fontSize}px`} as React.CSSProperties} value={text} onChange={e=>{setText(e.target.value);onSelection(undefined);reportSave(saveId,e.target.value===baseline.current?null:'editing');setStatus(e.target.value===baseline.current?'已保存':'待保存…');}} onBlur={()=>fire(flush())} onCompositionStart={()=>setComposing(true)} onCompositionEnd={()=>setComposing(false)} onSelect={pick} onMouseUp={pick} onKeyUp={pick} placeholder="在这里写下第一句。也可以点击「生成当前场景」，让 AI 走进人物的视角，与你一起完成这一幕。" spellCheck={false}/></>;
 }
