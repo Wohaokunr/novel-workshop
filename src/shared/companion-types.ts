@@ -1,4 +1,4 @@
-import type { SourceReference } from './types.js';
+import type { SourceReference, TokenUsage } from './types.js';
 
 /** Lightweight creative partner modes; each surface of the app summons one of them. */
 export type CompanionMode = 'diverge' | 'causality' | 'structure' | 'outline' | 'beat' | 'develop' | 'style';
@@ -50,14 +50,27 @@ export interface CompanionOp {
   /** updateNovel: which work field content replaces; updateStyle: summary, dial:<id>, rule:do, rule:avoid, preferWords, avoidWords or voice. */
   field?: string | null;
 }
-export interface CompanionProposal { id: string; title: string; summary: string; ops: CompanionOp[] }
+/** Result of applying a proposal to the work right after it was generated: ops adoption would skip, or why it cannot apply at all. */
+export interface ProposalCheck { skipped: Array<{ opId: string; reason: string }>; error?: string }
+export interface CompanionProposal { id: string; title: string; summary: string; ops: CompanionOp[]; check?: ProposalCheck }
 export interface CompanionResponse {
   reply: string; questions: CompanionQuestion[]; ideas: CompanionIdea[]; proposals: CompanionProposal[]; followUps: string[];
 }
 
+/** Choices the author makes in the interface. The message text never triggers them. */
+export interface CompanionAskOptions {
+  /** Outline mode: draft all three layers (acts → chapters → scenes) at once; a large, costly answer. */
+  fullDraft?: boolean;
+  /** Develop mode: give versions now instead of asking questions first. */
+  versions?: boolean;
+}
 export interface CompanionTurn {
   id: string; role: 'author' | 'companion'; text: string; at: string;
   intensity?: CompanionIntensity;
+  /** Author turns: the explicit choices sent with this message. */
+  options?: CompanionAskOptions;
+  /** Companion turns: tokens this reply used. */
+  usage?: TokenUsage;
   response?: CompanionResponse;
   /** Adopted item id (idea id or `${proposalId}#${opId}`) → operation batch id, so the author can undo it. */
   adopted?: Record<string, string>;
@@ -67,6 +80,8 @@ export interface CompanionTurn {
 export interface CompanionThread {
   id: string; projectId: string; mode: CompanionMode; anchor: CompanionAnchor; title: string;
   turns: CompanionTurn[]; status: 'idle' | 'streaming' | 'failed'; error?: string;
+  /** Tokens of every reply in this conversation, failed requests excluded. */
+  usage?: TokenUsage;
   /** Raw streamed text of the reply in progress; cleared when the turn is saved. */
   streaming?: string;
   createdAt: string; updatedAt: string;
@@ -75,6 +90,7 @@ export interface CompanionThread {
 export interface CompanionAskRequest {
   projectId: string; threadId?: string; mode: CompanionMode; anchor: CompanionAnchor;
   message: string; intensity: CompanionIntensity;
+  options?: CompanionAskOptions;
   /** Re-send the last unanswered author message after a failure. */
   retry?: boolean;
 }

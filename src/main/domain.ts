@@ -237,7 +237,7 @@ function validateStyle(style: StyleProfile, isCharacter: (id: string) => boolean
   const rules = ids(style.rules, '文风规则');
   check(rules.size <= STYLE_LIMITS.rules, `文风规则最多 ${STYLE_LIMITS.rules} 条`);
   const suggestions = ids(style.suggestions, '文风建议');
-  const origins = ['author', 'samples', 'edits', 'rejection', 'blindtest'];
+  const origins = ['author', 'samples', 'edits', 'rejection', 'blindtest', 'choice'];
   for (const rule of [...rules.values(), ...suggestions.values()]) {
     check(rule.kind === 'do' || rule.kind === 'avoid', '文风规则类型无效'); text(rule.content, '文风规则内容', true);
     check(origins.includes(rule.origin), '文风规则来源无效'); if (rule.evidence !== undefined) text(rule.evidence, '文风规则依据');

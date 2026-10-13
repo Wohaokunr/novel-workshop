@@ -8,11 +8,13 @@ import { NovelStore } from './store.js';
 import { applyCommands, createWorkspace, DomainValidationError } from './domain.js';
 import { assertWriteScope } from './agent/policy.js';
 import { buildWriterContext } from './context.js';
-import { CompanionService, normalizeResponse, partialReply } from './agent/companion.js';
+import { checkProposals, CompanionService, companionContext, decisionLog, normalizeResponse, partialReply } from './agent/companion.js';
+import { StyleLearningService } from './agent/style-learning.js';
+import { DemoStyleTransport } from './agent/style-learning.js';
 import { DemoCompanionTransport } from './agent/companion-demo.js';
 import { companionCommands, selectCompanionItems } from '../shared/companion.js';
 import type { AgentEvent, ProviderSecret, Workspace } from '../shared/types.js';
-import type { CompanionAnchor, CompanionOp, CompanionResponse, CompanionThread } from '../shared/companion-types.js';
+import type { CompanionAnchor, CompanionOp, CompanionResponse, CompanionThread, CompanionTurn } from '../shared/companion-types.js';
 import type { ModelRequest, ResponseTransport } from './responses.js';
 
 const provider: ProviderSecret = { name: '演示', baseURL: '', model: 'demo', mode: 'mock', apiKey: '' };
@@ -317,7 +319,7 @@ test('大纲分次采纳：先采纳场景会带上父级，再采纳整份草�
   const store = temporaryStore(t);
   const project = store.createProject('分次采纳');
   const service = new CompanionService(store, () => provider, () => {}, () => new DemoCompanionTransport());
-  const asked = service.ask({ projectId: project.id, mode: 'outline', anchor: { surface: 'outline', references: [], outlineNode: { kind: 'book' } }, message: '生成全书草案', intensity: 'steady' });
+  const asked = service.ask({ projectId: project.id, mode: 'outline', anchor: { surface: 'outline', references: [], outlineNode: { kind: 'book' } }, message: '生成全书草案', intensity: 'steady', options: { fullDraft: true } });
   const thread = await settled(store, project.id, asked.id);
   const turn = thread.turns.at(-1)!;
   const proposal = turn.response!.proposals[0]!;
@@ -464,4 +466,80 @@ test('补全构想：信息足够时直接给人物阵容，采纳后人物进�
   assert.equal(current.objects.filter(object => object.typeId === 'character').length, 3);
   assert.equal(current.cards.filter(card => card.kind === 'object').length, 3);
   assert.equal(current.canvasLinks.length, 2);
+});
+
+const contextOf = (request: ModelRequest) => JSON.parse((request.input[0] as { content: string }).content).context;
+
+test('全书草案与跳过追问只由界面传来的明确选项触发，消息里的字眼不再触发', async t => {
+  const store = temporaryStore(t), capture = new Capture();
+  const project = store.createProject('选项');
+  const service = new CompanionService(store, () => provider, () => {}, () => capture);
+  const outline = { surface: 'outline' as const, references: [], outlineNode: { kind: 'book' as const } };
+  await settled(store, project.id, service.ask({ projectId: project.id, mode: 'outline', anchor: outline, message: '给我完整的全书草案', intensity: 'steady' }).id);
+  const explicit = service.ask({ projectId: project.id, mode: 'outline', anchor: outline, message: '展开', intensity: 'steady', options: { fullDraft: true } });
+  const thread = await settled(store, project.id, explicit.id);
+  assert.deepEqual(capture.requests.map(request => contextOf(request).target.fullDraft), [false, true]);
+  assert.deepEqual(thread.turns[0]!.options, { fullDraft: true });
+  const develop = { surface: 'panel' as const, references: [], focus: 'theme' as const };
+  await settled(store, project.id, service.ask({ projectId: project.id, mode: 'develop', anchor: develop, message: '直接给我几个版本', intensity: 'steady' }).id);
+  await settled(store, project.id, service.ask({ projectId: project.id, mode: 'develop', anchor: develop, message: '来吧', intensity: 'steady', options: { versions: true } }).id);
+  assert.deepEqual(capture.requests.slice(2).map(request => contextOf(request).target.round), ['ask', 'draft']);
+  assert.throws(() => service.ask({ projectId: project.id, mode: 'beat', anchor: develop, message: 'x', intensity: 'steady', options: 'yes' as never }), DomainValidationError);
+});
+
+test('超过历史窗口的作者原话与已采纳内容进入 earlierDecisions；窗口内已采纳的方案带上内容', () => {
+  const at = '2026-10-13T00:00:00Z', workspace = createWorkspace('决策', 'decisions');
+  const response = (index: number): CompanionResponse => ({ reply: `回复${index}`, questions: [], followUps: [], ideas: [{ id: 'i1', kind: 'whatif', title: `点子${index}`, content: `点子${index}的内容`, hook: '' }],
+    proposals: [{ id: 'p1', title: `方案${index}`, summary: `方案${index}的梗概`, ops: [] }] });
+  const turns = Array.from({ length: 16 }, (_, index): CompanionTurn => index % 2 === 0
+    ? { id: `a${index}`, role: 'author', text: index === 0 ? '主角必须是女性，结局不要大团圆' : `第${index}轮`, at }
+    : { id: `c${index}`, role: 'companion', text: '', at, response: response(index), adopted: index === 1 ? { 'p1#o1': 'batch' } : index === 13 ? { p1: 'batch' } : {} });
+  const thread: CompanionThread = { id: 't', projectId: workspace.id, mode: 'diverge', anchor: { surface: 'canvas', references: [] }, title: '', turns, status: 'idle', createdAt: at, updatedAt: at };
+  const context = companionContext(workspace, thread, [], {}) as Record<string, any>;
+  assert.deepEqual(context.earlierDecisions.entries, ['作者：主角必须是女性，结局不要大团圆', '采纳方案：方案1——方案1的梗概', '作者：第2轮']);
+  assert.ok(context.conversation.some((item: any) => item.proposals?.includes('方案13（已采纳）：方案13的梗概')));
+  const long = decisionLog(Array.from({ length: 60 }, (_, index) => ({ id: `a${index}`, role: 'author' as const, text: `作者第${index}次说：${'很长的想法'.repeat(20)}`, at })));
+  assert.ok(long.omitted! > 0); assert.ok(long.entries.at(-1)!.startsWith('作者：作者第59次说'), '预算内保留最新的');
+});
+
+test('伙伴回复记录用量；方案生成后立即试算，标出采纳时会跳过的操作', async t => {
+  const store = temporaryStore(t);
+  const project = store.createProject('试算');
+  const raw = { reply: '两个方案。', questions: [], ideas: [], followUps: [], proposals: [
+    { title: '可行', summary: '', ops: [{ op: 'addCharacter', ref: 'c1', targetId: null, parentRef: null, parentId: null, title: '许砚', content: '学徒', purpose: null, order: null, povName: null, causes: [], people: [], places: [], events: [], field: null }] },
+    { title: '有失效的操作', summary: '', ops: [
+      { op: 'updateCharacter', ref: null, targetId: 'ghost', parentRef: null, parentId: null, title: '不存在的人', content: '补充', purpose: null, order: null, povName: null, causes: [], people: [], places: [], events: [], field: null },
+      { op: 'addCard', ref: null, targetId: null, parentRef: null, parentId: null, title: '便笺', content: '想法', purpose: null, order: null, povName: null, causes: [], people: [], places: [], events: [], field: null }] }] };
+  const transport: ResponseTransport = { stream: () => ({ events: (async function* () {})(), finalResponse: async () => ({ id: 'r', status: 'completed', output: [{ type: 'message' as const, id: 'm', role: 'assistant' as const, status: 'completed' as const,
+    content: [{ type: 'output_text' as const, text: JSON.stringify(raw), annotations: [] }] }], usage: { input_tokens: 900, output_tokens: 300, total_tokens: 1200 } }) }) };
+  const service = new CompanionService(store, () => provider, () => {}, () => transport);
+  const anchor = { surface: 'canvas' as const, references: [] };
+  let thread = await settled(store, project.id, service.ask({ projectId: project.id, mode: 'diverge', anchor, message: '想想', intensity: 'steady' }).id);
+  thread = await settled(store, project.id, service.ask({ projectId: project.id, threadId: thread.id, mode: 'diverge', anchor, message: '再想想', intensity: 'steady' }).id);
+  const turn = thread.turns.at(-1)!;
+  assert.equal(turn.usage!.total, 1200); assert.equal(thread.usage!.total, 2400);
+  const [good, partial] = turn.response!.proposals;
+  assert.deepEqual(good!.check, { skipped: [] });
+  assert.deepEqual(partial!.check, { skipped: [{ opId: 'o1', reason: '人物不存在' }] });
+  const broken = normalizeResponse({ ...raw, proposals: [{ title: '冲突', summary: '', ops: [raw.proposals[0]!.ops[0]!, raw.proposals[0]!.ops[0]!] }] });
+  checkProposals(store.getProject(project.id), thread, broken);
+  assert.ok(broken.proposals[0]!.check!.skipped.length + (broken.proposals[0]!.check!.error ? 1 : 0) >= 1, '同名人物第二次创建在试算中就被标出');
+});
+
+test('作者在几个方案中采纳一个：取舍进入文风学习，学过后不再重复', async t => {
+  const store = temporaryStore(t);
+  const project = store.createProject('取舍');
+  const service = new CompanionService(store, () => provider, () => {}, () => new DemoCompanionTransport());
+  const anchor = { surface: 'style' as const, references: [], focus: 'blindtest' as const };
+  const thread = await settled(store, project.id, service.ask({ projectId: project.id, mode: 'style', anchor, message: '给我几段盲测', intensity: 'steady' }).id);
+  const turn = thread.turns.at(-1)!;
+  assert.ok(turn.response!.proposals.length >= 2);
+  const learning = new StyleLearningService(store, () => provider, () => {}, () => new DemoStyleTransport());
+  assert.equal(learning.status(project.id).pendingChoices, 0, '没有采纳时没有取舍');
+  service.adopt({ projectId: project.id, threadId: thread.id, turnId: turn.id, itemIds: [turn.response!.proposals[1]!.id] });
+  assert.equal(learning.status(project.id).pendingChoices, 1);
+  const status = await learning.learn(project.id);
+  assert.equal(status.pendingChoices, 0); assert.equal(status.lastError, undefined);
+  const suggestion = store.getProject(project.id).style!.suggestions.find(item => item.origin === 'choice');
+  assert.ok(suggestion, '取舍形成待采纳的文风建议');
 });

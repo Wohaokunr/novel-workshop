@@ -1,3 +1,4 @@
+import type { TokenUsage } from './types.js';
 /** The author's voice: what the writer imitates and what the stylist reviews against. */
 export type StylePerson = 'first' | 'third-limited' | 'third-omniscient' | 'free';
 export type StyleScale = 1 | 2 | 3 | 4 | 5;
@@ -12,7 +13,7 @@ export interface StyleSample {
   source: 'own' | 'reference';
   sceneId?: string; author?: string; note?: string; pinned?: boolean;
 }
-export type StyleOrigin = 'author' | 'samples' | 'edits' | 'rejection' | 'blindtest';
+export type StyleOrigin = 'author' | 'samples' | 'edits' | 'rejection' | 'blindtest' | 'choice';
 export interface StyleRule { id: string; kind: 'do' | 'avoid'; content: string; origin: StyleOrigin; evidence?: string }
 /** Learned from edits / rejections; becomes a rule or word only when the author adopts it. */
 export interface StyleSuggestion extends StyleRule {
@@ -54,15 +55,21 @@ export const scaleNames: Record<StyleScaleId, [string, string, string]> = {
   register: ['语言质地', '口语网感', '书面典雅'],
   pace: ['叙事节奏', '紧凑', '舒缓'],
 };
-export const originNames: Record<StyleOrigin, string> = { author: '作者', samples: '范文', edits: '改稿', rejection: '拒稿', blindtest: '盲测' };
+export const originNames: Record<StyleOrigin, string> = { author: '作者', samples: '范文', edits: '改稿', rejection: '拒稿', blindtest: '盲测', choice: '方案取舍' };
 
 /** Edits made to AI prose, collected without a model call. */
 export interface StyleEditPair { key: string; sceneId: string; sceneTitle: string; hunks: Array<{ before: string; after: string }>; at: string }
 export interface StyleRejection { key: string; reason: string; label: string; at: string }
+/** One adoption among several companion options: what the author took and what they passed over in the same reply. */
+export interface StyleChoice { key: string; mode: string; chosen: string[]; passedOver: string[]; at: string }
 export interface StyleLearningStatus {
   projectId: string; pendingEdits: number; pendingRejections: number; running: boolean; lastError?: string;
+  /** Companion replies where the author adopted some options over others, not yet learned from. */
+  pendingChoices: number;
   /** Repeatedly deleted words, a zero-token hint. */
   deletedWords: Array<{ word: string; count: number }>;
+  /** Tokens style learning used since the app started. */
+  usage: TokenUsage;
 }
 export interface StyleAPI {
   getStyleLearning(projectId: string): Promise<StyleLearningStatus>;

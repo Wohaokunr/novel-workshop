@@ -1118,6 +1118,9 @@ button.empty-brief:hover:not(:disabled) { color: var(--accent-text); background:
 .companion-msg-body { display: flex; flex-direction: column; gap: 6px; flex: 1; min-width: 0; }
 .companion-msg-meta { display: flex; align-items: center; gap: 8px; min-height: 20px; }
 .companion-msg-meta strong { color: var(--text); font-size: 12.5px; font-weight: 600; }
+.companion-usage { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.op-node p.op-skip, .companion-proposal > p.op-skip { color: var(--warning, #b45309); font-size: 11.5px; }
+.op-node.will-skip > label strong { text-decoration: line-through; text-decoration-color: var(--muted); }
 .companion-reply { display: flex; flex-direction: column; gap: 14px; font-size: 13.5px; line-height: 1.75; color: var(--text); }
 .companion-thread.compact .companion-reply { font-size: 13px; }
 .companion-reply.streaming .md { color: var(--text-2); }
