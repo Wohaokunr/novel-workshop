@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Check, Circle, CircleAlert, FilePlus2, FileMinus2, FilePen, LoaderCircle, Pause, Play, Square } from 'lucide-react';
 import type { AgentRun, Change, Workspace } from '../shared/types';
-import type { AgentDecision, AgentMemory, AgentRole, AgentRuntimeSummary, AgentSession } from '../shared/agent-types';
+import { ROLE_LABELS, type AgentDecision, type AgentMemory, type AgentRole, type AgentRuntimeSummary, type AgentSession } from '../shared/agent-types';
 import { diffStats, diffText } from '../shared/text-diff';
 import { Callout, StatusPill, canResumeRun, fire, isAgentRun, isRunActive, runStatus, showValue } from './ui';
 import Markdown from './Markdown';
@@ -14,10 +14,7 @@ export interface AgentTaskActions {
   onAnswer: (id: string, answer: string) => Promise<unknown>;
 }
 
-export const roleNames: Record<AgentRole, string> = {
-  coordinator: '创作统筹', theme: '立意', planner: '方案编排', world: '世界因果', narrative: '叙述编排',
-  canvas: '构思画布', cast: '人物塑造', writer: '正文创作', character: '人物视角', evolution: '人物演进', reader: '读者审查', continuity: '一致性审查', stylist: '文风审阅',
-};
+export const roleNames = ROLE_LABELS;
 const reviewNames: Record<'reader' | 'continuity' | 'style', string> = { reader: '读者审查', continuity: '一致性审查', style: '文风审阅' };
 const nodeStatuses = { pending: '尚未开始', running: '进行中', completed: '已完成', failed: '失败' };
 const candidateStatuses = { draft: '草案', awaitingApproval: '等待作者审批', applied: '已批准并写入', rejected: '已拒绝', stale: '版本已过期' };

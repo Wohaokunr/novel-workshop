@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { AgentEvent, AgentRun, AgentStep, Command, ProviderSecret, RunRequest, Workspace } from '../../shared/types.js';
-import type { AgentArtifact, AgentCandidate, AgentDecision, AgentMemory, AgentPlan, AgentReceipt, AgentRuntimeSummary, AgentState, EvidenceSource, PlanNode, UpstreamResult } from '../../shared/agent-types.js';
+import { modelForRole, type AgentArtifact, type AgentCandidate, type AgentDecision, type AgentMemory, type AgentPlan, type AgentReceipt, type AgentRole, type AgentRuntimeSummary, type AgentState, type EvidenceSource, type PlanNode, type UpstreamResult } from '../../shared/agent-types.js';
 import { NovelStore } from '../store.js';
 import { buildWriterContext, resolveReferences, WRITER_CONTEXT_CHARS, WRITER_PRIORITY } from '../context.js';
 import { DomainValidationError, hasSemanticChanges } from '../domain.js';
@@ -103,7 +103,11 @@ function isRepairRequest(item: ResponseInputItem): boolean {
 
 interface Entry { run: AgentRun; state: AgentState; controller: AbortController; provider?: ProviderSecret; transport?: ResponseTransport; stop?: 'paused' | 'cancelled'; done?: Promise<void>; activeSince?: number }
 function stamp() { return new Date().toISOString(); }
-function providerHash(provider: ProviderSecret) { return fingerprint({ mode: provider.mode, baseURL: provider.baseURL, model: provider.model, reasoningEffort: provider.reasoningEffort }); }
+/** Role models count only when set, so runs saved before they existed keep their fingerprint. */
+function providerHash(provider: ProviderSecret) {
+  const roleModels = Object.fromEntries(Object.entries(provider.roleModels ?? {}).filter(([, model]) => model?.trim()));
+  return fingerprint({ mode: provider.mode, baseURL: provider.baseURL, model: provider.model, reasoningEffort: provider.reasoningEffort, ...(Object.keys(roleModels).length ? { roleModels } : {}) });
+}
 function fail(message: string): never { throw new DomainValidationError(message); }
 function publicStep(step: AgentStep): AgentStep {
   return { ...structuredClone(step), input: { sources: step.contextSources } };
@@ -415,7 +419,7 @@ export class PersistentAgentRuntime {
     let asked: number | undefined;
     while (true) {
       try {
-        return await this.model(entry, 'coordinator', definition, context, entry.run.objective, this.sources(entry), cp => this.autopilot(entry, cp));
+        return await this.model(entry, 'coordinator', 'coordinator', definition, context, entry.run.objective, this.sources(entry), cp => this.autopilot(entry, cp));
       } catch (error) {
         if (!(error instanceof OutputLimitError) || entry.controller.signal.aborted || entry.stop) throw error;
         // A truncated answer has already advanced the turn, so the reminded turn is cut again exactly when we land one past it.
@@ -427,11 +431,11 @@ export class PersistentAgentRuntime {
       }
     }
   }
-  private async model(entry: Entry, slot: string, definition: AgentDefinition, context: unknown, objective: string, sources: EvidenceSource[], next?: RunAgentOptions['next']): Promise<AgentStep> {
+  private async model(entry: Entry, slot: string, role: AgentRole, definition: AgentDefinition, context: unknown, objective: string, sources: EvidenceSource[], next?: RunAgentOptions['next']): Promise<AgentStep> {
     const checkpoint = entry.state.checkpoints[slot] as AgentCheckpoint | undefined;
     if (checkpoint?.phase === 'completed') return checkpoint.step;
     return runAgent(definition, { transport: entry.transport!, context, objective, contextSources: sources.map(source => `${source.projectId}:${source.kind}:${source.id}@${source.hash}`),
-      signal: entry.controller.signal, checkpoint, maxTurns: definition.id === 'coordinator' ? COORDINATOR_TURNS : 12, next,
+      signal: entry.controller.signal, checkpoint, maxTurns: definition.id === 'coordinator' ? COORDINATOR_TURNS : 12, next, model: modelForRole(entry.provider!, role),
       beforeRequest: () => {
         this.check(entry);
         const budget = entry.state.budget;
@@ -882,7 +886,7 @@ export class PersistentAgentRuntime {
       const reviews = candidate?.reviews.filter(review => review.candidateHash === candidate.hash);
       if (reviews?.length) specification.context = { ...(specification.context as Record<string, unknown>), candidateReviews: reviews.map(({ role, verdict, issues, recommendation }) => ({ role, verdict, issues, recommendation })) };
     }
-    const { step, commands } = await this.specialistOutput(entry, slot, specification);
+    const { step, commands } = await this.specialistOutput(entry, slot, node.role, specification);
     const structured = commands ? { ...(step.structured && typeof step.structured === 'object' ? step.structured : {}), commands } : step.structured;
     const artifact: AgentArtifact = { id: `artifact-${fingerprint(`${entry.run.id}:${slot}`).slice(0, 24)}`, nodeId: node.id, role: node.role, label: specification.definition.label,
       text: step.output, structured, stepId: step.id, sources: specification.sources, createdAt: stamp() };
@@ -895,10 +899,10 @@ export class PersistentAgentRuntime {
 
   /** Run a specialist and convert its output. A schema or domain rejection goes back to the same specialist as feedback a bounded
    * number of times; once exhausted the slot is cleared, so delegating the node again starts over instead of replaying the rejected output. */
-  private async specialistOutput(entry: Entry, slot: string, specification: SpecialistDefinition): Promise<{ step: AgentStep; commands?: Command[] }> {
+  private async specialistOutput(entry: Entry, slot: string, role: AgentRole, specification: SpecialistDefinition): Promise<{ step: AgentStep; commands?: Command[] }> {
     while (true) {
       try {
-        const step = await this.model(entry, slot, specification.definition, specification.context, specification.objective, specification.sources);
+        const step = await this.model(entry, slot, role, specification.definition, specification.context, specification.objective, specification.sources);
         return { step, commands: specification.toCommands?.(step) };
       } catch (error) {
         const cp = entry.state.checkpoints[slot] as AgentCheckpoint | undefined;

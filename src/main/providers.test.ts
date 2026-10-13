@@ -5,6 +5,8 @@ import { registerHooks } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ProviderInput } from '../shared/types.js';
+import { modelForRole, ROLE_LABELS } from '../shared/agent-types.js';
+import { ROLE_CAPABILITIES } from './agent/policy.js';
 
 const encrypt = async (value: string): Promise<Buffer> => Buffer.from(`encrypted:${value}`);
 const decrypt = async (value: Buffer): Promise<{ result: string; shouldReEncrypt: boolean }> => ({
@@ -120,4 +122,26 @@ test('单次输出上限只接受合理整数，留空不保存', async t => {
   assert.equal((await store.secret()).maxOutputTokens, 64_000);
   await store.save({ ...oldProvider, maxOutputTokens: undefined });
   assert.equal(store.public().maxOutputTokens, undefined);
+});
+
+test('角色模型去掉空白与留空项后保存，未知角色被拒绝，不填则所有角色用主模型', async t => {
+  const { store, filename } = fixture(t);
+  await store.save({ ...oldProvider, roleModels: { coordinator: '  strong-model ', reader: 'cheap-model', writer: '  ' } });
+  assert.deepEqual(store.public().roleModels, { coordinator: 'strong-model', reader: 'cheap-model' });
+  assert.deepEqual(JSON.parse(readFileSync(filename, 'utf8')).roleModels, { coordinator: 'strong-model', reader: 'cheap-model' });
+  const secret = await store.secret();
+  assert.equal(modelForRole(secret, 'coordinator'), 'strong-model');
+  assert.equal(modelForRole(secret, 'writer'), 'old-model');
+  await assert.rejects(store.save({ ...oldProvider, roleModels: { editor: 'x' } as ProviderInput['roleModels'] }), /未知的智能体角色：editor/);
+  await assert.rejects(store.save({ ...oldProvider, roleModels: { reader: 42 } as unknown as ProviderInput['roleModels'] }), /读者审查的模型名称无效/);
+  assert.deepEqual(store.public().roleModels, { coordinator: 'strong-model', reader: 'cheap-model' }, 'a rejected save changes nothing');
+  await store.save({ ...oldProvider, roleModels: { writer: '' } });
+  assert.equal(store.public().roleModels, undefined);
+  await store.save({ ...oldProvider, roleModels: { writer: 'w' } });
+  await store.save(oldProvider);
+  assert.equal(store.public().roleModels, undefined);
+});
+
+test('每个智能体角色都有设置页名称，顺序与角色定义一致', () => {
+  assert.deepEqual(Object.keys(ROLE_LABELS), Object.keys(ROLE_CAPABILITIES));
 });

@@ -76,6 +76,8 @@ export interface ModelResponse {
 }
 export interface ModelRequest {
   agentId: string;
+  /** Overrides the provider's model for this request (a role's own model). */
+  model?: string;
   instructions: string;
   input: ResponseInputItem[];
   tools: Array<{ type: 'function'; name: string; description: string; parameters: JsonSchema; strict: true }>;
@@ -212,7 +214,7 @@ export class OpenAIResponseTransport implements ResponseTransport {
     let stream: ReturnType<OpenAI['responses']['stream']>;
     try {
       stream = this.client.responses.stream({
-        model: this.provider.model,
+        model: request.model || this.provider.model,
         instructions: request.instructions,
         // With store: false the service keeps nothing, so a reasoning item can only be replayed with its encrypted content.
         input: request.input.filter(item => item.type !== 'reasoning' || !!item.encrypted_content),
@@ -285,6 +287,8 @@ export interface RunAgentOptions {
   onCheckpoint?(cp: AgentCheckpoint): void;
   beforeRequest?(): void | Promise<void>;
   maxTurns?: number;
+  /** The model this agent's requests go to; absent uses the transport's provider model. */
+  model?: string;
   /** Deterministic work in place of the next model turn: calls to execute as if the model had made them (recorded in the
    * conversation like its own), `true` to finish without another request, or nothing to ask the model. */
   next?(cp: AgentCheckpoint): RuntimeCall[] | true | undefined;
@@ -508,7 +512,7 @@ export async function runAgent(definition: AgentDefinition, options: RunAgentOpt
       let response: ModelResponse;
       try {
         const stream = await options.transport.stream({
-          agentId: definition.id, instructions: definition.instructions, input: requestInput,
+          agentId: definition.id, ...(options.model ? { model: options.model } : {}), instructions: definition.instructions, input: requestInput,
           tools: tools.map(({ name, description, parameters }) => ({ type: 'function', name, description, parameters, strict: true })),
           ...(definition.outputSchema ? { outputSchema: definition.outputSchema } : {}),
         }, options.signal);

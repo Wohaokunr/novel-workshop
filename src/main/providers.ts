@@ -1,7 +1,20 @@
 import { safeStorage } from 'electron';
 import { readFileSync, writeFileSync, renameSync, existsSync } from 'node:fs';
 import type { ProviderInput, ProviderSecret, ProviderSettings } from '../shared/types.js';
+import { ROLE_LABELS, type AgentRole } from '../shared/agent-types.js';
 
+/** Keeps only roles that name a model; an empty result means every role uses the main model. */
+function normalizeRoleModels(input: ProviderInput['roleModels']): ProviderSettings['roleModels'] {
+  if (input === undefined || input === null) return undefined;
+  if (typeof input !== 'object' || Array.isArray(input)) throw new Error('角色模型设置无效');
+  const entries: Array<[AgentRole, string]> = [];
+  for (const [role, model] of Object.entries(input)) {
+    if (!Object.hasOwn(ROLE_LABELS, role)) throw new Error(`未知的智能体角色：${role}`);
+    if (model !== undefined && typeof model !== 'string') throw new Error(`${ROLE_LABELS[role as AgentRole]}的模型名称无效`);
+    if (model?.trim()) entries.push([role as AgentRole, model.trim()]);
+  }
+  return entries.length ? Object.fromEntries(entries) : undefined;
+}
 interface StoredProvider extends Omit<ProviderSettings, 'hasKey'> { encryptedKey?: string }
 export class ProviderStore {
   private value: StoredProvider;
@@ -26,6 +39,8 @@ export class ProviderStore {
     if (input.reasoningEffort) next.reasoningEffort = input.reasoningEffort;
     if (input.summaryModel?.trim()) next.summaryModel = input.summaryModel.trim();
     if (input.embeddingModel?.trim()) next.embeddingModel = input.embeddingModel.trim();
+    const roleModels = normalizeRoleModels(input.roleModels);
+    if (roleModels) next.roleModels = roleModels;
     if (input.maxOutputTokens !== undefined && input.maxOutputTokens !== null) {
       if (!Number.isSafeInteger(input.maxOutputTokens) || input.maxOutputTokens < 1000 || input.maxOutputTokens > 200_000) throw new Error('单次输出上限应为 1000–200000 之间的整数');
       next.maxOutputTokens = input.maxOutputTokens;
