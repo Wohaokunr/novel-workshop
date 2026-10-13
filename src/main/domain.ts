@@ -107,6 +107,10 @@ export function validateWorkspace(workspace: Workspace): void {
   const isEvent = (id: string) => objects.get(id)?.typeId === 'event';
   for (const object of objects.values()) {
     text(object.name, '对象名称', true); text(object.typeId, '对象类型 ID', true);
+    if (object.aliases !== undefined) {
+      strings(object.aliases, '对象别名');
+      check(object.aliases.length <= 20 && object.aliases.every(alias => alias.trim() && alias.length <= 40), `对象 ${object.name} 的别名无效：最多 20 个，每个 1–40 字`);
+    }
     const type = types.get(object.typeId); check(type, `对象 ${object.name} 的类型不存在`);
     record(object.fields, '对象字段');
     for (const [key, value] of Object.entries(object.fields)) {

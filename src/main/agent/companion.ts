@@ -17,7 +17,7 @@ import { boundedContext, refreshMemories, selectAuthorRules } from './memory.js'
 import { sceneMentions } from './story-index.js';
 import { entityRecall, openThreads, storyOverview, StoryView } from './story-view.js';
 import { personNames, scaleNames, styleProfile } from '../../shared/style-types.js';
-import { elementNames, isSettingLike, sceneElements } from '../../shared/story-elements.js';
+import { elementNames, isSettingLike, objectNames, sceneElements } from '../../shared/story-elements.js';
 import { styleFingerprint } from '../../shared/style-metrics.js';
 
 const MODES: CompanionMode[] = ['diverge', 'causality', 'structure', 'outline', 'beat', 'develop', 'style'];
@@ -241,7 +241,7 @@ export function companionContext(workspace: Workspace, thread: CompanionThread, 
     base.currentScene = scene ? { id: scene.id, title: scene.title, pov: name(scene.povId) ?? '全知', outline: scene.outline, textTail: scene.text.slice(-3000),
       nextScene: scenes[index + 1] ? { title: scenes[index + 1]!.title, outline: excerpt(scenes[index + 1]!.outline, 600) } : null,
       previousScene: scenes[index - 1] ? { title: scenes[index - 1]!.title, ...view.sceneMemory(scenes[index - 1]!.id) } : null,
-      openThreads: openThreads(view, scene.id, [name(scene.povId) ?? ''], 10).map(thread => thread.title),
+      openThreads: openThreads(view, scene.id, (() => { const pov = workspace.objects.find(object => object.id === scene.povId); return pov ? objectNames(pov) : []; })(), 10).map(thread => thread.title),
       entityRecall: entityRecall(view, scene.id, [...(scene.povId ? [scene.povId] : []), ...sceneMentions(view.index, scene.id).keys(), ...scene.eventIds.flatMap(id => workspace.objects.find(object => object.id === id)?.event?.participants ?? [])],
         new Set(scenes.slice(Math.max(0, index - 1), index).map(item => item.id)), 6) } : null;
   }

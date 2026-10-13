@@ -6,14 +6,14 @@ import { join } from 'node:path';
 import type { Change, NarrativeScene, NovelObject, RunRequest, Workspace } from '../shared/types.js';
 import type { RollupDigest, SceneDigest } from '../shared/story-types.js';
 import type { CompanionThread } from '../shared/companion-types.js';
-import { createWorkspace } from './domain.js';
+import { applyCommands, createWorkspace, DomainValidationError } from './domain.js';
 import { buildWriterContext, WRITER_CONTEXT_CHARS } from './context.js';
 import { collectContext, compactChanges, MAX_CONTEXT_CHARS, searchContext } from './agent/memory.js';
 import { specialistDefinition } from './agent/specialists.js';
 import { companionContext } from './agent/companion.js';
-import { storyIndex, textHash, textSketch } from './agent/story-index.js';
-import { StoryView } from './agent/story-view.js';
-import { DemoStoryTransport, DIGEST_BATCH_CHARS, digestBatch, rollupBatch, StoryMemoryService } from './agent/story-memory.js';
+import { sceneMentions, storyIndex, textHash, textSketch } from './agent/story-index.js';
+import { ledgerForDigest, openThreads, StoryView, THREAD_EXPIRY_CHAPTERS } from './agent/story-view.js';
+import { DemoStoryTransport, DIGEST_BATCH_CHARS, digestBatch, LONG_SCENE_CHARS, rollupBatch, splitParts, stableThreads, StoryMemoryService } from './agent/story-memory.js';
 import { NovelStore } from './store.js';
 import { ModelServiceError, OutputLimitError, type ModelRequest, type ResponseTransport } from './responses.js';
 
@@ -203,7 +203,7 @@ test('后台故事记忆：演示传输完成场景摘要与章/卷/全书汇总
     assert.deepEqual(digests.filter(item => item.kind === 'chapter').map(item => (item as RollupDigest).targetId).sort(), [chapterId, 'second'].sort());
     assert.ok(digests.some(item => item.kind === 'volume') && digests.some(item => item.kind === 'book'));
     const view = new StoryView(store.getProject(project.id), digests);
-    assert.equal(view.ledgerBefore().length, 3, '每场的疑问成为未回收伏笔');
+    assert.equal(view.ledgerBefore().length, 1, '三场提出的是同一个疑问，合并为一条未回收伏笔');
     assert.equal(store.getProject(project.id).revision, saved.revision, '摘要不修改作品');
     assert.ok(events.includes('storyMemory'));
     const calls = digests.length;
@@ -250,9 +250,138 @@ test('后台故事记忆：一批内容无法整理时只跳过这一批并说�
     await service.run(project.id);
     const status = await service.status(project.id);
     assert.equal(status.fresh, 2); assert.equal(status.pending, 1);
-    assert.equal(status.lastError, '1 批内容整理失败，下次整理时重试：模型输出达到单次上限被截断');
+    assert.equal(status.lastError, '1 批内容整理失败：模型输出达到单次上限被截断。这些场景下次整理时重试');
     failure = undefined;
     await service.run(project.id);
     assert.equal((await service.status(project.id)).pending, 0);
   } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+/** A book of `chapters` one-scene chapters with stored digests built by `digest(index)`. */
+function threadBook(chapters: number, digest: (index: number) => Partial<SceneDigest>) {
+  const workspace = createWorkspace('伏笔', 'threads');
+  workspace.chapters = Array.from({ length: chapters }, (_, index) => ({ id: `c${index}`, title: `第${index + 1}章`, order: index }));
+  workspace.scenes = workspace.chapters.map((chapter, index) => ({ id: `s${index}`, chapterId: chapter.id, order: 0, title: `场景${index}`, povId: null, eventIds: [], outline: '', text: `第${index}场正文。` }));
+  const digests: SceneDigest[] = workspace.scenes.map((scene, index) => ({ kind: 'scene', sceneId: scene.id, textHash: textHash(scene.text), chars: scene.text.length, sketch: textSketch(scene.text),
+    summary: '平静的一天。', events: [], changes: [], facts: [], threadsOpened: [], threadsClosed: [], model: 'test', updatedAt: '', ...digest(index) }));
+  return new StoryView(workspace, digests);
+}
+
+test('伏笔账本：措辞相近的重复伏笔合并，回收任一条即回收；主线伏笔排前，久未提及的次要伏笔排在最后', () => {
+  const view = threadBook(80, index => index === 0 ? { threadsOpened: [{ id: 't:mystery', title: '钟楼为何敲响第十三声', major: true }] }
+    : index === 1 ? { threadsOpened: [{ id: 't:old', title: '码头仓库里藏着什么' }] }
+    : index === 5 ? { threadsOpened: [{ id: 't:dup', title: '钟楼为什么敲响第十三声' }] }
+    : index === 40 ? { threadsOpened: [{ id: 't:active', title: '账房先生的旧账本' }] }
+    : index === 60 ? { summary: '他又翻开账房先生的旧账本。' }
+    : index === 70 ? { threadsOpened: Array.from({ length: 3 }, (_, n) => ({ id: `t:new${n}`, title: `新的疑问${'甲乙丙'[n]}` })) } : {});
+  const ledger = view.ledgerBefore();
+  assert.deepEqual(ledger.map(thread => thread.id), ['t:mystery', 't:old', 't:active', 't:new0', 't:new1', 't:new2'], '重复的伏笔并入最早的一条');
+  assert.equal(ledger.find(thread => thread.id === 't:active')!.lastChapterIndex, 60, '后文摘要提到即视为仍在推进');
+  const listed = openThreads(view, undefined, [], 5).map(thread => thread.title);
+  assert.equal(listed[0], '钟楼为何敲响第十三声');
+  assert.ok(!listed.includes('码头仓库里藏着什么'), `超过 ${THREAD_EXPIRY_CHAPTERS} 章没被提起的次要伏笔在拥挤时让位`);
+  assert.deepEqual(openThreads(view, undefined, [], 10).at(-1), { id: 't:old', title: '码头仓库里藏着什么' }, '不拥挤时仍然列出');
+  const closedByDuplicate = threadBook(10, index => index === 0 ? { threadsOpened: [{ id: 't:a', title: '钟楼为何敲响第十三声' }] }
+    : index === 2 ? { threadsOpened: [{ id: 't:b', title: '钟楼为什么敲响第十三声' }] } : index === 4 ? { threadsClosed: ['t:b'] } : {});
+  assert.deepEqual(closedByDuplicate.ledgerBefore(), []);
+});
+
+test('交给摘要模型的伏笔：主线与本批正文提到的早期伏笔优先于最近的伏笔', () => {
+  const view = threadBook(200, index => index === 3 ? { threadsOpened: [{ id: 't:early', title: '银哨的来历' }] }
+    : index > 3 ? { threadsOpened: [{ id: `t:${index}`, title: `线索${String.fromCharCode(0x4e00 + index * 3)}${String.fromCharCode(0x5000 + index * 5)}` }] } : {});
+  const picked = ledgerForDigest(view.ledgerBefore(), '白鹭终于说出了银哨的来历。', 20);
+  assert.equal(picked.length, 20);
+  assert.ok(picked.some(thread => thread.id === 't:early'), '正文提到的早期伏笔可以被回收');
+  assert.ok(picked.some(thread => thread.id === 't:199'));
+});
+
+test('伏笔编号来自开启场景与措辞：重新整理该场时沿用相近伏笔的编号，后文的回收仍指向同一条', () => {
+  const first = stableThreads('s1', [{ title: '门后是谁', major: false }, { title: '钥匙去了哪里', major: true }]);
+  assert.match(first[0]!.id, /^t:s1:[0-9a-f]{10}$/); assert.equal(first[1]!.major, true);
+  const again = stableThreads('s1', [{ title: '钥匙到底去了哪里', major: true }, { title: '门后究竟是谁', major: false }], first);
+  assert.deepEqual(again.map(thread => thread.id), [first[1]!.id, first[0]!.id]);
+  const same = stableThreads('s2', [{ title: '同一句', major: false }, { title: '同一句', major: false }]);
+  assert.notEqual(same[0]!.id, same[1]!.id);
+});
+
+test('后台故事记忆：模型漏掉的场景不存兜底摘要，保持待整理并在下次重试', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'story-omit-'));
+  const store = new NovelStore(join(directory, 'test.sqlite'));
+  try {
+    const project = store.createProject('漏报'), chapterId = project.chapters[0]!.id;
+    store.execute({ projectId: project.id, actor: 'human', commands: [0, 1].map(index => ({ type: 'putScene' as const,
+      value: { id: `s${index}`, chapterId, order: index, title: `场景${index}`, povId: null, eventIds: [], outline: '', text: `第${index}场。雾里传来钟声。` } })) });
+    const demo = new DemoStoryTransport();
+    let drop = true;
+    const transport: ResponseTransport = { stream(request: ModelRequest, signal: AbortSignal) {
+      if (!drop || request.agentId !== 'story:digest') return demo.stream(request, signal);
+      const [user] = request.input as Array<{ content: string }>;
+      const parsed = JSON.parse(user!.content);
+      parsed.context.scenes = parsed.context.scenes.filter((scene: { sceneId: string }) => scene.sceneId !== 's1');
+      return demo.stream({ ...request, input: [{ role: 'user', content: JSON.stringify(parsed) }] }, signal);
+    } };
+    const service = new StoryMemoryService(store, () => ({ name: 'demo', baseURL: '', model: 'demo', mode: 'mock', apiKey: '' }), () => {}, () => transport);
+    await service.run(project.id);
+    let status = await service.status(project.id);
+    assert.equal(status.fresh, 1); assert.equal(status.pending, 1);
+    assert.equal(status.lastError, '1 场被模型漏掉。这些场景下次整理时重试');
+    assert.ok(!store.getStoryDigests(project.id).some(digest => digest.kind === 'scene' && digest.sceneId === 's1'));
+    drop = false;
+    await service.run(project.id);
+    status = await service.status(project.id);
+    assert.equal(status.pending, 0); assert.equal(status.lastError, undefined);
+  } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('后台故事记忆：超长场景分段整理再合并，不再省略中段；段内开启又回收的伏笔不留在账本里', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'story-long-'));
+  const store = new NovelStore(join(directory, 'test.sqlite'));
+  try {
+    const project = store.createProject('长场景'), chapterId = project.chapters[0]!.id;
+    const filler = '潮水一遍遍漫上石阶，又退回去。\n'.repeat(700);
+    const text = `她不知道门后是谁？\n${filler}中段：守钟人把铜钥匙藏进了钟摆。\n${filler}门开了，原来门后是守钟人。\n${filler}`;
+    assert.ok(text.length > LONG_SCENE_CHARS * 2);
+    store.execute({ projectId: project.id, actor: 'human', commands: [{ type: 'putScene', value: { id: 'long', chapterId, order: 0, title: '长夜', povId: null, eventIds: [], outline: '', text } }] });
+    const demo = new DemoStoryTransport(), requests: ModelRequest[] = [];
+    const transport: ResponseTransport = { stream(request: ModelRequest, signal: AbortSignal) {
+      requests.push(request);
+      if (request.agentId === 'story:digest') {
+        const { context } = JSON.parse((request.input[0] as { content: string }).content);
+        const part = context.scenes[0];
+        if (part.text.includes('门开了')) {
+          const opened = context.openThreads.find((thread: { title: string }) => thread.title.includes('门后'));
+          return stream(JSON.stringify({ scenes: [{ sceneId: part.sceneId, summary: '门开了。', events: ['门开了'], changes: [], threadsOpened: [], threadsClosed: [opened.id], facts: [] }] }));
+        }
+      }
+      return demo.stream(request, signal);
+    } };
+    const stream = (text: string) => ({ events: (async function* () {})(), finalResponse: async () => ({ id: 'fixture', status: 'completed', output: [{ type: 'message' as const, id: 'm', role: 'assistant' as const, status: 'completed' as const, content: [{ type: 'output_text' as const, text, annotations: [] }] }], usage: null }) });
+    const service = new StoryMemoryService(store, () => ({ name: 'demo', baseURL: '', model: 'demo', mode: 'mock', apiKey: '' }), () => {}, () => transport);
+    await service.run(project.id);
+    const parts = splitParts(text, 10_000);
+    const digestRequests = requests.filter(request => request.agentId === 'story:digest');
+    assert.equal(digestRequests.length, parts.length);
+    assert.ok(digestRequests.some(request => JSON.stringify(request.input).includes('守钟人把铜钥匙藏进了钟摆')), '中段也被整理');
+    assert.ok(digestRequests.every(request => JSON.stringify(request.input).includes(`long#`)), '各段标明是同一场景的第几部分');
+    assert.equal(requests.filter(request => request.agentId === 'story:merge').length, 1);
+    assert.equal(parts.join(''), text);
+    const digest = store.getStoryDigests(project.id).find(item => item.kind === 'scene') as SceneDigest;
+    assert.equal(digest.sceneId, 'long'); assert.equal(digest.textHash, textHash(text));
+    assert.deepEqual(digest.threadsOpened, [], '「门后是谁」在同一场里已经揭晓');
+    assert.equal((await service.status(project.id)).pending, 0);
+  } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('人物别名：按别名找到出场，最长名字优先避免「李明」误配「李明月」；别名需要有效', () => {
+  const workspace = createWorkspace('别名', 'aliases');
+  workspace.objects.push({ id: 'li', typeId: 'character', name: '李明', fields: {}, aliases: ['阿明', '李先生'] },
+    { id: 'yue', typeId: 'character', name: '李明月', fields: {} });
+  workspace.chapters = [{ id: 'c', title: '一', order: 0 }];
+  workspace.scenes = [{ id: 's', chapterId: 'c', order: 0, title: '一', povId: null, eventIds: [], outline: '', text: '李明月推门进来。阿明抬头，李先生，她喊。李明月笑了。' }];
+  const mentions = sceneMentions(storyIndex(workspace), 's');
+  assert.equal(mentions.get('yue')?.count, 2);
+  assert.equal(mentions.get('li')?.count, 2, '两个别名各一次，「李明月」里的「李明」不算');
+  assert.throws(() => applyCommands(workspace, [{ type: 'putObject', value: { ...workspace.objects[0]!, aliases: [''] } }]), DomainValidationError);
+  const renamed = applyCommands(workspace, [{ type: 'putObject', value: { ...workspace.objects[1]!, aliases: ['小月'] } }]);
+  assert.deepEqual(renamed.objects.find(object => object.id === 'yue')!.aliases, ['小月']);
 });

@@ -5,6 +5,10 @@ export type StoryElement = 'people' | 'plot' | 'place';
 export const elementNames: Record<StoryElement, string> = { people: '人物', plot: '情节', place: '环境' };
 
 /** Places, organisations, props and custom types: anything that is neither a character nor a world event. */
+/** The name and aliases a text may use for an object. Single characters are too ambiguous to count as a mention. */
+export function objectNames(object: Pick<NovelObject, 'name' | 'aliases'>): string[] {
+  return [...new Set([object.name, ...(object.aliases ?? [])].map(value => value.trim()).filter(value => Array.from(value).length >= 2))];
+}
 export const isSettingLike = (object: Pick<NovelObject, 'typeId' | 'event'>) => object.typeId !== 'character' && object.typeId !== 'event' && !object.event;
 export const elementOf = (object: Pick<NovelObject, 'typeId' | 'event'>): StoryElement => object.typeId === 'character' ? 'people' : object.event ? 'plot' : 'place';
 

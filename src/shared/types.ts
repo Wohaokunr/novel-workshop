@@ -10,7 +10,11 @@ export interface EventData {
   worldOrder: number; timeLabel: string; thread: string; participants: string[];
   causes: string[]; critical: boolean; observations: Record<string, string>;
 }
-export interface NovelObject { id: string; typeId: string; name: string; fields: Record<string, FieldValue>; event?: EventData }
+export interface NovelObject {
+  id: string; typeId: string; name: string; fields: Record<string, FieldValue>; event?: EventData;
+  /** Other names the prose uses (nicknames, titles, forms of address); used to find where the object appears. */
+  aliases?: string[];
+}
 export interface Chapter { id: string; title: string; order: number; actId?: string; summary?: string }
 /** A volume / act in the layered outline; chapters opt in through actId. */
 export interface Act { id: string; title: string; order: number; purpose: string; summary: string }

@@ -1,7 +1,7 @@
 import type { Workspace, CharacterContext, ReaderContext, SourceReference, CanvasCard, NovelObject, NarrativeScene } from '../shared/types.js';
 import { entityRecall, openThreads, storySoFar, StoryView } from './agent/story-view.js';
 import { writerStyle } from './agent/style.js';
-import { isSettingLike, sceneElements } from '../shared/story-elements.js';
+import { isSettingLike, objectNames, sceneElements } from '../shared/story-elements.js';
 
 /** Raw prose immediately before the target scene; everything earlier reaches the writer as layered digests. */
 export const RECENT_TEXT_CHARS = 6000;
@@ -55,7 +55,7 @@ export function buildWriterContext(workspace: Workspace, sceneId: string, refere
   // Only the places this scene happens in: bound by the author, or named in its outline, chapter plan or the prose just before.
   const settings = workspace.objects.filter(isSettingLike);
   const nearby = [scene.title, scene.outline, chapter.summary ?? '', recentText.map(item => item.text).join('\n').slice(-1500)].join('\n');
-  const named = settings.filter(object => Array.from(object.name.trim()).length >= 2 && nearby.includes(object.name.trim())).map(object => object.id);
+  const named = settings.filter(object => objectNames(object).some(name => nearby.includes(name))).map(object => object.id);
   const sceneSettings = (scene.settingIds?.length || named.length) ? [...(scene.settingIds ?? []), ...named]
     : settings.length <= ALL_SETTINGS_UP_TO ? settings.map(object => object.id) : [];
   const objectIds = new Set<string>([
@@ -96,7 +96,7 @@ export function buildWriterContext(workspace: Workspace, sceneId: string, refere
   const people = [...new Set([...(scene.povId ? [scene.povId] : []), ...sceneEvents.flatMap(event => event.event!.participants),
     ...relatedObjects.filter(object => !object.event).map(object => object.id)])];
   const recall = entityRecall(view, scene.id, people, new Set([...shown, ...view.order.filter(item => item.chapterId === scene.chapterId).map(item => item.id)]));
-  const threads = openThreads(view, scene.id, people.map(id => workspace.objects.find(object => object.id === id)?.name ?? ''));
+  const threads = openThreads(view, scene.id, people.flatMap(id => { const object = workspace.objects.find(item => item.id === id); return object ? objectNames(object) : []; }));
   const initialFacts = relatedFacts.filter(fact => fact.fromEventId === null);
   const sources = [...new Set([
     `scene:${scene.id}`, 'novel:theme', 'style', ...materials.sources, ...relatedObjects.map(object => `object:${object.id}`),

@@ -13,6 +13,7 @@ import { createCoordinatorTools, type ToolName } from './tools.js';
 import { sceneMentions } from './story-index.js';
 import { StoryView } from './story-view.js';
 import { storyOpsCommands } from './story-ops.js';
+import { objectNames } from '../../shared/story-elements.js';
 
 const SCENE_TEXT_PREVIEW = 4000, READ_TEXT_CHARS = 6000, READ_ENTITIES_CHARS = 16_000;
 
@@ -889,7 +890,7 @@ export class PersistentAgentRuntime {
         ...(appearances.length > 40 ? { omitted: `中间 ${appearances.length - 40} 次出场未列出，可用 chapterFrom/chapterTo 查看` } : {}),
         timeline: picked.map(scene => { const memory = view.sceneMemory(scene.id), mention = sceneMentions(view.index, scene.id).get(entityId);
           return { sceneId: scene.id, chapter: view.chapters[view.chapterIndex(scene.chapterId)]?.title, ...memory, summary: memory.summary.slice(0, 200), mentions: mention?.count ?? 0,
-            changes: memory.changes?.filter(change => change.who.includes(object.name) || object.name.includes(change.who)) }; }) };
+            changes: memory.changes?.filter(change => objectNames(object).some(name => change.who.includes(name) || name.includes(change.who))) }; }) };
     }
     const from = args.chapterFrom ? view.chapterIndex(String(args.chapterFrom)) : Math.max(0, view.chapterIndex(view.frontierChapterId() ?? '') - 2);
     const to = args.chapterTo ? view.chapterIndex(String(args.chapterTo)) : from + 2;

@@ -1,5 +1,6 @@
 import type { NarrativeScene, Workspace } from '../../shared/types.js';
 import { styleProfile, type StyleSample } from '../../shared/style-types.js';
+import { objectNames } from '../../shared/story-elements.js';
 import { AI_CLICHES, styleBaseline, styleDirectives } from '../../shared/style-metrics.js';
 
 /** Exemplars are the strongest voice signal, but they compete with story context for the writer budget. */
@@ -29,7 +30,7 @@ function present(workspace: Workspace, scene: NarrativeScene): Array<{ id: strin
     ...scene.eventIds.flatMap(id => workspace.objects.find(object => object.id === id)?.event?.participants ?? [])]);
   const characters = workspace.objects.filter(object => object.typeId === 'character');
   // Characters named in the outline or prose are on stage too, even without an event binding.
-  for (const character of characters) if (character.name && (scene.outline.includes(character.name) || scene.text.includes(character.name))) ids.add(character.id);
+  for (const character of characters) if (objectNames(character).some(name => scene.outline.includes(name) || scene.text.includes(name))) ids.add(character.id);
   return characters.filter(character => ids.has(character.id)).map(character => ({ id: character.id, name: character.name }));
 }
 

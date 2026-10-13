@@ -10,6 +10,7 @@ import { sceneMentions } from './story-index.js';
 import { STORY_OPS, STORY_OPS_HELP, storyOpsCommands } from './story-ops.js';
 import type { CompanionOpKind } from '../../shared/companion-types.js';
 import { openThreads, StoryView } from './story-view.js';
+import { objectNames } from '../../shared/story-elements.js';
 import { writerStyle } from './style.js';
 import { styleProfile } from '../../shared/style-types.js';
 import { styleBaseline, styleLint } from '../../shared/style-metrics.js';
@@ -238,7 +239,7 @@ export function specialistDefinition(specialist: SpecialistRequest & { story?: S
     return { definition: definition('continuity', '作者 · 连续性审阅', continuityInstructions, reviewSchema),
       context: boundedContext({ targetScenes: scenes.map(scene => ({ ...scene, text: scene.text.slice(0, 3000), outline: scene.outline.slice(0, 1200) })),
         precedingScenes: before.map(scene => ({ id: scene.id, ...story.sceneMemory(scene.id) })),
-        openThreads: scenes[0] ? openThreads(story, scenes[0].id, objects.map(object => object.name), 12).map(thread => thread.title) : [],
+        openThreads: scenes[0] ? openThreads(story, scenes[0].id, objects.flatMap(objectNames), 12).map(thread => thread.title) : [],
         authorFacts: facts.slice(0, 40), characterStates: states.slice(0, 20), authorObjects: objects.slice(0, 30), overview,
         omitted: { sceneBodies: Math.max(0, project.scenes.length - scenes.length), facts: Math.max(0, facts.length - 40), objects: Math.max(0, objects.length - 30),
           notice: '只载入审阅目标场景及其涉及人物/事件的设定；precedingScenes 为前文摘要。' } }),
