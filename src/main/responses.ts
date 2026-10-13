@@ -5,6 +5,7 @@ import type { ReasoningEffort } from 'openai/resources/shared';
 import type { AgentStep, ProviderSecret, TokenUsage } from '../shared/types.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { DomainValidationError } from './domain.js';
+import { promptVersion } from './prompts/prompt.js';
 
 export class ToolValidationError extends Error {}
 /** The service reported an error, so the request produced nothing: sending it again repeats no billed result. */
@@ -379,7 +380,7 @@ export async function runAgent(definition: AgentDefinition, options: RunAgentOpt
       id: randomUUID(), agentId: definition.id, label: definition.label, status: 'running',
       input: { instructions: definition.instructions, context: options.context, objective: options.objective, turns: newTurns },
       output: '', tools: [], usage: emptyUsage(), startedAt: new Date().toISOString(),
-      contextSources: options.contextSources, responseIds: [],
+      contextSources: options.contextSources, responseIds: [], promptVersion: promptVersion(definition.instructions),
     },
     input: [{ role: 'user', content: JSON.stringify({ context: options.context, objective: options.objective }) }],
     turn: 0, phase: 'ready', pendingCalls: [], cursor: 0,

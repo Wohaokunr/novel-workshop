@@ -197,6 +197,27 @@ npm run smoke -- --interaction
 
 首版不含安装包、协作服务、互斥剧情分支、富文本或 EPUB 导入。
 
+## 提示词与基准评测
+
+发给模型的提示词都在 `src/main/prompts/`，每个提示词的版本由文本计算，不需要手工维护；任务记录的每一步会写下所用提示词的版本（「步骤日志」底部）。协调智能体的工具版本由工具名与参数结构计算，只改提示词不会让暂停中的任务无法恢复。
+
+`src/main/eval/` 是一个小型基准集：两部样例作品（民国悬疑、轻小说日常），各自带有人物不知道的秘密、作者确认的约束和文风设定，以及写作、角色代入、读者审阅五个任务。每个任务自动检查：
+
+- **知识越界**：角色代入与读者拿到的上下文里不能有秘密和作者侧资料（零 token，`npm test` 每次都跑）；输出里不能出现泄露秘密的说法。
+- **违反作者约束**：写作上下文必须带上作者约束；任何输出都不能出现违反约束的说法。
+- **文风问题**：写作上下文必须带上禁用词；正文用本地文风统计对照作者范文，禁用词、AI 套话和人称不符直接判为未通过。
+- **格式**：正文长度合理，不夹 JSON、标题或说明；结构化结果字段齐全。
+
+基准任务目前覆盖写作、角色代入与读者审阅三个专长的提示词；协调、创作伙伴、故事记忆与文风学习的提示词由 `npm test` 中的模拟测试覆盖流程，尚未纳入基准。修改提示词前后各运行一次，比较通过率：
+
+```bash
+NOVEL_EVAL_MODEL=<模型名> NOVEL_EVAL_API_KEY=<API Key> npm run eval -- --repeat 3 --out artifacts/eval/before
+# 修改 src/main/prompts/ 之后
+NOVEL_EVAL_MODEL=<模型名> NOVEL_EVAL_API_KEY=<API Key> npm run eval -- --repeat 3 --baseline artifacts/eval/before/latest-live.json
+```
+
+`NOVEL_EVAL_BASE_URL`、`NOVEL_EVAL_REASONING_EFFORT`、`NOVEL_EVAL_MAX_OUTPUT_TOKENS` 可选。报告列出改动的提示词和通过率下降的检查；有下降、或上下文检查失败时退出码为 1，加 `--strict` 时任何检查未通过都返回 1。不设置模型与 API Key 时使用本地演示响应，只验证评测流程与上下文检查。检查是基于标记词与本地统计的确定性检查，能抓住明显的退步；没有命中不等于完全合规，细微的问题仍需人工阅读报告中的输出。
+
 ## 参与贡献
 
 欢迎提交 Issue 与 Pull Request。提交前请至少运行 `npm run typecheck` 与 `npm test`；涉及界面流程的修改再运行对应的 `npm run smoke`。桌面冒烟需要可交互的桌面环境，只使用演示模式，不调用真实模型，也不需要 API Key。

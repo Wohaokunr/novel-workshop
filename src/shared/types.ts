@@ -80,6 +80,8 @@ export interface AgentStep {
   id: string; agentId: string; label: string; status: RunStatus; input: unknown; output: string;
   structured?: unknown; tools: ToolActivity[]; usage: TokenUsage; startedAt: string; finishedAt?: string;
   contextSources: string[]; responseIds: string[];
+  /** Version (text hash) of the instructions this step ran with; see src/main/prompts. */
+  promptVersion?: string;
 }
 export type AssistTool = 'character' | 'world' | 'narrative' | 'canvas' | 'theme' | 'continuity';
 export interface RunRequest {
