@@ -1,4 +1,5 @@
 import type { AssistTool, Command, NarrativeScene, Workspace } from '../shared/types.js';
+import { scenePassages } from '../shared/structure.js';
 import type { resolveReferences } from './context.js';
 export { NovelAgentScheduler } from './agent/scheduler.js';
 
@@ -21,7 +22,8 @@ export function demoAssist(project: Workspace, tool: AssistTool, materials?: Ret
   if (tool === 'narrative' || tool === 'continuity') {
     const scene = scenes[0];
     if (!scene) return [];
-    const addition = tool === 'continuity' && scene.text.trim() ? `正文已呈现：${scene.text.slice(0, 100)}` : '通过当场可见的行动推进人物选择，保留尚未揭露的信息。';
+    const prose = scenePassages(project, scene.id).map(passage => passage.text).join('\n').trim();
+    const addition = tool === 'continuity' && prose ? `正文已呈现：${prose.slice(0, 100)}` : '通过当场可见的行动推进人物选择，保留尚未揭露的信息。';
     return [{ type: 'putScene', value: { ...scene, outline: scene.outline.includes(addition) ? scene.outline : `${scene.outline}\n${addition}`.trim() } }];
   }
   if (tool === 'canvas') {
@@ -80,14 +82,17 @@ export function demoOutline(project: Workspace): Command[] {
     },
   } });
   const existing = project.chapters.find(chapter => chapter.id === demoId(project, 'chapter'))
-    ?? [...project.chapters].sort((a, b) => a.order - b.order).find(chapter => !project.scenes.some(scene => scene.chapterId === chapter.id));
+    ?? [...project.chapters].sort((a, b) => a.order - b.order).find(chapter => !project.passages.some(passage => passage.chapterId === chapter.id));
   const chapterId = existing?.id ?? demoId(project, 'chapter');
   commands.push({ type: 'putChapter', value: { id: chapterId, title: '第一章 · 雾中来信', order: existing?.order ?? Math.max(0, ...project.chapters.map(chapter => chapter.order)) + 1 } });
+  const tower = project.objects.find(object => object.id === demoId(project, 'tower'));
   for (let index = 0; index < 3; index++) {
-    const sceneId = demoId(project, `scene-${index}`);
-    const current = project.scenes.find(scene => scene.id === sceneId);
-    commands.push({ type: 'putScene', value: { id: sceneId, chapterId, order: index + 1, title: titles[index]!, povId: participants[index === 1 ? 1 : 0] ?? null,
-      eventIds: hasEvents ? [demoId(project, `event-${index}`)] : [], outline: outlines[index]!, text: current?.text ?? '' } },
+    const sceneId = demoId(project, `scene-${index}`), passageId = demoId(project, `passage-${index}`);
+    const current = project.passages.find(passage => passage.id === passageId);
+    commands.push({ type: 'putScene', value: { id: sceneId, title: titles[index]!, povId: participants[index === 1 ? 1 : 0] ?? null,
+      castIds: participants.filter(id => id !== participants[index === 1 ? 1 : 0]), ...(tower ? { settingIds: [tower.id] } : {}),
+      eventIds: hasEvents ? [demoId(project, `event-${index}`)] : [], outline: outlines[index]! } },
+    { type: 'putPassage', value: { id: passageId, sceneId, chapterId, order: index + 1, text: current?.text ?? '' } },
     { type: 'putCard', value: { id: demoId(project, `card-scene-${index}`), kind: 'scene', refId: sceneId, title: titles[index]!, content: outlines[index]!, x: 80 + index * 360, y: 600 } });
     if (index) commands.push({ type: 'putCanvasLink', value: { id: demoId(project, `link-scene-${index}`), source: demoId(project, `card-scene-${index - 1}`), target: demoId(project, `card-scene-${index}`) } });
   }

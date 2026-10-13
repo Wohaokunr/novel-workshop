@@ -1,7 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
-import type { CanvasCard, Command, Workspace, NovelObject, ObjectType } from '../shared/types.js';
+import type { CanvasCard, Command, NarrativeScene, Workspace, NovelObject, ObjectType } from '../shared/types.js';
 import { personNames, STYLE_KEYS, STYLE_LIMITS, STYLE_SCALES, styleProfile, type StyleProfile } from '../shared/style-types.js';
+import { ASPECT_KEY_CHARS, ASPECT_VALUE_CHARS, MAX_STATE_ASPECTS } from '../shared/story-state.js';
+import { chapterProse, orderedChapters, passageOrderAt } from '../shared/structure.js';
+import { upgradeCommand } from './upgrade.js';
 
 export const builtinTypes: ObjectType[] = [
   { id: 'character', name: '人物', builtin: true, fields: [
@@ -21,18 +24,19 @@ export const builtinTypes: ObjectType[] = [
 
 export function createWorkspace(title: string, id: string = randomUUID()): Workspace {
   const workspace: Workspace = {
-    schemaVersion: 1, id, title: title.trim() || '未命名小说', brief: '', genre: '', audience: '', theme: '', logline: '', structureTemplate: '', acts: [], revision: 0,
+    schemaVersion: 2, id, title: title.trim() || '未命名小说', brief: '', genre: '', audience: '', theme: '', logline: '', structureTemplate: '', acts: [], revision: 0,
     objectTypes: structuredClone(builtinTypes), objects: [],
-    chapters: [{ id: randomUUID(), title: '第一章', order: 0 }], scenes: [],
-    facts: [], knowledge: [], characterStates: [], cards: [], canvasLinks: [], layouts: {},
+    chapters: [{ id: randomUUID(), title: '第一章', order: 0 }], scenes: [], passages: [],
+    facts: [], knowledge: [], stateChanges: [], cards: [], canvasLinks: [], layouts: {},
     reading: { scroll: 0, fontSize: 20, lineHeight: 1.9, theme: 'paper' },
   };
   validateWorkspace(workspace);
   return workspace;
 }
 
-/** Project-level string fields that updateNovel may patch. */
+/** Project-level string fields that updateNovel may patch; it may also set chapterTarget (null returns to the default). */
 export const NOVEL_FIELDS = ['title', 'brief', 'genre', 'audience', 'theme', 'logline', 'structureTemplate'] as const;
+export const CHAPTER_TARGET_RANGE = [100, 100_000] as const;
 
 export class DomainValidationError extends Error {
   constructor(message: string) { super(message); this.name = 'DomainValidationError'; }
@@ -66,28 +70,30 @@ function strings(value: unknown, label: string): asserts value is string[] {
 
 /** Validate the complete resulting workspace, allowing commands to fix dependencies together. */
 export function validateWorkspace(workspace: Workspace): void {
-  record(workspace, '项目'); check(workspace.schemaVersion === 1, '不支持的项目格式版本');
+  record(workspace, '项目'); check(workspace.schemaVersion === 2, '不支持的项目格式版本');
   text(workspace.id, '项目 ID', true); text(workspace.title, '书名', true);
   for (const key of ['brief', 'genre', 'audience'] as const) text(workspace[key], key);
   if (workspace.theme !== undefined) text(workspace.theme, '小说立意');
   if (workspace.logline !== undefined) text(workspace.logline, '一句话梗概');
   if (workspace.structureTemplate !== undefined) text(workspace.structureTemplate, '结构模板');
   check(Number.isSafeInteger(workspace.revision) && workspace.revision >= 0, '项目修订号无效');
+  if (workspace.chapterTarget !== undefined) check(Number.isSafeInteger(workspace.chapterTarget) && workspace.chapterTarget >= CHAPTER_TARGET_RANGE[0]
+    && workspace.chapterTarget <= CHAPTER_TARGET_RANGE[1], `每章目标字数须是 ${CHAPTER_TARGET_RANGE[0]}–${CHAPTER_TARGET_RANGE[1]} 的整数`);
   const types = ids(workspace.objectTypes, '对象类型');
   const objects = ids(workspace.objects, '对象');
-  check(workspace.acts === undefined || Array.isArray(workspace.acts), '大纲幕/卷必须是列表');
-  const acts = ids(workspace.acts ?? [], '大纲幕/卷');
+  check(workspace.acts === undefined || Array.isArray(workspace.acts), '卷必须是列表');
+  const acts = ids(workspace.acts ?? [], '卷');
   const actOrders = new Set<number>();
   for (const act of acts.values()) {
-    text(act.title, '幕/卷标题', true); number(act.order, '幕/卷顺序'); text(act.purpose, '幕/卷作用'); text(act.summary, '幕/卷概要');
-    check(!actOrders.has(act.order), '幕/卷顺序不能重复'); actOrders.add(act.order);
+    text(act.title, '卷标题', true); number(act.order, '卷顺序'); text(act.purpose, '卷的作用'); text(act.summary, '卷概要');
+    check(!actOrders.has(act.order), '卷的顺序不能重复'); actOrders.add(act.order);
   }
   const chapters = ids(workspace.chapters, '章节');
   const scenes = ids(workspace.scenes, '场景');
+  const passages = ids(workspace.passages, '场景段');
   const facts = ids(workspace.facts, '事实');
   ids(workspace.knowledge, '角色知识');
-  check(workspace.characterStates === undefined || Array.isArray(workspace.characterStates), '人物演进状态必须是列表');
-  const characterStates = ids(workspace.characterStates ?? [], '人物演进状态');
+  const stateChanges = ids(workspace.stateChanges, '状态变化');
   const cards = ids(workspace.cards, '画布卡片');
   ids(workspace.canvasLinks, '画布关联');
   for (const builtin of builtinTypes) check(types.get(builtin.id)?.builtin === true, `内置类型 ${builtin.name} 不可删除或改为自定义类型`);
@@ -153,18 +159,24 @@ export function validateWorkspace(workspace: Workspace): void {
     text(chapter.title, '章节标题', true); number(chapter.order, '章节顺序');
     check(!chapterOrders.has(chapter.order), '章节阅读顺序不能重复'); chapterOrders.add(chapter.order);
     if (chapter.summary !== undefined) text(chapter.summary, '章节概要');
-    if (chapter.actId !== undefined) check(acts.has(chapter.actId), '章节所属幕/卷不存在');
+    if (chapter.actId !== undefined) check(acts.has(chapter.actId), '章节所属的卷不存在');
   }
-  const sceneOrders = new Set<string>();
   for (const scene of scenes.values()) {
-    check(chapters.has(scene.chapterId), '场景所属章节不存在');
-    number(scene.order, '场景顺序'); text(scene.title, '场景标题', true);
+    text(scene.title, '场景标题', true);
+    for (const key of ['chapterId', 'order', 'text']) check(!Object.hasOwn(scene, key), `场景「${scene.title}」不再直接属于章节或包含正文（${key}），正文属于场景段`);
     check(scene.povId === null || isCharacter(scene.povId), '场景视角必须是人物或全知视角');
     strings(scene.eventIds, '场景事件'); for (const id of scene.eventIds) check(isEvent(id), '场景引用的事件不存在');
     if (scene.castIds !== undefined) { strings(scene.castIds, '出场人物'); for (const id of scene.castIds) check(isCharacter(id), '出场人物必须是人物'); }
     if (scene.settingIds !== undefined) { strings(scene.settingIds, '场景环境'); for (const id of scene.settingIds) check(objects.has(id) && !isCharacter(id) && !isEvent(id), '场景环境必须是环境或设定对象'); }
-    text(scene.outline, '场景大纲'); text(scene.text, '场景正文');
-    const key = `${scene.chapterId}:${scene.order}`; check(!sceneOrders.has(key), '同一章节的场景顺序不能重复'); sceneOrders.add(key);
+    text(scene.outline, '场景大纲');
+  }
+  const passageOrders = new Set<string>();
+  for (const passage of passages.values()) {
+    check(scenes.has(passage.sceneId), '场景段所属的场景不存在');
+    check(chapters.has(passage.chapterId), '场景段所属的章节不存在');
+    number(passage.order, '场景段顺序'); text(passage.text, '正文');
+    if (passage.beat !== undefined) text(passage.beat, '场景段要点');
+    const key = `${passage.chapterId}:${passage.order}`; check(!passageOrders.has(key), '同一章节中场景段的顺序不能重复'); passageOrders.add(key);
   }
   for (const fact of facts.values()) {
     check(objects.has(fact.subjectId), '事实所属对象不存在'); text(fact.key, '事实属性', true); text(fact.value, '事实内容');
@@ -191,15 +203,27 @@ export function validateWorkspace(workspace: Workspace): void {
       }
     }
   }
-  const stateAnchors = new Set<string>();
-  for (const state of characterStates.values()) {
-    check(isCharacter(state.characterId), '演进状态所属人物不存在');
-    check(isEvent(state.eventId), '演进状态锚定事件不存在');
-    for (const key of ['perspective', 'psychology', 'motivation', 'evidence'] as const) text(state[key], `人物状态 ${key}`);
-    strings(state.sceneIds, '人物状态正文证据');
-    for (const id of state.sceneIds) check(scenes.get(id)?.eventIds.includes(state.eventId), '人物状态的正文证据必须引用锚定事件');
-    const key = JSON.stringify([state.characterId, state.eventId]);
-    check(!stateAnchors.has(key), '同一人物在同一事件只能有一个演进状态'); stateAnchors.add(key);
+  const changeAnchors = new Set<string>();
+  for (const change of stateChanges.values()) {
+    const subject = objects.get(change.subjectId);
+    check(subject && !subject.event, '状态变化必须属于人物、环境或其它设定对象');
+    check(change.sceneId !== undefined || change.eventId !== undefined, '状态变化需要所在场景或世界事件');
+    if (change.sceneId !== undefined) check(scenes.has(change.sceneId), '状态变化所在的场景不存在');
+    if (change.passageId !== undefined) check(change.sceneId !== undefined && passages.get(change.passageId)?.sceneId === change.sceneId, '状态变化所在的场景段不属于该场景');
+    if (change.eventId !== undefined) {
+      check(isEvent(change.eventId), '状态变化对应的世界事件不存在');
+      if (change.sceneId !== undefined) check(scenes.get(change.sceneId)!.eventIds.includes(change.eventId), '状态变化对应的事件不在该场景中');
+    }
+    record(change.aspects, '状态内容');
+    const aspects = Object.entries(change.aspects);
+    check(aspects.length >= 1 && aspects.length <= MAX_STATE_ASPECTS, `一条状态变化写 1–${MAX_STATE_ASPECTS} 个方面`);
+    for (const [key, value] of aspects) {
+      check(key.trim() === key && key.length >= 1 && key.length <= ASPECT_KEY_CHARS, `状态方面的名称须为 1–${ASPECT_KEY_CHARS} 字`);
+      text(value, `状态「${key}」`, true); check(value.length <= ASPECT_VALUE_CHARS, `状态「${key}」过长`);
+    }
+    if (change.note !== undefined) text(change.note, '状态变化备注');
+    const anchor = JSON.stringify([change.subjectId, change.sceneId ?? null, change.passageId ?? null, change.eventId ?? null]);
+    check(!changeAnchors.has(anchor), `${subject.name}在同一位置只能有一条状态变化`); changeAnchors.add(anchor);
   }
   for (const card of cards.values()) {
     check(['note', 'object', 'scene', 'group'].includes(card.kind), '画布卡片类型无效');
@@ -254,7 +278,7 @@ function validateStyle(style: StyleProfile, isCharacter: (id: string) => boolean
     text(sample.label, '范文标题'); text(sample.text, '范文内容', true);
     check(sample.text.length <= STYLE_LIMITS.sampleChars, `单段范文最多 ${STYLE_LIMITS.sampleChars} 字`);
     check(sample.source === 'own' || sample.source === 'reference', '范文来源无效');
-    for (const key of ['sceneId', 'author', 'note'] as const) if (sample[key] !== undefined) text(sample[key], `范文 ${key}`);
+    for (const key of ['passageId', 'author', 'note'] as const) if (sample[key] !== undefined) text(sample[key], `范文 ${key}`);
     check(sample.pinned === undefined || typeof sample.pinned === 'boolean', '范文置顶标记无效');
     total += sample.text.length;
   }
@@ -297,10 +321,24 @@ function cleanFacts(workspace: Workspace, removed: Set<string>): void {
   for (const fact of workspace.facts) if (fact.replacesId && removed.has(fact.replacesId)) delete fact.replacesId;
   for (const knowledge of workspace.knowledge) if (knowledge.factId && removed.has(knowledge.factId)) delete knowledge.factId;
 }
+/** A scene goes with its passages and the state changes that happen in it. */
 function deleteScenes(workspace: Workspace, removed: Set<string>): void {
   workspace.scenes = workspace.scenes.filter(scene => !removed.has(scene.id));
-  for (const state of workspace.characterStates ?? []) state.sceneIds = state.sceneIds.filter(id => !removed.has(id));
+  const passages = new Set(workspace.passages.filter(passage => removed.has(passage.sceneId)).map(passage => passage.id));
+  workspace.passages = workspace.passages.filter(passage => !passages.has(passage.id));
+  workspace.stateChanges = workspace.stateChanges.filter(change => !change.sceneId || !removed.has(change.sceneId));
   cleanCards(workspace, new Set(workspace.cards.filter(card => card.kind === 'scene' && card.refId && removed.has(card.refId)).map(card => card.id)));
+  for (const id of [...removed, ...passages]) cleanLayout(workspace, id);
+}
+/** Changes on a removed passage stay with its scene as changes of the whole scene, unless the scene already has one for that subject. */
+function deletePassages(workspace: Workspace, removed: Set<string>): void {
+  workspace.passages = workspace.passages.filter(passage => !removed.has(passage.id));
+  const kept = workspace.stateChanges.filter(change => !change.passageId || !removed.has(change.passageId));
+  for (const change of workspace.stateChanges) if (change.passageId && removed.has(change.passageId)) {
+    const lifted = { ...change }; delete lifted.passageId;
+    if (!kept.some(other => other.subjectId === lifted.subjectId && other.sceneId === lifted.sceneId && !other.passageId && other.eventId === lifted.eventId)) kept.push(lifted);
+  }
+  workspace.stateChanges = kept;
   for (const id of removed) cleanLayout(workspace, id);
 }
 function deleteObject(workspace: Workspace, id: string): void {
@@ -325,7 +363,9 @@ function deleteObject(workspace: Workspace, id: string): void {
   }
   cleanFacts(workspace, new Set(workspace.facts.filter(fact => fact.subjectId === id || fact.fromEventId === id).map(fact => fact.id)));
   workspace.knowledge = workspace.knowledge.filter(item => item.characterId !== id && item.learnedAt !== id);
-  workspace.characterStates = (workspace.characterStates ?? []).filter(state => state.characterId !== id && state.eventId !== id);
+  // A change placed in a scene outlives its event; one placed only at the event goes with it.
+  workspace.stateChanges = workspace.stateChanges.filter(change => change.subjectId !== id && (change.eventId !== id || change.sceneId !== undefined));
+  for (const change of workspace.stateChanges) if (change.eventId === id) delete change.eventId;
   for (const item of workspace.knowledge) if (item.fromCharacterId === id) delete item.fromCharacterId;
   cleanCards(workspace, new Set(workspace.cards.filter(card => card.kind === 'object' && card.refId === id).map(card => card.id)));
   if (workspace.style) workspace.style.voices = workspace.style.voices.filter(voice => voice.characterId !== id);
@@ -340,9 +380,9 @@ export function cardContent({ x: _x, y: _y, width: _width, height: _height, coll
 
 function semantic(workspace: Workspace): unknown {
   return { title: workspace.title, brief: workspace.brief, genre: workspace.genre, audience: workspace.audience, theme: workspace.theme ?? '',
-    logline: workspace.logline ?? '', structureTemplate: workspace.structureTemplate ?? '', acts: workspace.acts ?? [],
-    objectTypes: workspace.objectTypes, objects: workspace.objects, chapters: workspace.chapters,
-    scenes: workspace.scenes, facts: workspace.facts, knowledge: workspace.knowledge, characterStates: workspace.characterStates ?? [],
+    logline: workspace.logline ?? '', structureTemplate: workspace.structureTemplate ?? '', acts: workspace.acts ?? [], chapterTarget: workspace.chapterTarget ?? null,
+    objectTypes: workspace.objectTypes, objects: workspace.objects, chapters: workspace.chapters, scenes: workspace.scenes, passages: workspace.passages,
+    facts: workspace.facts, knowledge: workspace.knowledge, stateChanges: workspace.stateChanges,
     cards: workspace.cards.map(cardContent), canvasLinks: workspace.canvasLinks, style: styleProfile(workspace) };
 }
 
@@ -353,19 +393,25 @@ export function hasSemanticChanges(before: Workspace, after: Workspace): boolean
 export function applyCommands(workspace: Workspace, commands: Command[]): Workspace {
   check(Array.isArray(commands), '操作必须是列表');
   const next = structuredClone(workspace);
-  next.characterStates ??= [];
+  next.passages ??= []; next.stateChanges ??= [];
   next.theme ??= ''; next.logline ??= ''; next.structureTemplate ??= ''; next.acts ??= [];
-  for (const command of commands) {
-    record(command, '操作');
-    text(command.type, '操作类型', true);
+  for (const raw of commands) {
+    record(raw, '操作');
+    text(raw.type, '操作类型', true);
+    const command = upgradeCommand(raw);
     if (command.type.startsWith('delete')) text((command as { id?: unknown }).id, '删除 ID', true);
     switch (command.type) {
       case 'updateNovel': {
         record(command.patch, '小说更新');
         for (const [key, value] of Object.entries(command.patch)) {
+          if (key === 'chapterTarget') {
+            if (value === null) delete next.chapterTarget; else { number(value, '每章目标字数'); next.chapterTarget = value; }
+            continue;
+          }
           check(NOVEL_FIELDS.includes(key as typeof NOVEL_FIELDS[number]), '不允许修改此项目字段'); text(value, key);
+          next[key as typeof NOVEL_FIELDS[number]] = value;
         }
-        Object.assign(next, command.patch); break;
+        break;
       }
       case 'updateStyle': {
         record(command.patch, '文风更新');
@@ -393,23 +439,46 @@ export function applyCommands(workspace: Workspace, commands: Command[]): Worksp
         next.acts = next.acts.filter(act => act.id !== command.id);
         for (const chapter of next.chapters) if (chapter.actId === command.id) delete chapter.actId;
         break;
-      case 'deleteChapter':
-        deleteScenes(next, new Set(next.scenes.filter(scene => scene.chapterId === command.id).map(scene => scene.id)));
+      case 'deleteChapter': {
+        // Its passages go with it, and so do the scenes that had prose only in this chapter; scenes running on elsewhere stay.
+        const removed = next.passages.filter(passage => passage.chapterId === command.id);
+        const orphans = new Set(removed.map(passage => passage.sceneId).filter(sceneId => next.passages.every(passage => passage.sceneId !== sceneId || passage.chapterId === command.id)));
+        deletePassages(next, new Set(removed.map(passage => passage.id)));
+        deleteScenes(next, orphans);
         next.chapters = next.chapters.filter(chapter => chapter.id !== command.id);
         if (next.reading.chapterId === command.id) { delete next.reading.chapterId; next.reading.scroll = 0; }
         break;
-      case 'putScene':
-        put(next.scenes, command.value);
-        strings(command.value.eventIds, '场景事件');
-        for (const state of next.characterStates) state.sceneIds = state.sceneIds.filter(id => id !== command.value.id || command.value.eventIds.includes(state.eventId));
+      }
+      case 'putScene': {
+        record(command.value, '场景');
+        // Format 1 kept a scene's prose on it, in one chapter: that part becomes the passage sharing the scene's id.
+        const { chapterId, order, text: prose, ...scene } = command.value as NarrativeScene & { chapterId?: unknown; order?: unknown; text?: unknown };
+        put(next.scenes, scene);
+        strings(scene.eventIds, '场景事件');
+        for (const change of next.stateChanges) if (change.sceneId === scene.id && change.eventId !== undefined && !scene.eventIds.includes(change.eventId)) delete change.eventId;
+        if (chapterId !== undefined || order !== undefined || prose !== undefined) {
+          const existing = next.passages.find(passage => passage.id === scene.id), target = chapterId ?? existing?.chapterId;
+          text(target, '场景正文所属章节', true);
+          put(next.passages, { id: scene.id, sceneId: scene.id, chapterId: target, text: prose === undefined ? existing?.text ?? '' : prose as string,
+            order: order === undefined ? existing?.chapterId === target ? existing.order : passageOrderAt(next, target) : order as number,
+            ...(existing?.beat !== undefined ? { beat: existing.beat } : {}) });
+        }
         break;
+      }
       case 'deleteScene': deleteScenes(next, new Set([command.id])); break;
+      case 'putPassage': {
+        put(next.passages, command.value);
+        // A passage handed to another scene takes none of the old scene's changes along.
+        for (const change of next.stateChanges) if (change.passageId === command.value.id && change.sceneId !== command.value.sceneId) delete change.passageId;
+        break;
+      }
+      case 'deletePassage': deletePassages(next, new Set([command.id])); break;
       case 'putFact': put(next.facts, command.value); break;
       case 'deleteFact': cleanFacts(next, new Set([command.id])); break;
       case 'putKnowledge': put(next.knowledge, command.value); break;
       case 'deleteKnowledge': next.knowledge = next.knowledge.filter(item => item.id !== command.id); break;
-      case 'putCharacterState': put(next.characterStates, command.value); break;
-      case 'deleteCharacterState': next.characterStates = next.characterStates.filter(item => item.id !== command.id); break;
+      case 'putStateChange': put(next.stateChanges, command.value); break;
+      case 'deleteStateChange': next.stateChanges = next.stateChanges.filter(item => item.id !== command.id); break;
       case 'putCard': put(next.cards, command.value); break;
       case 'deleteCard': cleanCards(next, new Set([command.id])); break;
       case 'putCanvasLink': put(next.canvasLinks, command.value); break;
@@ -424,7 +493,8 @@ export function applyCommands(workspace: Workspace, commands: Command[]): Worksp
   return next;
 }
 
+/** The book's prose for export: every chapter with its title, or one chapter's prose alone. */
 export function chapterText(workspace: Workspace, chapterId?: string): string {
-  return [...workspace.chapters].sort((a, b) => a.order - b.order).filter(chapter => !chapterId || chapter.id === chapterId)
-    .map(chapter => [...(chapterId ? [] : [chapter.title]), ...workspace.scenes.filter(scene => scene.chapterId === chapter.id).sort((a, b) => a.order - b.order).map(scene => scene.text).filter(Boolean)].join('\n\n')).join('\n\n');
+  return orderedChapters(workspace).filter(chapter => !chapterId || chapter.id === chapterId)
+    .map(chapter => [...(chapterId ? [] : [chapter.title]), chapterProse(workspace, chapter.id)].filter(Boolean).join('\n\n')).join('\n\n');
 }

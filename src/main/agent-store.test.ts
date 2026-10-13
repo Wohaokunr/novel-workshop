@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { KEEP_FINISHED_SNAPSHOTS, NovelStore } from './store.js';
-import { STORE_SCHEMA_VERSION } from './migrations.js';
+import { STORE_SCHEMA_VERSION, UPGRADE_STOPPED_RUN } from './migrations.js';
 import { applyCommands, createWorkspace } from './domain.js';
 import type { AgentRun, CanvasCard, Command, OperationBatch, Workspace } from '../shared/types.js';
 import type { AgentCandidate, AgentDecision, AgentMemory, AgentReceipt, AgentState } from '../shared/agent-types.js';
@@ -59,15 +59,19 @@ function completeCheckpoint(state: AgentState, result: unknown): void {
 
 const note = (id: string, patch: Partial<CanvasCard> = {}): CanvasCard => ({ id, kind: 'note', title: id, content: '原文', x: 10, y: 20, ...patch });
 
-test('迁移无版本旧 SQLite：保留作品、历史、runs，重开后仍可执行和撤销', t => {
+test('迁移无版本旧 SQLite：作品升级为独立场景与场景段，历史仍可撤销，未完成的任务结束并说明原因', t => {
   const directory = mkdtempSync(join(tmpdir(), 'novel-agent-migration-')), filename = join(directory, 'old.sqlite');
   t.after(() => rmSync(directory, { recursive: true, force: true }));
-  const original = createWorkspace('旧作品');
-  const old = applyCommands(original, [{ type: 'updateNovel', patch: { brief: '旧构思' } }]);
-  delete old.theme; delete old.characterStates;
+  const original = createWorkspace('旧作品'), chapterId = original.chapters[0]!.id;
+  const current = applyCommands(original, [{ type: 'updateNovel', patch: { brief: '旧构思' } }, { type: 'putObject', value: { id: 'lin', typeId: 'character', name: '林舟', fields: {} } }]);
+  const { passages: _passages, stateChanges: _changes, theme: _theme, ...rest } = current;
+  // Format 1: the scene holds its prose and its place in one chapter; characters had states per event.
+  const scene = { id: 'scene', chapterId, order: 0, title: '开场', povId: 'lin', eventIds: [], outline: '', text: '雨夜。' };
+  const old = { ...rest, schemaVersion: 1, scenes: [scene], characterStates: [] };
   const batch: OperationBatch = { id: 'old-operation', projectId: old.id, actor: 'human', at, label: '旧历史', undone: false,
-    changes: [{ collection: 'metadata', key: 'brief', before: '', after: '旧构思' }] };
+    changes: [{ collection: 'metadata', key: 'brief', before: '', after: '旧构思' }, { collection: 'scenes', key: 'scene', before: { ...scene, text: '' }, after: scene }] };
   const run: AgentRun = { ...makeRun(old.id, 'old-run'), stage: 'outline', status: 'completed' };
+  const pending = { ...makeRun(old.id, 'pending-run'), stage: 'chapter', status: 'running', sceneId: 'scene' };
   const oldJSON = JSON.stringify(old), db = new DatabaseSync(filename);
   db.exec(`CREATE TABLE projects(id TEXT PRIMARY KEY,title TEXT NOT NULL,revision INTEGER NOT NULL,updated_at TEXT NOT NULL,data TEXT NOT NULL);
     CREATE TABLE operations(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id),data TEXT NOT NULL);
@@ -75,14 +79,25 @@ test('迁移无版本旧 SQLite：保留作品、历史、runs，重开后仍可
   db.prepare('INSERT INTO projects VALUES(?,?,?,?,?)').run(old.id, old.title, old.revision, at, oldJSON);
   db.prepare('INSERT INTO operations VALUES(?,?,?)').run(batch.id, old.id, JSON.stringify(batch));
   db.prepare('INSERT INTO runs VALUES(?,?,?,?)').run(run.id, old.id, at, JSON.stringify(run));
+  db.prepare('INSERT INTO runs VALUES(?,?,?,?)').run(pending.id, old.id, at, JSON.stringify(pending));
   db.close();
   let store = new NovelStore(filename);
   try {
     assert.equal(row(filename, 'PRAGMA user_version').user_version, STORE_SCHEMA_VERSION);
-    assert.equal(row(filename, 'SELECT data FROM projects').data, oldJSON, '迁移不重写旧作品 JSON');
-    assert.equal(store.getProject(old.id).brief, '旧构思');
-    assert.equal(store.getProject(old.id).theme, ''); assert.deepEqual(store.getProject(old.id).characterStates, []);
-    assert.deepEqual(store.history(old.id), [batch]); assert.deepEqual(store.getRuns(old.id), [run]);
+    const upgraded = JSON.parse(row(filename, 'SELECT data FROM projects').data as string) as Workspace;
+    assert.notEqual(JSON.stringify(upgraded), oldJSON);
+    assert.equal(upgraded.schemaVersion, 2);
+    assert.deepEqual(upgraded.scenes, [{ id: 'scene', title: '开场', povId: 'lin', eventIds: [], outline: '' }]);
+    assert.deepEqual(upgraded.passages, [{ id: 'scene', sceneId: 'scene', chapterId, order: 0, text: '雨夜。' }]);
+    const project = store.getProject(old.id);
+    assert.equal(project.brief, '旧构思'); assert.equal(project.theme, ''); assert.deepEqual(project.stateChanges, []);
+    // The scene's prose edit is now an edit of its passage, so undoing it still works.
+    assert.deepEqual(store.history(old.id), [{ ...batch, changes: [batch.changes[0]!,
+      { collection: 'passages', key: 'scene', before: { id: 'scene', sceneId: 'scene', chapterId, order: 0, text: '' }, after: upgraded.passages[0] }] }]);
+    const runs = store.getRuns(old.id);
+    assert.deepEqual(runs.find(item => item.id === run.id), run);
+    const stopped = runs.find(item => item.id === pending.id)!;
+    assert.deepEqual([stopped.status, stopped.error, stopped.passageId, 'sceneId' in stopped, !!stopped.finishedAt], ['failed', UPGRADE_STOPPED_RUN, 'scene', false, true]);
     assert.deepEqual(store.listAgentStates(), []);
     const sessionId = store.getSession(old.id).id;
     store.close(); store = new NovelStore(filename);
@@ -90,8 +105,9 @@ test('迁移无版本旧 SQLite：保留作品、历史、runs，重开后仍可
     const next = store.execute({ projectId: old.id, actor: 'ai', expectedRevision: old.revision, taskId: 'new-task', commands: [{ type: 'updateNovel', patch: { theme: '新立意' } }] });
     assert.equal(next.revision, old.revision + 1);
     assert.equal(store.undo(old.id, 'new-task').theme, '');
-    assert.equal(store.undo(old.id, batch.id).brief, '');
-    assert.equal(store.getRuns(old.id)[0]!.id, run.id);
+    const undone = store.undo(old.id, batch.id);
+    assert.equal(undone.brief, ''); assert.equal(undone.passages[0]!.text, '');
+    assert.ok(store.getRuns(old.id).some(item => item.id === run.id));
   } finally { store.close(); }
 });
 
@@ -190,11 +206,12 @@ test('批准必须等待 matching candidate/hash，取消/暂停/失败运行不
 test('正文候选审批必须有当前版本的独立审查；设定候选可免审；作者可以接受带修订建议的候选', t => {
   const { store } = temporaryStore(t);
   const created = store.createProject('正文审批');
-  const withScene = store.execute({ projectId: created.id, actor: 'human', commands: [{ type: 'putScene', value: { id: 's1', chapterId: created.chapters[0]!.id, order: 1, title: '开场', povId: null, eventIds: [], outline: '', text: '' } }] });
-  const prose = candidateFixture(store, [{ type: 'putScene', value: { ...withScene.scenes[0]!, text: '新的正文' } }], withScene);
+  const withScene = store.execute({ projectId: created.id, actor: 'human', commands: [{ type: 'putScene', value: { id: 's1', title: '开场', povId: null, eventIds: [], outline: '' } },
+    { type: 'putPassage', value: { id: 's1', sceneId: 's1', chapterId: created.chapters[0]!.id, order: 1, text: '' } }] });
+  const prose = candidateFixture(store, [{ type: 'putPassage', value: { ...withScene.passages[0]!, text: '新的正文' } }], withScene);
   const proseState = structuredClone(prose.state); proseState.candidates[0]!.reviews = []; store.saveAgentState(proseState);
   assert.throws(() => store.commitAgentCandidate(prose.decision, completeCheckpoint), /REVIEW_REQUIRED/);
-  assert.equal(store.getProject(withScene.id).scenes[0]!.text, '');
+  assert.equal(store.getProject(withScene.id).passages[0]!.text, '');
   const f = candidateFixture(store);
   const stale = structuredClone(f.state); stale.candidates[0]!.reviews = [{ ...f.candidate.reviews[0]!, candidateHash: 'old-hash' }]; store.saveAgentState(stale);
   assert.throws(() => store.commitAgentCandidate(f.decision, completeCheckpoint), /REVIEW_REQUIRED/);

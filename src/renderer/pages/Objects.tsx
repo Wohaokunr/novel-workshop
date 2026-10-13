@@ -1,7 +1,7 @@
 import { useCallback, useContext, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { ArrowDown, ArrowUp, ArrowRight, ArrowLeft, BookOpen, Check, ChevronRight, CircleAlert, Download, FileText, FolderPlus, History, LayoutDashboard, Lightbulb, ListTree, PanelLeftClose, PanelLeftOpen, Plus, Settings2, Sparkles, Trash2, Undo2, Upload, X, Moon, Sun } from 'lucide-react';
-import { ActionCancelled, ActionMenu, Dialog, Toast, SaveFeedbackContext, Field, Select, Empty, MultiPicker, uid, fire, colors, stageNames, statuses, assistTools, taskLabel, taskObjective, canResumeRun, characters, orderedChapters, orderedScenes, sceneFor, events, showValue, isAgentRun, isRunActive, runStatus, type Commit, type TaskDraft } from '../ui';
+import { ActionCancelled, ActionMenu, Dialog, Toast, SaveFeedbackContext, Field, Select, Empty, MultiPicker, uid, fire, colors, stageNames, statuses, assistTools, taskLabel, taskObjective, canResumeRun, characters, orderedChapters, orderedScenes, passageFor, events, showValue, isAgentRun, isRunActive, runStatus, type Commit, type TaskDraft } from '../ui';
 import type { Workspace, Command, ProjectSummary, NovelObject, ObjectType, NarrativeScene, AgentRun, ProviderSettings, ProviderInput, OperationBatch, RunRequest, FieldValue, SourceReference, AssistTool } from '../../shared/types';
 import { canvasAction, type View, type AskAction, type RegisterFlush, type AssistAction, type OpenCanvas, type AskDelete } from '../types';
 import { ObjectForm } from '../forms';

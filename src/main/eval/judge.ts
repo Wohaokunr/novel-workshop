@@ -44,7 +44,8 @@ function sides(verdict: Verdict, baselineFirst: boolean) {
 const agree = (first: JudgeSide, second: JudgeSide): JudgeSide => first === second ? first : 'tie';
 
 function judgeContext(benchCase: BenchCase, project: Workspace, before: TaskResult, a: string, b: string) {
-  const task = benchCase.tasks.find(item => item.id === before.taskId), scene = project.scenes.find(item => item.id === task?.sceneId);
+  const task = benchCase.tasks.find(item => item.id === before.taskId);
+  const scene = project.scenes.find(item => item.id === project.passages.find(passage => passage.id === task?.passageId)?.sceneId);
   return { task: task?.objective ?? '', outline: scene?.outline ?? '', style: { summary: project.style?.summary ?? '', rules: project.style?.rules.map(rule => rule.content) ?? [],
     avoidWords: project.style?.avoidWords ?? [] }, authorRules: benchCase.rules.map(rule => rule.content), A: a, B: b };
 }

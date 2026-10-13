@@ -5,7 +5,7 @@ import type { AgentRun, ProviderSecret, RunRequest, Workspace } from '../shared/
 import type { CompanionOp } from '../shared/companion-types.js';
 import { emptyStyle, styleProfile, type StyleProfile } from '../shared/style-types.js';
 import { AI_CLICHES, styleBaseline, styleDirectives, styleFingerprint, styleLint } from '../shared/style-metrics.js';
-import { authoredScenes, deletedWords, editPairs } from '../shared/style-provenance.js';
+import { authoredPassages, deletedWords, editPairs } from '../shared/style-provenance.js';
 import { companionCommands, selectCompanionItems } from '../shared/companion.js';
 import { applyCommands, createWorkspace, DomainValidationError } from './domain.js';
 import { buildWriterContext, WRITER_PRIORITY } from './context.js';
@@ -24,7 +24,8 @@ function sample(): Workspace {
   return applyCommands(base, [
     { type: 'putObject', value: { id: 'lin', typeId: 'character', name: '林舟', fields: {} } },
     { type: 'putObject', value: { id: 'shen', typeId: 'character', name: '沈卿', fields: {} } },
-    { type: 'putScene', value: { id: 's1', chapterId: chapter.id, order: 1, title: '雨夜', povId: 'lin', eventIds: [], outline: '林舟在雨里等人', text: '' } },
+    { type: 'putScene', value: { id: 's1', title: '雨夜', povId: 'lin', eventIds: [], outline: '林舟在雨里等人' } },
+    { type: 'putPassage', value: { id: 's1', sceneId: 's1', chapterId: chapter.id, order: 1, text: '' } },
   ]);
 }
 
@@ -105,7 +106,7 @@ test('写作上下文带上文风：范文受预算限制、参考范文附说�
 });
 
 test('正文任务不能顺带修改文风档案', () => {
-  const before = sample(), request: RunRequest = { projectId: before.id, stage: 'chapter', objective: '写', sceneId: 's1', chapterId: before.chapters[0]!.id };
+  const before = sample(), request: RunRequest = { projectId: before.id, stage: 'chapter', objective: '写', passageId: 's1', chapterId: before.chapters[0]!.id };
   const after = applyCommands(before, [{ type: 'updateStyle', patch: { summary: '偷偷改' } }]);
   assert.throws(() => assertWriteScope(request, before, after, [{ collection: 'style', key: 'summary', before: '', after: '偷偷改' }]), /文风/);
 });
@@ -114,18 +115,18 @@ test('改稿学习：从操作历史找出被作者改过的 AI 正文，统计�
   const store = new NovelStore(':memory:');
   try {
     const project = store.createProject('改稿'), chapter = project.chapters[0]!;
-    const scene = { id: 's', chapterId: chapter.id, order: 1, title: '雨', povId: null, eventIds: [], outline: '', text: '' };
+    const passage = { id: 's', sceneId: 's', chapterId: chapter.id, order: 1, text: '' };
     const aiText = '他缓缓地抬头。她缓缓地走近。门缓缓地开了。风很冷。';
-    store.execute({ projectId: project.id, actor: 'human', commands: [{ type: 'putScene', value: scene }] });
-    store.execute({ projectId: project.id, actor: 'ai', expectedRevision: store.getProject(project.id).revision, label: 'AI 正文', commands: [{ type: 'putScene', value: { ...scene, text: aiText } }] });
+    store.execute({ projectId: project.id, actor: 'human', commands: [{ type: 'putScene', value: { id: 's', title: '雨', povId: null, eventIds: [], outline: '' } }, { type: 'putPassage', value: passage }] });
+    store.execute({ projectId: project.id, actor: 'ai', expectedRevision: store.getProject(project.id).revision, label: 'AI 正文', commands: [{ type: 'putPassage', value: { ...passage, text: aiText } }] });
     assert.equal(editPairs(store.getProject(project.id), store.history(project.id)).length, 0);
-    assert.equal(authoredScenes(store.getProject(project.id), store.history(project.id)).size, 0);
-    store.execute({ projectId: project.id, actor: 'human', commands: [{ type: 'putScene', value: { ...scene, text: '他抬头。她走近。门开了。风很冷。' } }] });
+    assert.equal(authoredPassages(store.getProject(project.id), store.history(project.id)).size, 0);
+    store.execute({ projectId: project.id, actor: 'human', commands: [{ type: 'putPassage', value: { ...passage, text: '他抬头。她走近。门开了。风很冷。' } }] });
     const pairs = editPairs(store.getProject(project.id), store.history(project.id));
     assert.equal(pairs.length, 1);
     assert.ok(pairs[0]!.hunks.some(hunk => hunk.before.includes('缓缓地') && !hunk.after.includes('缓缓地')));
     assert.deepEqual(deletedWords(pairs)[0], { word: '缓缓地', count: 3 });
-    assert.equal(authoredScenes(store.getProject(project.id), store.history(project.id)).size, 1);
+    assert.equal(authoredPassages(store.getProject(project.id), store.history(project.id)).size, 1);
   } finally { store.close(); }
 });
 
@@ -133,10 +134,10 @@ test('整理改稿偏好只写入待确认建议，同一改稿不重复学习',
   const store = new NovelStore(':memory:');
   try {
     const project = store.createProject('学习'), chapter = project.chapters[0]!;
-    const scene = { id: 's', chapterId: chapter.id, order: 1, title: '雨', povId: null, eventIds: [], outline: '', text: '' };
-    store.execute({ projectId: project.id, actor: 'human', commands: [{ type: 'putScene', value: scene }] });
-    store.execute({ projectId: project.id, actor: 'ai', expectedRevision: store.getProject(project.id).revision, commands: [{ type: 'putScene', value: { ...scene, text: '他缓缓地抬头。她缓缓地走近。门缓缓地开了。' } }] });
-    store.execute({ projectId: project.id, actor: 'human', commands: [{ type: 'putScene', value: { ...scene, text: '他抬头。她走近。门开了。' } }] });
+    const passage = { id: 's', sceneId: 's', chapterId: chapter.id, order: 1, text: '' };
+    store.execute({ projectId: project.id, actor: 'human', commands: [{ type: 'putScene', value: { id: 's', title: '雨', povId: null, eventIds: [], outline: '' } }, { type: 'putPassage', value: passage }] });
+    store.execute({ projectId: project.id, actor: 'ai', expectedRevision: store.getProject(project.id).revision, commands: [{ type: 'putPassage', value: { ...passage, text: '他缓缓地抬头。她缓缓地走近。门缓缓地开了。' } }] });
+    store.execute({ projectId: project.id, actor: 'human', commands: [{ type: 'putPassage', value: { ...passage, text: '他抬头。她走近。门开了。' } }] });
     const events: unknown[] = [];
     const service = new StyleLearningService(store, () => provider, event => events.push(event), () => new DemoStyleTransport());
     assert.equal(service.status(project.id).pendingEdits, 1);
@@ -162,7 +163,8 @@ test('正文候选经过文风审阅；拒稿理由可被收集用于学习', { 
   try {
     const initial = store.createProject('审阅');
     const project = store.execute({ projectId: initial.id, actor: 'human', commands: [
-      { type: 'putScene', value: { id: 'scene-0', chapterId: initial.chapters[0]!.id, order: 0, title: '场景', text: '', outline: '人物面对线索作出选择', povId: null, eventIds: [] } },
+      { type: 'putScene', value: { id: 'scene-0', title: '场景', outline: '人物面对线索作出选择', povId: null, eventIds: [] } },
+      { type: 'putPassage', value: { id: 'scene-0', sceneId: 'scene-0', chapterId: initial.chapters[0]!.id, order: 0, text: '' } },
       { type: 'updateStyle', patch: { summary: '短句为主' } },
     ] });
     let current: RunRequest;
@@ -171,7 +173,7 @@ test('正文候选经过文风审阅；拒稿理由可被收集用于学习', { 
       const demo = new DemoAgentTransport(current, store.getProject(current.projectId));
       return { stream: (request, signal) => { agents.push(request.agentId); return demo.stream(request, signal); } };
     });
-    current = { projectId: project.id, stage: 'chapter', objective: '写这一场', sceneId: 'scene-0', chapterId: project.chapters[0]!.id };
+    current = { projectId: project.id, stage: 'chapter', objective: '写这一场', passageId: 'scene-0', chapterId: project.chapters[0]!.id };
     const run = scheduler.start(current);
     const pending = await until(store, run.id, value => ['awaitingApproval', 'failed', 'completed', 'paused', 'awaitingInput'].includes(value.status));
     assert.equal(pending.status, 'awaitingApproval', pending.error ?? pending.runtime?.pauseReason ?? '');

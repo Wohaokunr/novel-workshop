@@ -18,7 +18,9 @@ export interface CompanionAnchor {
   /** Absolute canvas / graph position used to place adopted cards. */
   point?: { x: number; y: number };
   outlineNode?: { kind: OutlineNodeKind; id?: string };
+  /** The scene the author is at; in the writer, the scene of passageId, the passage being written. */
   sceneId?: string;
+  passageId?: string;
   focus?: CompanionFocus;
 }
 
@@ -26,18 +28,20 @@ export interface CompanionAnchor {
 export interface CompanionQuestion { id: string; question: string; why: string; options?: string[] }
 export type CompanionIdeaKind = 'whatif' | 'twist' | 'conflict' | 'character' | 'setting' | 'theme' | 'beat';
 export interface CompanionIdea { id: string; kind: CompanionIdeaKind; title: string; content: string; hook: string }
-export type CompanionOpKind = 'addAct' | 'updateAct' | 'addChapter' | 'updateChapter' | 'addScene' | 'updateScene' | 'moveScene' | 'addEvent' | 'addCard'
-  | 'updateNovel' | 'addCharacter' | 'updateCharacter' | 'addSetting' | 'updateSetting' | 'link' | 'addCause' | 'updateStyle';
+export type CompanionOpKind = 'addAct' | 'updateAct' | 'addChapter' | 'updateChapter' | 'addScene' | 'updateScene' | 'moveScene' | 'continueScene' | 'changeState'
+  | 'addEvent' | 'addCard' | 'updateNovel' | 'addCharacter' | 'updateCharacter' | 'addSetting' | 'updateSetting' | 'link' | 'addCause' | 'updateStyle';
 /** Flat, strict-schema friendly operation. Empty / null fields mean "not provided" or "unchanged". */
 export interface CompanionOp {
   id: string; op: CompanionOpKind;
   /** Temporary handle for new items so later ops can reference them. */
   ref: string | null;
-  /** Existing entity id for update / move ops, the effect event for a new cause, or the chapter a new chapter follows. */
+  /** Existing entity id for update / move ops (a scene, or one passage of it), the effect event for a new cause, the chapter a new
+   * chapter follows, the scene a continueScene carries on, or the character / setting whose state changeState records. */
   targetId: string | null;
+  /** The parent: a chapter's volume, a scene's chapter, a link's other end, or the scene (or passage) where changeState happens. */
   parentRef: string | null; parentId: string | null;
   title: string | null; content: string | null; purpose: string | null;
-  /** 1-based position among siblings; null appends. */
+  /** 1-based position among siblings (for scene ops, among the chapter's passages); null appends. */
   order: number | null;
   povName: string | null;
   causes: string[];
@@ -45,9 +49,10 @@ export interface CompanionOp {
   people: string[];
   /** Scene ops: settings (names, ids or refs) where the scene happens. Missing on older stored threads. */
   places?: string[];
-  /** Scene ops: world events (ids, refs or names) the scene presents. */
+  /** Scene ops: world events (ids, refs or names) the scene presents; changeState: the event the change comes with. */
   events?: string[];
-  /** updateNovel: which work field content replaces; updateStyle: summary, dial:<id>, rule:do, rule:avoid, preferWords, avoidWords or voice. */
+  /** updateNovel: which work field content replaces; updateStyle: summary, dial:<id>, rule:do, rule:avoid, preferWords, avoidWords or voice;
+   * changeState: the aspect that changes (心理、视角、认知、动机、状态、氛围 or the author's own, such as 境界). */
   field?: string | null;
 }
 /** Result of applying a proposal to the work right after it was generated: ops adoption would skip, or why it cannot apply at all. */

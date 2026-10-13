@@ -22,7 +22,7 @@ export function Monitor({ workspace, runs, history, selectedRun, onSelectedRun, 
   const run = runs.find(r => r.id === selectedRun) || runs[0];
   const active = runs.some(isRunActive);
   const visible = runs.filter(item => matches(item, filter));
-  const labels: Record<string, string> = { novel: '作品信息', objects: '人物与设定', chapters: '章节', scenes: '场景', facts: '世界事实', knowledge: '人物认知', characterStates: '人物演进', cards: '画布卡片', canvasLinks: '素材关联', layouts: '图布局', reading: '阅读偏好', objectTypes: '对象类型' };
+  const labels: Record<string, string> = { novel: '作品信息', acts: '卷', objects: '人物与设定', chapters: '章节', scenes: '场景', passages: '场景段', facts: '世界事实', knowledge: '人物认知', stateChanges: '状态变化', characterStates: '人物演进', cards: '画布卡片', canvasLinks: '素材关联', layouts: '图布局', reading: '阅读偏好', objectTypes: '对象类型' };
   const changeTitle = (change: OperationBatch['changes'][number]) => {
     const item = (change.after ?? change.before) as { name?: string; title?: string; content?: string; key?: string } | undefined;
     const name = item?.name || item?.title || item?.content || item?.key;
@@ -34,7 +34,8 @@ export function Monitor({ workspace, runs, history, selectedRun, onSelectedRun, 
     else if (kind === 'event') onOpenReference('object', id);
     else if (kind === 'fact') { const fact = workspace.facts.find(f => f.id === id); if (fact) onOpenReference('object', fact.subjectId); }
     else if (kind === 'knowledge') { const knowledge = workspace.knowledge.find(k => k.id === id); if (knowledge) onOpenReference('object', knowledge.characterId); }
-    else if (kind === 'characterState') { const state = workspace.characterStates?.find(k => k.id === id); if (state) onOpenReference('object', state.characterId); }
+    else if (kind === 'passage') { const passage = workspace.passages.find(p => p.id === id); if (passage) onOpenReference('scene', passage.sceneId); }
+    else if (kind === 'stateChange') { const change = workspace.stateChanges.find(k => k.id === id); if (change) onOpenReference('object', change.subjectId); }
   };
   return <div className="monitor-page">
     <div className="monitor-toolbar"><div className="segmented" role="tablist" aria-label="创作记录"><button role="tab" aria-selected={tab === 'runs'} className={tab === 'runs' ? 'active' : ''} onClick={() => setTab('runs')}>AI 任务 · {runs.length}</button><button role="tab" aria-selected={tab === 'history'} className={tab === 'history' ? 'active' : ''} onClick={() => setTab('history')}>修改历史 · {history.length}</button></div>{mock && <span className="provider-tag mock"><i aria-hidden="true"/>演示输出 · 未调用真实模型</span>}</div>
@@ -70,7 +71,7 @@ export function Monitor({ workspace, runs, history, selectedRun, onSelectedRun, 
         {detail === 'steps' && <>{run.steps.map((step, i) => <section className="agent-step" key={step.id}>
           <header><div className="step-title"><span>{String(i + 1).padStart(2, '0')}</span><div><h3>{step.label}</h3><small>{step.agentId}</small></div></div><StatusPill status={step.status}>{statuses[step.status as keyof typeof statuses] ?? step.status}</StatusPill></header>
           <div className="public-output"><span className="eyebrow">公开输出</span><p>{step.output || '智能体正在准备输出…'}</p></div>
-          <details><summary>输入与上下文来源</summary><pre>{showValue(step.input)}</pre><div className="source-tags">{step.contextSources.map((source, j) => /^(card|scene|object|event|fact|knowledge|characterState):/.test(source) ? <button key={j} className="chip" onClick={() => openSource(source)}>{source}</button> : <span key={j} className="chip">{source}</span>)}</div></details>
+          <details><summary>输入与上下文来源</summary><pre>{showValue(step.input)}</pre><div className="source-tags">{step.contextSources.map((source, j) => /^(card|scene|passage|object|event|fact|knowledge|stateChange):/.test(source) ? <button key={j} className="chip" onClick={() => openSource(source)}>{source}</button> : <span key={j} className="chip">{source}</span>)}</div></details>
           {step.structured !== undefined && <details><summary>结构化结果</summary><pre>{showValue(step.structured)}</pre></details>}
           {step.tools.map((tool, j) => <details className="tool-detail" key={j}><summary>工具 · {tool.name}<small>{new Date(tool.at).toLocaleTimeString('zh-CN')}</small></summary><div className="comparison"><div><span>操作参数</span><pre>{showValue(tool.arguments)}</pre></div><div><span>操作结果</span><pre>{showValue(tool.result)}</pre></div></div></details>)}
           <div className="step-footer">{step.usage.provided ? `${step.usage.total} tokens · 输入 ${step.usage.input} / 输出 ${step.usage.output}` : '模型未提供该步用量'}{step.promptVersion && <span className="muted" title="这一步所用提示词的版本（由文本计算）"> · 提示词 {step.promptVersion}</span>}{step.responseIds.length > 0 && <details><summary>响应标识</summary><code>{step.responseIds.join('\n')}</code></details>}</div>

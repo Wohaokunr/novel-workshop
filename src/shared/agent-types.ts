@@ -18,7 +18,8 @@ export interface AgentBudget {
 }
 export interface PlanNode {
   id: string; role: Exclude<AgentRole, 'coordinator'>; objective: string; dependsOn: string[];
-  sceneId?: string; characterId?: string; eventId?: string; chapterId?: string;
+  /** passageId: the scene's prose in one chapter, which a writer writes; sceneId: the scene whose state changes evolution records. */
+  passageId?: string; sceneId?: string; characterId?: string; eventId?: string; chapterId?: string;
   acceptance: string; status: 'pending' | 'running' | 'completed' | 'failed'; artifactId?: string;
   /** Why a failed node failed, as reported to the coordinator and the author. */
   error?: string;

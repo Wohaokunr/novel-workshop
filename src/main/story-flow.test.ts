@@ -31,9 +31,10 @@ test('三要素缺口：场景缺人物、情节或环境都会被统计，并�
   const workspace = applyCommands(base, [
     { type: 'putObject', value: { id: 'lin', typeId: 'character', name: '林舟', fields: {} } },
     { type: 'putObject', value: { id: 'tower', typeId: 'setting', name: '钟楼', fields: {} } },
-    { type: 'putScene', value: { id: 'full', chapterId, order: 1, title: '齐全', povId: 'lin', eventIds: [], outline: '捡到铜片', text: '', settingIds: ['tower'] } },
-    { type: 'putScene', value: { id: 'empty', chapterId, order: 2, title: '空白', povId: null, eventIds: [], outline: '', text: '' } },
-    { type: 'putScene', value: { id: 'cast', chapterId, order: 3, title: '只有出场人物', povId: null, castIds: ['lin'], eventIds: [], outline: '对峙', text: '' } },
+    { type: 'putScene', value: { id: 'full', title: '齐全', povId: 'lin', eventIds: [], outline: '捡到铜片', settingIds: ['tower'] } },
+    { type: 'putScene', value: { id: 'empty', title: '空白', povId: null, eventIds: [], outline: '' } },
+    { type: 'putScene', value: { id: 'cast', title: '只有出场人物', povId: null, castIds: ['lin'], eventIds: [], outline: '对峙' } },
+    ...['full', 'empty', 'cast'].map((id, order) => ({ type: 'putPassage' as const, value: { id, sceneId: id, chapterId, order, text: '' } })),
   ]);
   assert.deepEqual(storyGaps(workspace).sceneElementGaps, { noPeople: 1, noPlace: 2, noPlot: 1 });
   assert.match(storyFlow(workspace).find(stage => stage.id === 'order')!.hint, /2 个场景/);

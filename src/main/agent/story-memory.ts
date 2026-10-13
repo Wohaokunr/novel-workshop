@@ -1,19 +1,19 @@
 import { randomUUID } from 'node:crypto';
 import type { ResponseOutputItem, ResponseStreamEvent } from 'openai/resources/responses/responses';
-import type { AgentEvent, ProviderSecret, TokenUsage, Workspace } from '../../shared/types.js';
-import type { RollupDigest, SceneDigest, StoryDigest, StoryMemoryStatus, StoryThread } from '../../shared/story-types.js';
+import type { AgentEvent, Passage, ProviderSecret, TokenUsage, Workspace } from '../../shared/types.js';
+import type { PassageDigest, RollupDigest, StoryDigest, StoryMemoryStatus, StoryThread } from '../../shared/story-types.js';
 import { NovelStore } from '../store.js';
 import { addUsage, checkCancelled, emptyUsage, ModelOutputError, objectSchema, runAgent, ToolValidationError, type EmbeddingTransport, type JsonSchema, type ModelRequest, type ModelResponse, type ResponseTransport } from '../responses.js';
 import { indexVectors, vectorCoverage } from './semantic.js';
-import { extractSummary, sceneHash, textHash, textSketch } from './story-index.js';
+import { extractSummary, passageHash, textHash, textSketch } from './story-index.js';
 import { ledgerForDigest, StoryView, threadOverlap } from './story-view.js';
 import { digestPrompt, mergePrompt, rollupPrompts } from '../prompts/story-memory.js';
 
 export const DIGEST_BATCH_CHARS = 12_000;
-const DIGEST_BATCH_SCENES = 8;
-/** Longer scenes are digested in parts of about SCENE_PART_CHARS, then merged, instead of losing their middle. */
-export const LONG_SCENE_CHARS = 16_000;
-const SCENE_PART_CHARS = 10_000;
+const DIGEST_BATCH_PASSAGES = 8;
+/** Longer passages are digested in parts of about PASSAGE_PART_CHARS, then merged, instead of losing their middle. */
+export const LONG_PASSAGE_CHARS = 16_000;
+const PASSAGE_PART_CHARS = 10_000;
 const ROLLUP_BATCH_CHARS = 10_000;
 /** Open threads shown to the digest model: major, picked up by the prose, then recent (see ledgerForDigest). */
 const LEDGER_LIMIT = 60;
@@ -22,8 +22,8 @@ const IDLE_MS = { live: 90_000, mock: 1_000 } as const;
 export const AUTO_LIMIT_CHARS = 60_000;
 
 const string: JsonSchema = { type: 'string' }, strings: JsonSchema = { type: 'array', items: string };
-export const digestSchema = objectSchema({ scenes: { type: 'array', items: objectSchema({
-  sceneId: string, summary: string, events: strings, changes: { type: 'array', items: objectSchema({ who: string, change: string }) },
+export const digestSchema = objectSchema({ passages: { type: 'array', items: objectSchema({
+  passageId: string, summary: string, events: strings, changes: { type: 'array', items: objectSchema({ who: string, change: string }) },
   threadsOpened: { type: 'array', items: objectSchema({ title: string, major: { type: 'boolean' } }) }, threadsClosed: strings, facts: strings,
 }) } });
 export const rollupSchema = objectSchema({ items: { type: 'array', items: objectSchema({ id: string, summary: string }) } });
@@ -31,7 +31,7 @@ export const rollupSchema = objectSchema({ items: { type: 'array', items: object
 
 function stamp() { return new Date().toISOString(); }
 
-/** Background digests: scenes in reading order, then chapter → volume → book rollups. Never touches the workspace. */
+/** Background digests: passages in reading order, then chapter → volume → book rollups. Never touches the workspace. */
 export class StoryMemoryService {
   private timers = new Map<string, NodeJS.Timeout>();
   private running = new Map<string, AbortController>();
@@ -88,7 +88,7 @@ export class StoryMemoryService {
   }
   shutdown() { for (const projectId of [...this.timers.keys(), ...this.running.keys()]) this.stop(projectId); }
 
-  /** Digest every pending scene, then refresh stale rollups. Safe to call repeatedly; progress is saved per batch. */
+  /** Digest every pending passage, then refresh stale rollups. Safe to call repeatedly; progress is saved per batch. */
   async run(projectId: string): Promise<void> {
     if (this.running.has(projectId)) { this.again.add(projectId); return; }
     const controller = new AbortController();
@@ -116,8 +116,8 @@ export class StoryMemoryService {
         const view = new StoryView(project, this.store.getStoryDigests(projectId));
         const batch = digestBatch(view, attempted);
         if (!batch.length) break;
-        for (const scene of batch) attempted.add(scene.id);
-        await attempt(async () => { omitted += await this.digestScenes(project, view, batch, transport, summary.model, controller.signal); });
+        for (const passage of batch) attempted.add(passage.id);
+        await attempt(async () => { omitted += await this.digestPassages(project, view, batch, transport, summary.model, controller.signal); });
         await this.emit(projectId);
       }
       for (const kind of ['chapter', 'volume', 'book'] as const) {
@@ -129,8 +129,8 @@ export class StoryMemoryService {
           await attempt(() => this.rollup(project, kind, work, transport, summary.model, controller.signal));
         }
       }
-      const problems = [skipped ? `${skipped} 批内容整理失败：${lastSkip}` : '', omitted ? `${omitted} 场被模型漏掉` : ''].filter(Boolean);
-      if (problems.length && !controller.signal.aborted) this.errors.set(projectId, `${problems.join('；')}。这些场景下次整理时重试`);
+      const problems = [skipped ? `${skipped} 批内容整理失败：${lastSkip}` : '', omitted ? `${omitted} 段被模型漏掉` : ''].filter(Boolean);
+      if (problems.length && !controller.signal.aborted) this.errors.set(projectId, `${problems.join('；')}。这些场景段下次整理时重试`);
       // The semantic index embeds the prose itself, so it does not wait for digests.
       const embeddingModel = provider.embeddingModel;
       if (embeddingModel && this.embedderFactory && !controller.signal.aborted) {
@@ -139,7 +139,7 @@ export class StoryMemoryService {
       }
       if (!controller.signal.aborted) {
         const project = this.store.getProject(projectId), view = new StoryView(project);
-        this.store.pruneStoryDigests(projectId, { scene: new Set(project.scenes.map(scene => scene.id)), chapter: new Set(project.chapters.map(chapter => chapter.id)),
+        this.store.pruneStoryDigests(projectId, { passage: new Set(project.passages.map(passage => passage.id)), chapter: new Set(project.chapters.map(chapter => chapter.id)),
           volume: new Set(view.volumes().map(volume => volume.id)), book: new Set([project.id]) });
       }
     } catch (failure) {
@@ -159,21 +159,21 @@ export class StoryMemoryService {
     addUsage(total, usage); this.usage.set(projectId, total);
   }
 
-  /** Returns how many scenes the model left out: they keep no digest and stay pending, so the next run digests them again. */
-  private async digestScenes(project: Workspace, view: StoryView, batch: Workspace['scenes'], transport: ResponseTransport, model: string, signal: AbortSignal): Promise<number> {
-    if (batch.length === 1 && batch[0]!.text.length > LONG_SCENE_CHARS) return this.digestLongScene(project, view, batch[0]!, transport, model, signal);
+  /** Returns how many passages the model left out: they keep no digest and stay pending, so the next run digests them again. */
+  private async digestPassages(project: Workspace, view: StoryView, batch: Passage[], transport: ResponseTransport, model: string, signal: AbortSignal): Promise<number> {
+    if (batch.length === 1 && batch[0]!.text.length > LONG_PASSAGE_CHARS) return this.digestLongPassage(project, view, batch[0]!, transport, model, signal);
     const open = view.ledgerBefore(batch[0]!.id), known = new Set(open.map(thread => thread.id));
     const context = {
-      openThreads: threadList(ledgerForDigest(open, batch.map(scene => scene.text).join('\n'), LEDGER_LIMIT)),
+      openThreads: threadList(ledgerForDigest(open, batch.map(passage => passage.text).join('\n'), LEDGER_LIMIT)),
       previousSummary: previousSummary(view, batch[0]!.id),
-      scenes: batch.map(scene => ({ sceneId: scene.id, chapter: view.chapters[view.chapterIndex(scene.chapterId)]?.title ?? '', text: scene.text })),
+      passages: batch.map(passage => ({ passageId: passage.id, chapter: chapterTitle(view, passage), scene: view.label(passage.id), text: passage.text })),
     };
     const result = await this.digestCall(project.id, transport, context, signal);
-    const at = stamp(), digests: SceneDigest[] = [];
-    for (const scene of batch) {
-      const item = result.scenes.find(value => value.sceneId === scene.id);
+    const at = stamp(), digests: PassageDigest[] = [];
+    for (const passage of batch) {
+      const item = result.passages.find(value => value.passageId === passage.id);
       if (!item) continue;
-      const digest = sceneDigest(view, scene, { ...item, threadsOpened: stableThreads(scene.id, item.threadsOpened.slice(0, 3), view.storedDigest(scene.id)?.threadsOpened) }, known, model, at);
+      const digest = passageDigest(view, passage, { ...item, threadsOpened: stableThreads(passage.id, item.threadsOpened.slice(0, 3), view.storedDigest(passage.id)?.threadsOpened) }, known, model, at);
       digests.push(digest);
       for (const thread of digest.threadsOpened) known.add(thread.id);
     }
@@ -181,31 +181,31 @@ export class StoryMemoryService {
     return batch.length - digests.length;
   }
 
-  /** A scene too long for one request is digested part by part, each part seeing the threads earlier parts opened, then its
+  /** A passage too long for one request is digested part by part, each part seeing the threads earlier parts opened, then its
    * summaries are merged into one. Nothing is stored unless every part was digested. */
-  private async digestLongScene(project: Workspace, view: StoryView, scene: Workspace['scenes'][number], transport: ResponseTransport, model: string, signal: AbortSignal): Promise<number> {
-    const parts = splitParts(scene.text, SCENE_PART_CHARS), open = view.ledgerBefore(scene.id), known = new Set(open.map(thread => thread.id));
-    const chapter = view.chapters[view.chapterIndex(scene.chapterId)]?.title ?? '', previousThreads = view.storedDigest(scene.id)?.threadsOpened ?? [];
+  private async digestLongPassage(project: Workspace, view: StoryView, passage: Passage, transport: ResponseTransport, model: string, signal: AbortSignal): Promise<number> {
+    const parts = splitParts(passage.text, PASSAGE_PART_CHARS), open = view.ledgerBefore(passage.id), known = new Set(open.map(thread => thread.id));
+    const chapter = chapterTitle(view, passage), scene = view.label(passage.id), previousThreads = view.storedDigest(passage.id)?.threadsOpened ?? [];
     const digested: Array<DigestItem & { threads: StoryThread[] }> = [], openedHere: StoryThread[] = [];
-    let previous = previousSummary(view, scene.id);
+    let previous = previousSummary(view, passage.id);
     for (const [index, part] of parts.entries()) {
-      const partId = `${scene.id}#${index + 1}/${parts.length}`;
+      const partId = `${passage.id}#${index + 1}/${parts.length}`;
       const result = await this.digestCall(project.id, transport, { openThreads: [...threadList(ledgerForDigest(open, part, LEDGER_LIMIT)), ...threadList(openedHere)],
-        previousSummary: previous, scenes: [{ sceneId: partId, chapter, text: part }] }, signal);
-      const item = result.scenes.find(value => value.sceneId === partId) ?? (result.scenes.length === 1 ? result.scenes[0] : undefined);
+        previousSummary: previous, passages: [{ passageId: partId, chapter, scene, text: part }] }, signal);
+      const item = result.passages.find(value => value.passageId === partId) ?? (result.passages.length === 1 ? result.passages[0] : undefined);
       if (!item) return 1;
-      const threads = stableThreads(scene.id, item.threadsOpened.slice(0, 3), previousThreads.filter(thread => !openedHere.some(other => other.id === thread.id)));
+      const threads = stableThreads(passage.id, item.threadsOpened.slice(0, 3), previousThreads.filter(thread => !openedHere.some(other => other.id === thread.id)));
       digested.push({ ...item, threads }); openedHere.push(...threads); previous = item.summary;
       for (const thread of threads) known.add(thread.id);
     }
-    const step = await runAgent({ id: 'story:merge', label: '故事记忆 · 长场景合并', instructions: mergePrompt.text, outputSchema: rollupSchema },
-      { transport, context: { items: [{ id: scene.id, title: scene.title, parts: digested.map(item => ({ summary: item.summary, events: item.events })) }] }, objective: '合并为这一场的摘要。', signal, contextSources: [] });
+    const step = await runAgent({ id: 'story:merge', label: '故事记忆 · 长段合并', instructions: mergePrompt.text, outputSchema: rollupSchema },
+      { transport, context: { items: [{ id: passage.id, title: scene, parts: digested.map(item => ({ summary: item.summary, events: item.events })) }] }, objective: '合并为这一段的摘要。', signal, contextSources: [] });
     this.track(project.id, step.usage);
-    const merged = (step.structured as { items: Array<{ id: string; summary: string }> }).items.find(item => item.id === scene.id)?.summary;
-    // A thread opened and answered inside the same long scene was never open after it.
+    const merged = (step.structured as { items: Array<{ id: string; summary: string }> }).items.find(item => item.id === passage.id)?.summary;
+    // A thread opened and answered inside the same long passage was never open after it.
     const closed = new Set(digested.flatMap(item => item.threadsClosed));
-    const digest = sceneDigest(view, scene, {
-      sceneId: scene.id, summary: merged ?? digested.map(item => item.summary).join(' '),
+    const digest = passageDigest(view, passage, {
+      passageId: passage.id, summary: merged ?? digested.map(item => item.summary).join(' '),
       events: spread(digested.flatMap(item => item.events), 5), changes: spread(digested.flatMap(item => item.changes), 8), facts: spread(digested.flatMap(item => item.facts), 4),
       threadsOpened: openedHere.filter(thread => !closed.has(thread.id)).slice(0, 6), threadsClosed: [...closed].filter(id => !openedHere.some(thread => thread.id === id)),
     }, known, model, stamp());
@@ -213,11 +213,11 @@ export class StoryMemoryService {
     return 0;
   }
 
-  private async digestCall(projectId: string, transport: ResponseTransport, context: unknown, signal: AbortSignal): Promise<{ scenes: DigestItem[] }> {
-    const step = await runAgent({ id: 'story:digest', label: '故事记忆 · 场景摘要', instructions: digestPrompt.text, outputSchema: digestSchema },
-      { transport, context, objective: '为这些场景建立故事记忆。', signal, contextSources: [] });
+  private async digestCall(projectId: string, transport: ResponseTransport, context: unknown, signal: AbortSignal): Promise<{ passages: DigestItem[] }> {
+    const step = await runAgent({ id: 'story:digest', label: '故事记忆 · 场景段摘要', instructions: digestPrompt.text, outputSchema: digestSchema },
+      { transport, context, objective: '为这些场景段建立故事记忆。', signal, contextSources: [] });
     this.track(projectId, step.usage);
-    return step.structured as { scenes: DigestItem[] };
+    return step.structured as { passages: DigestItem[] };
   }
 
   private async rollup(project: Workspace, kind: RollupDigest['kind'], work: RollupWork[], transport: ResponseTransport, model: string, signal: AbortSignal) {
@@ -231,31 +231,32 @@ export class StoryMemoryService {
   }
 }
 
-interface DigestItem { sceneId: string; summary: string; events: string[]; changes: SceneDigest['changes']; threadsOpened: Array<{ title: string; major: boolean }>; threadsClosed: string[]; facts: string[] }
+interface DigestItem { passageId: string; summary: string; events: string[]; changes: PassageDigest['changes']; threadsOpened: Array<{ title: string; major: boolean }>; threadsClosed: string[]; facts: string[] }
 
-function previousSummary(view: StoryView, sceneId: string): string {
-  const before = view.order[view.positionOf(sceneId) - 1];
+function chapterTitle(view: StoryView, passage: Passage): string { return view.chapters[view.chapterIndex(passage.chapterId)]?.title ?? ''; }
+function previousSummary(view: StoryView, passageId: string): string {
+  const before = view.order[view.positionOf(passageId) - 1];
   return before ? view.digest(before.id)?.summary ?? extractSummary(before.text).closing : '';
 }
 function threadList(threads: StoryThread[]) { return threads.map(thread => ({ id: thread.id, title: thread.title, ...(thread.major ? { major: true } : {}) })); }
 
-/** Thread ids come from the opening scene and the wording. A re-digest of that scene keeps the id of a similarly worded thread it
- * opened before, so closures recorded in later scenes still point at the same thread. */
-export function stableThreads(sceneId: string, opened: Array<{ title: string; major: boolean }>, previous: StoryThread[] = []): StoryThread[] {
+/** Thread ids come from the opening passage and the wording. A re-digest of that passage keeps the id of a similarly worded thread it
+ * opened before, so closures recorded in later passages still point at the same thread. */
+export function stableThreads(passageId: string, opened: Array<{ title: string; major: boolean }>, previous: StoryThread[] = []): StoryThread[] {
   const used = new Set<string>();
   return opened.map(thread => {
     const title = thread.title.trim().slice(0, 120);
     const reuse = previous.filter(old => !used.has(old.id)).map(old => ({ old, score: threadOverlap(old.title, title) }))
       .filter(item => item.score >= 0.6).sort((a, b) => b.score - a.score)[0]?.old;
-    let id = reuse?.id ?? `t:${sceneId}:${textHash(title).slice(0, 10)}`;
+    let id = reuse?.id ?? `t:${passageId}:${textHash(title).slice(0, 10)}`;
     if (used.has(id)) id = `${id}:${used.size}`;
     used.add(id);
     return { id, title, ...(thread.major ? { major: true } : {}) };
   });
 }
 
-function sceneDigest(view: StoryView, scene: Workspace['scenes'][number], item: Omit<DigestItem, 'threadsOpened'> & { threadsOpened: StoryThread[] }, known: Set<string>, model: string, at: string): SceneDigest {
-  return { kind: 'scene', sceneId: scene.id, textHash: sceneHash(view.index, scene.id)!, chars: scene.text.length, sketch: textSketch(scene.text),
+function passageDigest(view: StoryView, passage: Passage, item: Omit<DigestItem, 'threadsOpened'> & { threadsOpened: StoryThread[] }, known: Set<string>, model: string, at: string): PassageDigest {
+  return { kind: 'passage', passageId: passage.id, textHash: passageHash(view.index, passage.id)!, chars: passage.text.length, sketch: textSketch(passage.text),
     summary: item.summary.slice(0, 400), events: item.events.slice(0, 5).map(value => value.slice(0, 200)),
     changes: item.changes.slice(0, 8).map(value => ({ who: value.who.slice(0, 40), change: value.change.slice(0, 200) })),
     threadsOpened: item.threadsOpened, threadsClosed: item.threadsClosed.filter(id => known.has(id)),
@@ -284,16 +285,16 @@ export function splitParts(text: string, size: number): string[] {
   return parts;
 }
 
-/** Consecutive pending scenes in reading order, bounded by DIGEST_BATCH_CHARS. A single long scene goes alone. */
-export function digestBatch(view: StoryView, skip: Set<string> = new Set()): Workspace['scenes'] {
-  const pending = view.pending().filter(scene => !skip.has(scene.id));
-  const batch: Workspace['scenes'] = [];
+/** Consecutive pending passages in reading order, bounded by DIGEST_BATCH_CHARS. A single long passage goes alone. */
+export function digestBatch(view: StoryView, skip: Set<string> = new Set()): Passage[] {
+  const pending = view.pending().filter(passage => !skip.has(passage.id));
+  const batch: Passage[] = [];
   let chars = 0;
-  for (const scene of pending) {
-    const size = Math.min(scene.text.length, LONG_SCENE_CHARS);
-    if (batch.length && (chars + size > DIGEST_BATCH_CHARS || batch.length >= DIGEST_BATCH_SCENES
-      || view.positionOf(scene.id) !== view.positionOf(batch.at(-1)!.id) + 1)) break;
-    batch.push(scene); chars += size;
+  for (const passage of pending) {
+    const size = Math.min(passage.text.length, LONG_PASSAGE_CHARS);
+    if (batch.length && (chars + size > DIGEST_BATCH_CHARS || batch.length >= DIGEST_BATCH_PASSAGES
+      || view.positionOf(passage.id) !== view.positionOf(batch.at(-1)!.id) + 1)) break;
+    batch.push(passage); chars += size;
   }
   return batch;
 }
@@ -304,7 +305,7 @@ export function rollupBatch(view: StoryView, kind: RollupDigest['kind'], skip: S
   const candidates: RollupWork[] = [];
   if (kind === 'chapter') for (const chapter of view.chapters) {
     const input = view.chapterInput(chapter.id);
-    if (input && view.rollup('chapter', chapter.id)?.inputHash !== input.hash) candidates.push({ id: chapter.id, title: chapter.title, hash: input.hash, parts: input.scenes });
+    if (input && view.rollup('chapter', chapter.id)?.inputHash !== input.hash) candidates.push({ id: chapter.id, title: chapter.title, hash: input.hash, parts: input.passages });
   }
   if (kind === 'volume') for (const volume of view.volumes()) {
     const input = view.volumeInput(volume.id);
@@ -332,9 +333,9 @@ export class DemoStoryTransport implements ResponseTransport {
     const first = request.input.find(item => 'role' in item && item.role === 'user') as { content?: string } | undefined;
     const { context } = JSON.parse(String(first?.content ?? '{}')) as { context: any };
     const sentence = (text: string) => (String(text).match(/[^。！？!?\n]+[。！？!?]?/g) ?? []).map(value => value.trim()).filter(Boolean);
-    const result = request.agentId === 'story:digest' ? { scenes: (context.scenes ?? []).map((scene: { sceneId: string; text: string }) => {
-      const lines = sentence(scene.text);
-      return { sceneId: scene.sceneId, summary: lines.slice(0, 2).join('').slice(0, 150), events: lines.slice(-1), changes: [],
+    const result = request.agentId === 'story:digest' ? { passages: (context.passages ?? []).map((passage: { passageId: string; text: string }) => {
+      const lines = sentence(passage.text);
+      return { passageId: passage.passageId, summary: lines.slice(0, 2).join('').slice(0, 150), events: lines.slice(-1), changes: [],
         threadsOpened: lines.filter(line => /[？?]|不知道/.test(line)).slice(0, 1).map(title => ({ title, major: false })), threadsClosed: [], facts: [] };
     }) } : { items: (context.items ?? []).map((item: RollupWork) => ({ id: item.id, summary: item.parts.map(part => part.summary).join(' ').slice(0, 250) })) };
     const text = JSON.stringify(result);

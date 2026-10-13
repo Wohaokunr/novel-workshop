@@ -4,9 +4,9 @@ import { BookOpen, Check, ChevronRight, ChevronsUpDown, CircleAlert, Feather, Fi
 import Board from './Board';
 import Assistant, { TaskOutcome } from './Assistant';
 import AgentTask, { type AgentMemoryActions, type AgentTaskActions } from './AgentTask';
-import { ActionCancelled, Dialog, Toast, SaveFeedbackContext, Empty, Kbd, uid, fire, assistTools, taskObjective, CONTINUE_OBJECTIVE, canResumeRun, orderedChapters, orderedScenes, sceneFor, events, isAgentRun, isRunActive, type Commit, type TaskDraft } from './ui';
+import { ActionCancelled, Dialog, Toast, SaveFeedbackContext, Empty, Kbd, uid, fire, assistTools, taskObjective, CONTINUE_OBJECTIVE, canResumeRun, orderedChapters, orderedPassages, orderedScenes, passageFor, sceneChapters, events, isAgentRun, isRunActive, type Commit, type TaskDraft } from './ui';
 import { useMediaQuery, useModalFocus } from './interaction';
-import type { Workspace, Command, ProjectSummary, NovelObject, ObjectType, NarrativeScene, AgentRun, ProviderSettings, ProviderInput, OperationBatch, RunRequest, FieldValue, SourceReference, AssistTool } from '../shared/types';
+import type { Workspace, Command, ProjectSummary, NovelObject, ObjectType, NarrativeScene, Passage, AgentRun, ProviderSettings, ProviderInput, OperationBatch, RunRequest, FieldValue, SourceReference, AssistTool } from '../shared/types';
 import type { AgentDecision, AgentMemory, AgentSession } from '../shared/agent-types';
 
 import type { View, AskAction, RegisterFlush, AssistAction, OpenCanvas, AskDelete, SaveState } from './types';
@@ -23,6 +23,7 @@ import { Outline } from './pages/Outline';
 import { Style } from './pages/Style';
 import { accents, setAppearance, toggleTheme, useAppearance } from './appearance';
 import { STYLE_LIMITS, styleProfile } from '../shared/style-types';
+import { newChapter, passageLabel, passageOrderAt, scenePassages } from '../shared/structure';
 const nav = [
   { view: 'home', label: '作品概览', icon: LayoutDashboard },
   { view: 'canvas', label: '构思', icon: Lightbulb },
@@ -66,10 +67,12 @@ export default function App() {
   const [creating,setCreating] = useState(false);
   const [selectedObject,setSelectedObject] = useState('');
   const [selectedScene,setSelectedScene] = useState('');
+  /** The passage open in the writer; selectedScene is the scene the boards and details show. */
+  const [selectedPassage,setSelectedPassage] = useState('');
   const [selectedCard,setSelectedCard] = useState('');
   const [confirm,setConfirm] = useState<{title:string;message:string;act:()=>Promise<void>;cancel?:()=>void;confirmLabel:string;danger?:boolean}|null>(null);
   const [task,setTask] = useState<TaskDraft>(freshTask);
-  const [selection,setSelection] = useState<{sceneId:string;start:number;end:number;text:string}|undefined>();
+  const [selection,setSelection] = useState<{passageId:string;start:number;end:number;text:string}|undefined>();
   const [selectedRun,setSelectedRun] = useState('');
   const [navCollapsed,setNavCollapsed] = useState(false);
   const [inspectorOpen,setInspectorOpen] = useState(false);
@@ -154,8 +157,8 @@ export default function App() {
       if(view==='write'&&event.altKey&&!event.ctrlKey&&!event.metaKey&&!event.shiftKey&&(event.key==='ArrowUp'||event.key==='ArrowDown')){
         const current=workspaceRef.current;if(!current)return;
         event.preventDefault();
-        const list=orderedScenes(current),index=list.findIndex(scene=>scene.id===sceneFor(current,selectedScene)?.id),next=list[index+(event.key==='ArrowDown'?1:-1)];
-        if(next)selectScene(next.id);
+        const list=orderedPassages(current),index=list.findIndex(passage=>passage.id===passageFor(current,selectedPassage)?.id),next=list[index+(event.key==='ArrowDown'?1:-1)];
+        if(next)selectPassage(next.id);
         return;
       }
       if(!(event.ctrlKey||event.metaKey)||event.altKey)return;
@@ -193,15 +196,18 @@ export default function App() {
       });
     }));
   };
-  const chooseScene = async(id:string)=>{
+  const choosePassage = async(id:string)=>{
     setBusy(true);
     try{
       await flushEdits();
-      if(!workspaceRef.current?.scenes.some(scene=>scene.id===id))throw new Error('这个场景已被删除。');
-      setSelectedScene(id);setSelection(undefined);
+      const passage=workspaceRef.current?.passages.find(item=>item.id===id);
+      if(!passage)throw new Error('这一段已被删除。');
+      setSelectedPassage(id);setSelectedScene(passage.sceneId);setSelection(undefined);
     }finally{setBusy(false);}
   };
-  const selectScene = (id:string)=>fire(protect(()=>chooseScene(id)));
+  const selectPassage = (id:string)=>fire(protect(()=>choosePassage(id)));
+  /** A scene opens in the writer at the passage already open, when it is one of the scene's, else at its first passage. */
+  const passageOfScene = (current:Workspace,sceneId:string)=>{const parts=scenePassages(current,sceneId);return parts.find(item=>item.id===selectedPassage)??parts[0];};
   const refreshDetails = useCallback(async(id:string)=>{const [h,p]=await Promise.all([window.novel.history(id),window.novel.listProjects()]);if(workspaceRef.current?.id===id)setHistory(h);setProjects(p);},[]);
   const reloadRuns = useCallback((id:string):Promise<void>=>{
     const pending=reloadingRuns.current.get(id);if(pending)return pending;
@@ -228,7 +234,7 @@ export default function App() {
   }),[protect]);
   useEffect(()=>{if(workspace?.id&&aiOpen)fire(loadAgentContext(workspace.id));},[workspace?.id,aiOpen,loadAgentContext]);
   const resetProjectUI=useCallback(()=>{
-    setSelectedObject('');setSelectedScene('');setSelectedCard('');setSelection(undefined);setSelectedRun('');
+    setSelectedObject('');setSelectedScene('');setSelectedPassage('');setSelectedCard('');setSelection(undefined);setSelectedRun('');
     setTask(freshTask());setInspectorOpen(false);setAiOpen(false);setFocusMode(false);setDismissedRun('');setView('home');setSaveError(false);setNotice(null);
     ++memoryRequest.current;setMemories([]);setSession(null);setMemoryLoading(false);setMemoryError('');
     saveReportsRef.current={};setSaveReports({});
@@ -310,22 +316,27 @@ export default function App() {
   };
   const restore=()=>protect(async()=>{await flushEdits();const w=await window.novel.importProject();if(w){await openProject(w.id);notify('备份已恢复为独立作品。');}});
   const patchObject = (id:string,patch:Partial<NovelObject>)=>commit(w=>{const value=w.objects.find(o=>o.id===id);return value?[{type:'putObject',value:{...value,...patch}}]:[];});
-  const patchScene = (id:string,patch:Partial<NarrativeScene>)=>commit(w=>{const value=w.scenes.find(s=>s.id===id);return value?[{type:'putScene',value:{...value,...patch,...(patch.chapterId&&patch.chapterId!==value.chapterId?{order:Math.max(0,...w.scenes.filter(s=>s.chapterId===patch.chapterId).map(s=>s.order))+1}:{})}}]:[];});
+  const patchScene = (id:string,patch:Partial<NarrativeScene>)=>commit(w=>{const value=w.scenes.find(s=>s.id===id);return value?[{type:'putScene',value:{...value,...patch}}]:[];});
   const addObject = async(typeId?:string,isEvent=false,position?:{x:number;y:number})=>{await protect(flushEdits);if(!workspace)return;const id=uid();const tid=typeId||workspace.objectTypes.find(t=>t.id==='event')?.id||workspace.objectTypes[0]?.id;if(!tid){notify('请先创建一个对象类型。',true);return;}await commit(w=>[
     {type:'putObject',value:{id,typeId:tid,name:isEvent?'新的世界事件':'未命名对象',fields:{},...(isEvent||tid==='event'?{event:{worldOrder:Math.max(0,...events(w).map(o=>o.event!.worldOrder))+1,timeLabel:'',thread:'主线',participants:[],causes:[],critical:false,observations:{}}}:{})}},
     ...(position?[{type:'setLayout' as const,key:`world:${id}`,value:position}]:[]),
   ]);setSelectedObject(id);showPanel('details');return id;};
-  const addChapter = async()=>{const id=uid();await commit(w=>[{type:'putChapter',value:{id,title:`第 ${w.chapters.length+1} 章`,order:Math.max(0,...w.chapters.map(c=>c.order))+1}}]);return id;};
-  const addScene = (chapterId?:string,position?:{x:number;y:number})=>protect(async()=>{
+  /** A new chapter at the end of the book, in the last chapter's volume. */
+  const addChapter = async()=>{const id=uid();await commit(w=>[{type:'putChapter',value:newChapter(w,id)}]);return id;};
+  /** A new scene, opened in a chapter as its first (empty) passage: the given chapter, else the last one. */
+  const createScene = async(chapterId?:string,position?:{x:number;y:number})=>{
     await flushEdits();
     const current=workspaceRef.current;if(!current)return;
-    const cid=chapterId||orderedChapters(current)[0]?.id||await addChapter();const id=uid();
+    const cid=chapterId||orderedChapters(current).at(-1)?.id||await addChapter();const id=uid(),passageId=uid();
     await commit(w=>[
-      {type:'putScene',value:{id,chapterId:cid,order:Math.max(0,...w.scenes.filter(s=>s.chapterId===cid).map(s=>s.order))+1,title:'新的场景',povId:null,eventIds:[],outline:'',text:''}},
+      {type:'putScene',value:{id,title:'新的场景',povId:null,eventIds:[],outline:''}},
+      {type:'putPassage',value:{id:passageId,sceneId:id,chapterId:cid,order:passageOrderAt(w,cid),text:''}},
       ...(position?[{type:'setLayout' as const,key:`story:${id}`,value:position}]:[]),
     ]);
-    setSelectedScene(id);setSelection(undefined);return id;
-  });
+    setSelectedScene(id);setSelectedPassage(passageId);setSelection(undefined);return {sceneId:id,passageId};
+  };
+  const addScene = (chapterId?:string,position?:{x:number;y:number})=>protect(async()=>(await createScene(chapterId,position))?.sceneId);
+  const addPassageScene = (chapterId?:string)=>protect(async()=>(await createScene(chapterId))?.passageId);
   const activeRun = runs.find(isRunActive);
   const isBoard = view==='canvas'||view==='world'||view==='story';
   const changeInspector = (open:boolean)=>{if(open)switchPanel('details');else closePanel('details');};
@@ -333,7 +344,20 @@ export default function App() {
     await flushEdits();const w=workspaceRef.current;if(!w)return;
     if(kind==='card'){if(!w.cards.some(c=>c.id===id))throw new Error('这张卡片已被删除。');setSelectedCard(id);setView('canvas');showPanel('details');}
     else if(kind==='object'){const object=w.objects.find(o=>o.id===id);if(!object)throw new Error('这个对象已被删除。');setSelectedObject(id);setView(object.event?'world':'objects');showPanel('details');}
-    else{if(!w.scenes.some(s=>s.id===id))throw new Error('这个场景已被删除。');setSelectedScene(id);setSelection(undefined);setView('write');setInspectorOpen(false);if(aiDrawer)setAiOpen(false);}
+    else{
+      if(!w.scenes.some(s=>s.id===id))throw new Error('这个场景已被删除。');
+      const passage=passageOfScene(w,id);
+      setSelectedScene(id);setSelection(undefined);
+      // A scene not placed in any chapter has nothing to write yet: its details show where to place it.
+      if(passage){setSelectedPassage(passage.id);setView('write');setInspectorOpen(false);if(aiDrawer)setAiOpen(false);}
+      else{setView('story');showPanel('details');}
+    }
+  }));
+  /** Open one passage in the writer, e.g. where the reader or the scene details point. */
+  const openPassage = (id:string)=>fire(protect(async()=>{
+    await flushEdits();const passage=workspaceRef.current?.passages.find(item=>item.id===id);
+    if(!passage)throw new Error('这一段已被删除。');
+    setSelectedPassage(id);setSelectedScene(passage.sceneId);setSelection(undefined);setView('write');setInspectorOpen(false);if(aiDrawer)setAiOpen(false);
   }));
   const prepareTask = (stage:RunRequest['stage'],references:SourceReference[]=[],tool:AssistTool='canvas',chapterScope:'scene'|'chapter'='scene')=>{
     const opener=document.activeElement as HTMLElement|null;
@@ -342,11 +366,13 @@ export default function App() {
       try{
         await flushEdits();const current=workspaceRef.current;if(!current)return;
         const ref=references.find(ref=>ref.kind==='scene'||(ref.kind==='card'&&current.cards.find(card=>card.id===ref.id)?.kind==='scene'));
-        const id=ref?.kind==='scene'?ref.id:ref?current.cards.find(card=>card.id===ref.id)?.refId:sceneFor(current,selectedScene)?.id;
-        const scene=current.scenes.find(scene=>scene.id===id);
+        const sceneId=ref?.kind==='scene'?ref.id:ref?current.cards.find(card=>card.id===ref.id)?.refId:undefined;
+        // Drafting a scene writes its passage still without prose (the selected one first), e.g. the part that goes on in the next chapter.
+        const blank=stage==='chapter'&&sceneId?scenePassages(current,sceneId).filter(item=>!item.text.trim()):[];
+        const passage=sceneId?blank.find(item=>item.id===selectedPassage)??blank[0]??passageOfScene(current,sceneId):passageFor(current,selectedPassage);
         setTask({stage,tool,objective:taskObjective(stage,tool,chapterScope),references,chapterScope,
-          ...((stage==='chapter'||stage==='rewrite')?{sceneId:scene?.id}:{}),
-          ...(stage==='rewrite'&&selection&&scene&&selection.sceneId===scene.id&&selection.end>selection.start?{selection:{start:selection.start,end:selection.end,text:selection.text}}:{}),
+          ...((stage==='chapter'||stage==='rewrite')?{passageId:passage?.id}:{}),
+          ...(stage==='rewrite'&&selection&&passage&&selection.passageId===passage.id&&selection.end>selection.start?{selection:{start:selection.start,end:selection.end,text:selection.text}}:{}),
         });setDismissedRun(runsRef.current.find(isRunActive)?.id??runsRef.current[0]?.id??'');setAiTab('task');showPanel('ai',opener);
       }finally{setBusy(false);}
     }));
@@ -355,10 +381,11 @@ export default function App() {
   /** One click from the writer: write the empty scene, or continue the prose at the cursor (the end of the scene when there is none),
    * without stopping at the task form. The task still ends with the author approving the candidate. */
   const quickWrite = (mode:'scene'|'continue')=>fire(protect(async()=>{
-    await flushEdits();const current=workspaceRef.current,scene=current&&sceneFor(current,selectedScene);if(!current||!scene)return;
-    const at=selection&&selection.sceneId===scene.id&&selection.end<=scene.text.length?selection.end:scene.text.length;
-    const draft:TaskDraft=mode==='scene'?{stage:'chapter',tool:'canvas',objective:taskObjective('chapter'),references:[{kind:'scene',id:scene.id}],chapterScope:'scene',sceneId:scene.id}
-      :{stage:'rewrite',tool:'canvas',objective:CONTINUE_OBJECTIVE,references:[{kind:'scene',id:scene.id}],chapterScope:'scene',sceneId:scene.id,selection:{start:at,end:at,text:''}};
+    await flushEdits();const current=workspaceRef.current,passage=current&&passageFor(current,selectedPassage);if(!current||!passage)return;
+    const at=selection&&selection.passageId===passage.id&&selection.end<=passage.text.length?selection.end:passage.text.length;
+    const references:SourceReference[]=[{kind:'scene',id:passage.sceneId}];
+    const draft:TaskDraft=mode==='scene'?{stage:'chapter',tool:'canvas',objective:taskObjective('chapter'),references,chapterScope:'scene',passageId:passage.id}
+      :{stage:'rewrite',tool:'canvas',objective:CONTINUE_OBJECTIVE,references,chapterScope:'scene',passageId:passage.id,selection:{start:at,end:at,text:''}};
     setTask(draft);setAiTab('task');
     await start(draft);
   }));
@@ -381,18 +408,18 @@ export default function App() {
       await flushEdits();const current=workspaceRef.current;if(!current)return;
       if(runsRef.current.some(isRunActive))throw new Error('当前任务尚未结束，请先恢复、审批、回答或停止任务。');
       if(!draft.objective.trim())throw new Error('请填写本次创作目标。');
-      const scene=current.scenes.find(scene=>scene.id===draft.sceneId);
+      const passage=current.passages.find(item=>item.id===draft.passageId);
       for(const ref of draft.references){const collection=ref.kind==='card'?current.cards:ref.kind==='object'?current.objects:current.scenes;if(!collection.some(item=>item.id===ref.id))throw new Error('引用资料已被删除，请移除失效引用后再开始。');}
-      if((draft.stage==='chapter'||draft.stage==='rewrite')&&!scene)throw new Error('请先选择有效的目标场景。');
-      if(draft.stage==='chapter'&&(draft.chapterScope==='scene'?!!scene!.text.trim():!current.scenes.some(item=>item.chapterId===scene!.chapterId&&!item.text.trim())))throw new Error('目标已有正文，请选择空白场景，或选中文字进行改写。');
-      if(draft.stage==='rewrite'&&(!draft.selection||scene!.text.slice(draft.selection.start,draft.selection.end)!==draft.selection.text))throw new Error('选段已变化，请在正文中重新选取文字并准备改写。');
+      if((draft.stage==='chapter'||draft.stage==='rewrite')&&!passage)throw new Error('请先选择有效的目标场景。');
+      if(draft.stage==='chapter'&&(draft.chapterScope==='scene'?!!passage!.text.trim():!current.passages.some(item=>item.chapterId===passage!.chapterId&&!item.text.trim())))throw new Error('目标已有正文，请选择空白场景，或选中文字进行改写。');
+      if(draft.stage==='rewrite'&&(!draft.selection||passage!.text.slice(draft.selection.start,draft.selection.end)!==draft.selection.text))throw new Error('选段已变化，请在正文中重新选取文字并准备改写。');
       const run=await window.novel.startRun({
         projectId:current.id,stage:draft.stage,
         objective:draft.objective.trim(),
-        ...((draft.stage==='chapter'||draft.stage==='rewrite')?{chapterId:scene!.chapterId}:{}),
+        ...((draft.stage==='chapter'||draft.stage==='rewrite')?{chapterId:passage!.chapterId}:{}),
         ...(draft.stage==='assist'?{tool:draft.tool}:{}),references:draft.references,
-        ...(draft.stage==='chapter'&&draft.chapterScope==='scene'?{sceneId:scene!.id}:{}),
-        ...(draft.stage==='rewrite'?{sceneId:scene!.id,selection:{start:draft.selection!.start,end:draft.selection!.end}}:{}),
+        ...(draft.stage==='chapter'&&draft.chapterScope==='scene'?{passageId:passage!.id}:{}),
+        ...(draft.stage==='rewrite'?{passageId:passage!.id,selection:{start:draft.selection!.start,end:draft.selection!.end}}:{}),
       });
       if(workspaceRef.current?.id!==run.projectId)return;
       const existing=runsRef.current.find(item=>item.id===run.id);
@@ -489,22 +516,24 @@ export default function App() {
     onConfirm:memoryId=>changeMemory(id=>window.novel.confirmMemory(id,memoryId),'记忆建议已确认。'),
     onDelete:memoryId=>changeMemory(id=>window.novel.deleteMemory(id,memoryId),'记忆已删除。'),
   };
-  const currentScene = workspace?sceneFor(workspace,selectedScene):undefined;
+  const currentPassage = workspace?passageFor(workspace,selectedPassage):undefined;
+  const currentScene = workspace&&currentPassage?workspace.scenes.find(scene=>scene.id===currentPassage.sceneId):undefined;
   const canInspect=isBoard||view==='objects'||(view==='write'&&!!currentScene);
   const groupView=view==='objects'?'canvas':view==='story'||view==='outline'?'world':view;
   const pageTabs:View[]=groupView==='canvas'?['canvas','objects']:groupView==='world'?['outline','world','story']:[];
   const reported=Object.values(saveReports);
   const status=reported.includes('conflict')?'conflict':reported.includes('error')||saveError?'error':pendingSaves||reported.includes('saving')?'saving':reported.includes('editing')?'editing':'saved';
   /** The selected prose becomes an own sample: the strongest signal of the author's voice. */
-  const pinSample=(sceneId=selection?.sceneId,raw=selection?.text)=>{
-    const scene=workspace?.scenes.find(item=>item.id===sceneId);
-    if(!scene||!raw?.trim())return;
+  const pinSample=(passageId=selection?.passageId,raw=selection?.text)=>{
+    const passage=workspace?.passages.find(item=>item.id===passageId);
+    if(!workspace||!passage||!raw?.trim())return;
+    const title=passageLabel(workspace,passage);
     const text=raw.trim().slice(0,STYLE_LIMITS.sampleChars);
     fire(protect(async()=>{
       await commit(current=>{const style=styleProfile(current),total=style.samples.reduce((sum,item)=>sum+item.text.length,0);
         if(style.samples.some(item=>item.text===text))return[];
         if(style.samples.length>=STYLE_LIMITS.samples||total+text.length>STYLE_LIMITS.samplesTotal)throw new Error(`范文库已满（最多 ${STYLE_LIMITS.samples} 段、${STYLE_LIMITS.samplesTotal.toLocaleString()} 字），请先在文风页删掉一些。`);
-        return[{type:'updateStyle',patch:{samples:[...style.samples,{id:uid(),label:`${scene.title} · ${text.slice(0,12)}`,text,source:'own',sceneId:scene.id}]}}];},'设为范文');
+        return[{type:'updateStyle',patch:{samples:[...style.samples,{id:uid(),label:`${title} · ${text.slice(0,12)}`,text,source:'own',passageId:passage.id}]}}];},'设为范文');
       notify(`已设为范文（${text.length.toLocaleString()} 字），写作时会参照这段的笔触。`);
     }));
   };
@@ -513,22 +542,23 @@ export default function App() {
   const drawerOpen=(aiOpen&&aiDrawer)||(inspectorVisible&&inspectorDrawer);
   const groupTitle=groupView==='canvas'?'构思':groupView==='world'?'情节规划':viewTitles[view];
   const content = workspace&&<>
-    {view==='home'&&<Home workspace={workspace} scene={currentScene} commit={commit} setView={navigate} onAssist={prepareAssist} onPrepare={prepareStage} runs={runs} onMonitor={openMonitor}/>}
+    {view==='home'&&<Home workspace={workspace} passage={currentPassage} commit={commit} setView={navigate} onAssist={prepareAssist} onPrepare={prepareStage} runs={runs} onMonitor={openMonitor}/>}
     {view==='objects'&&<Objects workspace={workspace} commit={commit} selected={selectedObject} select={id=>selectEntity(setSelectedObject,id)} patchObject={patchObject} addObject={addObject} askDelete={askDelete} askAction={askAction} onAssist={prepareAssist} onOpenCanvas={openCanvas} onOpenReference={openReference} beforeChange={()=>protect(flushEdits)} inspectorHost={inspectorVisible?inspectorHost:null}/>}
     {isBoard&&<Board key={`${workspace.id}:${view}`} mode={view as 'canvas'|'world'|'story'} workspace={workspace} commit={commit}
       selectedObject={selectedObject} selectObject={id=>selectEntity(setSelectedObject,id)} selectedScene={selectedScene} selectScene={id=>selectEntity(setSelectedScene,id)} selectedCard={selectedCard} selectCard={id=>selectEntity(setSelectedCard,id)}
       addEvent={position=>addObject(undefined,true,position)} addScene={addScene} askDelete={askDelete}
       renderObjectForm={object=><ObjectForm key={object.id} workspace={workspace} object={object} commit={commit} patch={patch=>patchObject(object.id,patch)} onOpenReference={openReference} askDelete={askDelete}/>}
-      renderSceneForm={scene=><SceneForm key={scene.id} workspace={workspace} scene={scene} patch={patch=>patchScene(scene.id,patch)}/>}
+      renderSceneForm={scene=><SceneForm key={scene.id} workspace={workspace} scene={scene} patch={patch=>patchScene(scene.id,patch)} commit={commit} askDelete={askDelete} onOpenPassage={openPassage}/>}
       onOpenReference={openReference} onPrepare={prepareStage} onAssist={prepareAssist} onOpenCanvas={openCanvas} showInspector={inspectorVisible} onInspectorChange={changeInspector} inspectorHost={inspectorHost}/>}
-    {view==='outline'&&<Outline workspace={workspace} commit={commit} askDelete={askDelete} onOpenReference={openReference}/>}
-    {view==='write'&&<Writer workspace={workspace} scene={currentScene} selectScene={selectScene} registerFlush={registerFlush} addChapter={addChapter} addScene={addScene} commit={commit} askDelete={askDelete} onAssist={prepareAssist} onOpenCanvas={openCanvas} beforeChange={()=>protect(flushEdits)}
-      onSelection={picked=>setSelection(picked&&currentScene?{...picked,sceneId:currentScene.id}:undefined)} hasSelection={!!selection&&selection.sceneId===currentScene?.id&&selection.end>selection.start}
+    {view==='outline'&&<Outline workspace={workspace} commit={commit} askDelete={askDelete} onOpenPassage={openPassage}/>}
+    {view==='write'&&<Writer workspace={workspace} passage={currentPassage} selectPassage={selectPassage} registerFlush={registerFlush} addChapter={addChapter} addScene={addPassageScene} commit={commit} askDelete={askDelete} onAssist={prepareAssist} onOpenCanvas={openCanvas} beforeChange={()=>protect(flushEdits)}
+      onSelection={picked=>setSelection(picked&&currentPassage?{...picked,passageId:currentPassage.id}:undefined)} hasSelection={!!selection&&selection.passageId===currentPassage?.id&&selection.end>selection.start}
+      cursor={selection&&selection.passageId===currentPassage?.id?selection.start:undefined} notify={text=>notify(text)}
       onQuickWrite={()=>quickWrite('scene')} onContinue={()=>quickWrite('continue')} runs={runs}
       onRewrite={()=>prepareTask('rewrite',currentScene?[{kind:'scene',id:currentScene.id}]:[])} onPinSample={()=>pinSample()} onPrepare={(stage,refs,scope)=>prepareTask(stage,refs,'canvas',scope)} onDetails={()=>changeInspector(!inspectorOpen)} detailsOpen={inspectorVisible}
       focusMode={focusMode} onFocusMode={setFocusMode}/>}
-    {view==='style'&&<Style workspace={workspace} commit={commit} history={history} sceneId={currentScene?.id} onOpenScene={id=>openReference('scene',id)}/>}
-    {view==='reader'&&<Reader workspace={workspace} commit={commit} registerFlush={registerFlush} jump={id=>openReference('scene',id)} onPinSample={pinSample}/>}
+    {view==='style'&&<Style workspace={workspace} commit={commit} history={history} passageId={currentPassage?.id} onOpenPassage={openPassage}/>}
+    {view==='reader'&&<Reader workspace={workspace} commit={commit} registerFlush={registerFlush} jump={openPassage} onPinSample={pinSample}/>}
     {view==='monitor'&&<Monitor workspace={workspace} selectedRun={selectedRun} onSelectedRun={setSelectedRun} onOpenReference={openReference} onNextStage={prepareStage} runs={runs} history={history} cancel={id=>protect(()=>window.novel.cancelRun(id))} retry={retry} undo={undo} mock={provider?.mode==='mock'} agentActions={agentActions} agentBusy={agentBusy} reload={()=>reloadRuns(workspace.id)}/>}
   </>;
   const dismissConfirm=()=>{confirm?.cancel?.();setConfirm(null);};
@@ -568,7 +598,7 @@ export default function App() {
     {inspectorVisible&&<aside ref={inspectorRef} id="inspector-panel" className={`inspector-panel ${inspectorDrawer?'drawer':''}`} role={inspectorDrawer?'dialog':'complementary'} aria-modal={inspectorDrawer||undefined} aria-label="详情" tabIndex={-1}>
       <header className="panel-header"><PanelRight className="panel-icon" aria-hidden="true"/><strong>详情</strong><button className="icon-button ghost inspector-close" aria-label="关闭详情" title="关闭（Esc）" onClick={()=>closePanel('details')}><X/></button></header>
       <div className="inspector-body" ref={setInspectorHost}>
-        {view==='write'&&workspace&&currentScene&&<div className="writer-details"><div className="inspector-title"><span className="eyebrow">场景</span><h2>{currentScene.title}</h2></div><SceneForm key={currentScene.id} workspace={workspace} scene={currentScene} patch={patch=>patchScene(currentScene.id,patch)}/></div>}
+        {view==='write'&&workspace&&currentScene&&<div className="writer-details"><div className="inspector-title"><span className="eyebrow">场景</span><h2>{currentScene.title}</h2></div><SceneForm key={currentScene.id} workspace={workspace} scene={currentScene} passage={currentPassage} patch={patch=>patchScene(currentScene.id,patch)} commit={commit} askDelete={askDelete} onOpenPassage={selectPassage}/></div>}
       </div>
     </aside>}
     {aiOpen&&<aside ref={aiRef} id="ai-panel" className={`context-panel ${aiDrawer?'drawer':''}`} role={aiDrawer?'dialog':'complementary'} aria-modal={aiDrawer||undefined} aria-label="AI 助手" tabIndex={-1}>
@@ -592,7 +622,7 @@ export default function App() {
       {id:'action:ai',label:aiOpen?'关闭 AI 助手':'打开 AI 助手',group:'操作',hint:'Ctrl J',run:()=>togglePanel('ai')},
       {id:'action:new',label:'新建作品',group:'操作',run:()=>{setProjectTitle('');setCreating(true);}},
       ...(Object.entries(assistTools) as Array<[AssistTool,typeof assistTools[AssistTool]]>).map(([tool,info])=>({id:`assist:${tool}`,label:`AI · ${info.label}`,group:'AI 专项工具',disabled:!workspace,run:()=>prepareAssist(tool,[])})),
-      ...(workspace?orderedScenes(workspace).map(scene=>({id:`scene:${scene.id}`,label:scene.title,group:'场景',hint:workspace.chapters.find(c=>c.id===scene.chapterId)?.title,run:()=>openReference('scene',scene.id)})):[]),
+      ...(workspace?orderedScenes(workspace).map(scene=>({id:`scene:${scene.id}`,label:scene.title,group:'场景',hint:sceneChapters(workspace,scene.id),run:()=>openReference('scene',scene.id)})):[]),
       ...(workspace?workspace.objects.map(object=>({id:`object:${object.id}`,label:object.name,group:object.event?'世界事件':'人物与设定',hint:object.event?`#${object.event.worldOrder}`:workspace.objectTypes.find(t=>t.id===object.typeId)?.name,run:()=>openReference('object',object.id)})):[]),
     ]}/>}
     {creating&&<Dialog title="新建作品" onClose={()=>{if(!busy)setCreating(false);}}><form onSubmit={e=>{e.preventDefault();fire(protect(create));}}><label className="field"><span>作品名称</span><input data-testid="project-title-input" value={projectTitle} placeholder="为你的故事起一个名字" onChange={e=>setProjectTitle(e.target.value)} maxLength={200}/></label><label className="field"><span>题材（可选）</span><input data-testid="project-genre-input" value={projectGenre} placeholder="悬疑、奇幻、轻小说…" onChange={e=>setProjectGenre(e.target.value)} maxLength={200}/></label><label className="field"><span>一个念头（可选）</span><textarea data-testid="project-idea-input" rows={3} value={projectIdea} placeholder="一个画面、一个人物或一个还不确定的冲突。AI 会据此推断立意与人物。" onChange={e=>setProjectIdea(e.target.value)} maxLength={4000}/></label><label className="field"><span>贴一段你写的文字（可选）<small>叙境会以它为范文学习你的笔触</small></span><textarea data-testid="project-sample-input" rows={3} value={projectSample} placeholder="任何你满意的段落都可以，不必和这部作品有关。" onChange={e=>setProjectSample(e.target.value)} maxLength={STYLE_LIMITS.sampleChars}/></label><div className="button-row"><button type="button" onClick={()=>setCreating(false)} disabled={busy}>取消</button><button className="primary" data-testid="create-project" disabled={!projectTitle.trim()||busy}>{busy?'正在创建…':'创建作品'}</button></div></form></Dialog>}

@@ -11,7 +11,8 @@ export interface StyleSample {
   id: string; label: string; text: string;
   /** own: the author's writing; reference: someone else's, imitated for technique only. */
   source: 'own' | 'reference';
-  sceneId?: string; author?: string; note?: string; pinned?: boolean;
+  /** own samples: the passage the excerpt was taken from. */
+  passageId?: string; author?: string; note?: string; pinned?: boolean;
 }
 export type StyleOrigin = 'author' | 'samples' | 'edits' | 'rejection' | 'blindtest' | 'choice';
 export interface StyleRule { id: string; kind: 'do' | 'avoid'; content: string; origin: StyleOrigin; evidence?: string }
@@ -58,7 +59,7 @@ export const scaleNames: Record<StyleScaleId, [string, string, string]> = {
 export const originNames: Record<StyleOrigin, string> = { author: '作者', samples: '范文', edits: '改稿', rejection: '拒稿', blindtest: '盲测', choice: '方案取舍' };
 
 /** Edits made to AI prose, collected without a model call. */
-export interface StyleEditPair { key: string; sceneId: string; sceneTitle: string; hunks: Array<{ before: string; after: string }>; at: string }
+export interface StyleEditPair { key: string; passageId: string; title: string; hunks: Array<{ before: string; after: string }>; at: string }
 export interface StyleRejection { key: string; reason: string; label: string; at: string }
 /** One adoption among several companion options: what the author took and what they passed over in the same reply. */
 export interface StyleChoice { key: string; mode: string; chosen: string[]; passedOver: string[]; at: string }

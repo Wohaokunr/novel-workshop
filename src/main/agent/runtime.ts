@@ -6,19 +6,21 @@ import { buildWriterContext, resolveReferences, WRITER_CONTEXT_CHARS, WRITER_PRI
 import { DomainValidationError, hasSemanticChanges } from '../domain.js';
 import type { ResponseInputItem } from 'openai/resources/responses/responses';
 import { addUsage, AgentSuspended, emptyUsage, OutputLimitError, runAgent, runtimeCalls, settleCheckpointTool, ToolValidationError, type AgentCheckpoint, type AgentDefinition, type EmbeddingTransport, type ResponseTransport, type RunAgentOptions, type RuntimeCall, type ToolCallContext } from '../responses.js';
-import { bookSources, boundedContext, changeSources, collectContext, compactChanges, filteredScenes, fingerprint, refreshMemories, searchContext, selectAuthorRules } from './memory.js';
+import { bookSources, boundedContext, changeSources, collectContext, compactChanges, filteredPassages, fingerprint, refreshMemories, searchContext, selectAuthorRules } from './memory.js';
 import { nearestChunks, type SemanticHit } from './semantic.js';
 import { assertWriteScope, canProposeCommands, canReadAuthor, chainWriterNodes, createBudget, PLAN_ROLES, touchesProse, validatePlan, validatePlanTarget } from './policy.js';
 import { reviewOutcome, specialistDefinition, type SpecialistDefinition } from './specialists.js';
 import { createCoordinatorTools, toolDefinitions, type ToolName } from './tools.js';
-import { sceneMentions } from './story-index.js';
+import { passageMentions } from './story-index.js';
 import { StoryView } from './story-view.js';
 import { storyOpsCommands } from './story-ops.js';
 import { objectNames } from '../../shared/story-elements.js';
+import { orderedChapters } from '../../shared/structure.js';
+import { changePlace, labelledAspects, storyTimeline } from '../../shared/story-state.js';
 import { coordinatorPrompt } from '../prompts/coordinator.js';
 import { promptVersion } from '../prompts/prompt.js';
 
-const SCENE_TEXT_PREVIEW = 4000, READ_TEXT_CHARS = 6000, READ_ENTITIES_CHARS = 16_000;
+const PASSAGE_TEXT_PREVIEW = 4000, READ_TEXT_CHARS = 6000, READ_ENTITIES_CHARS = 16_000;
 
 /** Checkpoints replay tool calls, so a run resumes only with the tools it started with. The schema part is derived from the tool names and
  * parameters; bump the number only when a tool's behaviour changes incompatibly with the same schema. Prompt edits do not block resuming. */
@@ -58,7 +60,7 @@ export function keepCompleted(nodes: PlanNode[], previous: AgentPlan | undefined
   if (!previous) return [];
   const before = new Map(previous.nodes.map(node => [node.id, node])), byId = new Map(nodes.map(node => [node.id, node])), kept = new Set<string>(), seen = new Set<string>();
   const same = (a: PlanNode, b: PlanNode) => a.role === b.role && a.objective === b.objective && a.acceptance === b.acceptance
-    && (['sceneId', 'chapterId', 'characterId', 'eventId'] as const).every(key => (a[key] ?? null) === (b[key] ?? null))
+    && (['passageId', 'sceneId', 'chapterId', 'characterId', 'eventId'] as const).every(key => (a[key] ?? null) === (b[key] ?? null))
     && a.dependsOn.length === b.dependsOn.length && a.dependsOn.every(id => b.dependsOn.includes(id));
   const visit = (node: PlanNode): boolean => {
     if (seen.has(node.id)) return kept.has(node.id);
@@ -171,18 +173,18 @@ export class PersistentAgentRuntime {
     if (!['agent', 'idea', 'outline', 'chapter', 'rewrite', 'assist'].includes(request.stage)) fail('任务类型无效');
     if (typeof request.objective !== 'string' || !request.objective.trim() || request.objective.length > 20000) fail('请提供不超过 20000 字符的创作目标');
     resolveReferences(project, request.references);
-    if (request.sceneId && !project.scenes.some(scene => scene.id === request.sceneId)) fail('目标场景已删除');
+    if (request.passageId && !project.passages.some(passage => passage.id === request.passageId)) fail('目标场景段已删除');
     if (request.chapterId && !project.chapters.some(chapter => chapter.id === request.chapterId)) fail('目标章节已删除');
-    const scene = project.scenes.find(scene => scene.id === request.sceneId);
-    if (scene && request.chapterId && scene.chapterId !== request.chapterId) fail('场景不属于目标章节');
-    if (request.selection && !allowWrittenTargets && (!scene || !Number.isSafeInteger(request.selection.start) || !Number.isSafeInteger(request.selection.end)
-      || request.selection.start < 0 || request.selection.end < request.selection.start || request.selection.end > scene.text.length)) fail('改写选区无效');
-    if (request.stage === 'rewrite' && !scene) fail('请选择要改写的场景');
+    const passage = project.passages.find(passage => passage.id === request.passageId);
+    if (passage && request.chapterId && passage.chapterId !== request.chapterId) fail('场景段不属于目标章节');
+    if (request.selection && !allowWrittenTargets && (!passage || !Number.isSafeInteger(request.selection.start) || !Number.isSafeInteger(request.selection.end)
+      || request.selection.start < 0 || request.selection.end < request.selection.start || request.selection.end > passage.text.length)) fail('改写选区无效');
+    if (request.stage === 'rewrite' && !passage) fail('请选择要改写的场景段');
     if (request.selection && request.stage !== 'rewrite') fail('只有改写任务可设置选区');
     if (request.stage === 'assist' ? !request.tool || !['character', 'world', 'narrative', 'canvas', 'theme', 'continuity'].includes(request.tool) : request.tool !== undefined) fail('辅助工具与任务类型不匹配');
     if (request.stage === 'chapter' && !allowWrittenTargets) {
-      const targetChapter = request.chapterId ?? scene?.chapterId ?? project.chapters[0]?.id;
-      if (!project.scenes.some(value => (!scene || value.id === scene.id) && value.chapterId === targetChapter && !value.text.trim())) fail('目标没有空白场景，请选中文字使用改写任务');
+      const targetChapter = request.chapterId ?? passage?.chapterId ?? orderedChapters(project)[0]?.id;
+      if (!project.passages.some(value => (!passage || value.id === passage.id) && value.chapterId === targetChapter && !value.text.trim())) fail('目标没有空白的场景段，请选中文字使用改写任务');
     }
   }
 
@@ -333,8 +335,8 @@ export class PersistentAgentRuntime {
     if (this.store.getProject(previous.projectId).revision !== expectedRevision) throw new Error('REVISION_CONFLICT：作品已更新');
     const entry = provider && previous.status === 'failed' ? this.reusable(id, provider) : undefined;
     if (!entry) {
-      const { projectId, stage, tool, objective, chapterId, sceneId, selection, references } = previous;
-      return this.start({ projectId, stage, tool, objective, chapterId, sceneId, selection, references });
+      const { projectId, stage, tool, objective, chapterId, passageId, selection, references } = previous;
+      return this.start({ projectId, stage, tool, objective, chapterId, passageId, selection, references });
     }
     if (this.store.getRuns(previous.projectId).some(run => run.id !== id && (!terminal.has(run.status) || (run.status === 'cancelled' && !run.finishedAt)))
       || [...this.active.values()].some(other => other.run.projectId === previous.projectId)) throw new Error('这部作品已有未结束任务，请恢复或结束当前任务');
@@ -567,10 +569,10 @@ export class PersistentAgentRuntime {
         const workspace = this.workspace(entry, args.candidateId), kind = String(args.kind) as 'objects';
         const ids = args.ids as string[];
         if (ids.length > 20) fail('一次最多读取 20 个实体');
-        const values = (workspace[kind] as Array<{ id: string }>).filter(value => ids.includes(value.id)).map(value => {
-          const scene = value as Workspace['scenes'][number];
-          if (String(kind) !== 'scenes' || scene.text.length <= SCENE_TEXT_PREVIEW) return value;
-          return { ...scene, text: `${scene.text.slice(0, SCENE_TEXT_PREVIEW / 2)}\n……（中间 ${scene.text.length - SCENE_TEXT_PREVIEW} 字未载入，用 read_text 读取）……\n${scene.text.slice(-SCENE_TEXT_PREVIEW / 2)}`, textChars: scene.text.length };
+        const values = ((workspace[kind] ?? []) as Array<{ id: string }>).filter(value => ids.includes(value.id)).map(value => {
+          const passage = value as Workspace['passages'][number];
+          if (String(kind) !== 'passages' || passage.text.length <= PASSAGE_TEXT_PREVIEW) return value;
+          return { ...passage, text: `${passage.text.slice(0, PASSAGE_TEXT_PREVIEW / 2)}\n……（中间 ${passage.text.length - PASSAGE_TEXT_PREVIEW} 字未载入，用 read_text 读取）……\n${passage.text.slice(-PASSAGE_TEXT_PREVIEW / 2)}`, textChars: passage.text.length };
         });
         const text = JSON.stringify(values);
         return text.length > READ_ENTITIES_CHARS ? { ok: false, reason: '内容过大，请减少实体或用 search_context 读取片段' } : { revision: workspace.revision, values, missing: ids.filter(id => !values.some(value => value.id === id)) };
@@ -578,19 +580,19 @@ export class PersistentAgentRuntime {
       case 'search_context': {
         const workspace = this.workspace(entry), query = String(args.query);
         const filter = { chapterFrom: args.chapterFrom as string | null, chapterTo: args.chapterTo as string | null, entityId: args.entityId as string | null };
-        return searchContext(workspace, query, 6, 'coordinator', {}, filter, await this.semantic(entry, workspace, query, filteredScenes(workspace, filter)));
+        return searchContext(workspace, query, 6, 'coordinator', {}, filter, await this.semantic(entry, workspace, query, filteredPassages(workspace, filter)));
       }
       case 'get_context': {
         const workspace = this.workspace(entry, args.candidateId);
-        const { sources: _sources, ...context } = buildWriterContext(workspace, String(args.sceneId), entry.run.references, this.story(workspace));
+        const { sources: _sources, ...context } = buildWriterContext(workspace, String(args.passageId), entry.run.references, this.story(workspace));
         return boundedContext(context, WRITER_CONTEXT_CHARS, WRITER_PRIORITY);
       }
       case 'read_story_memory': return this.storyMemory(this.workspace(entry), args);
       case 'read_text': {
-        const scene = this.workspace(entry).scenes.find(item => item.id === String(args.sceneId)) ?? fail('场景不存在');
-        const start = Math.max(0, Math.min(scene.text.length, Math.floor(Number(args.start) || 0)));
-        const end = Math.min(scene.text.length, start + Math.max(1, Math.min(READ_TEXT_CHARS, Math.floor(Number(args.length) || READ_TEXT_CHARS))));
-        return { sceneId: scene.id, title: scene.title, start, end, totalChars: scene.text.length, text: scene.text.slice(start, end) };
+        const workspace = this.workspace(entry), passage = workspace.passages.find(item => item.id === String(args.passageId)) ?? fail('场景段不存在');
+        const start = Math.max(0, Math.min(passage.text.length, Math.floor(Number(args.start) || 0)));
+        const end = Math.min(passage.text.length, start + Math.max(1, Math.min(READ_TEXT_CHARS, Math.floor(Number(args.length) || READ_TEXT_CHARS))));
+        return { passageId: passage.id, sceneId: passage.sceneId, chapterId: passage.chapterId, title: this.story(workspace).label(passage.id), start, end, totalChars: passage.text.length, text: passage.text.slice(start, end) };
       }
       case 'recall_memory': return this.memories(projectId).filter(memory => memory.status === 'active' && memory.confirmed).map(memory => ({ id: memory.id, kind: memory.kind, content: memory.content, sources: memory.sources }));
       case 'refresh_context': {
@@ -610,7 +612,7 @@ export class PersistentAgentRuntime {
         state.planVersion = (state.planVersion ?? state.plan?.version ?? 0) + 1;
         state.plan = { version: state.planVersion, summary: String(args.summary), nodes };
         return { ...state.plan, notice: `计划已保存。运行时会按依赖自动执行节点、组成候选、审查正文并提交作者批准；完成或需要你决定时会交还给你。${
-          chained ? '写作节点已按阅读顺序串联：后一场会读到前一场刚写的正文。' : ''}${kept.length ? `沿用上一版计划中已完成节点的结果：${kept.join('、')}。` : ''}` };
+          chained ? '写作节点已按阅读顺序串联：后一段会读到前一段刚写的正文。' : ''}${kept.length ? `沿用上一版计划中已完成节点的结果：${kept.join('、')}。` : ''}` };
       }
       case 'delegate_tasks': {
         if (!state.plan) fail('先保存任务计划');
@@ -759,24 +761,26 @@ export class PersistentAgentRuntime {
     const call = this.nextStep(entry);
     return call && !failedBefore(cp, call) ? [call] : undefined;
   }
-  /** Writing one scene or rewriting / continuing at one place needs no planning: the runtime saves the plan itself, so the coordinator
-   * model is only consulted when something goes wrong. Chapter writing also follows the viewpoint character through the scene's events. */
+  /** Writing one passage or rewriting / continuing at one place needs no planning: the runtime saves the plan itself, so the coordinator
+   * model is only consulted when something goes wrong. Writing a passage also records how the people and places of its scene change
+   * in what was just written. */
   private quickPlan(entry: Entry): RuntimeCall | undefined {
     const run = entry.run;
-    if (!run.sceneId || (run.stage !== 'rewrite' && run.stage !== 'chapter')) return undefined;
-    const workspace = entry.state.baseWorkspace, scene = workspace.scenes.find(item => item.id === run.sceneId);
-    if (!scene) return undefined;
-    const target = { sceneId: scene.id, chapterId: scene.chapterId };
+    if (!run.passageId || (run.stage !== 'rewrite' && run.stage !== 'chapter')) return undefined;
+    const workspace = entry.state.baseWorkspace, passage = workspace.passages.find(item => item.id === run.passageId);
+    const scene = passage && workspace.scenes.find(item => item.id === passage.sceneId);
+    if (!passage || !scene) return undefined;
+    const target = { passageId: passage.id, chapterId: passage.chapterId };
     const nodes: Array<Record<string, unknown>> = [{ id: 'write', role: 'writer', objective: run.objective, dependsOn: [], acceptance: run.stage === 'rewrite'
-      ? '只写入选区或光标处，保留其余正文' : '写出本场完整正文，落实场景大纲的每个节拍', ...target, characterId: null, eventId: null }];
-    if (run.stage === 'chapter' && scene.povId) {
-      for (const eventId of scene.eventIds.slice(0, 2)) {
-        const node = { id: `evolve-${eventId}`, role: 'evolution', objective: '依据本场正文跟进视角人物在这个事件之后的视角、心理与动机。', dependsOn: ['write'],
-          acceptance: '变化有正文依据', ...target, characterId: scene.povId, eventId };
-        try { validatePlanTarget({ ...node, status: 'pending' } as PlanNode, workspace, run); nodes.push(node); } catch { /* The viewpoint character is not part of this event. */ }
-      }
+      ? '只写入选区或光标处，保留其余正文' : '写出本段完整正文，落实场景大纲与本段节拍', ...target, sceneId: null, characterId: null, eventId: null }];
+    const onStage = !!scene.povId || !!scene.castIds?.length || !!scene.settingIds?.length || scene.eventIds.length > 0;
+    if (run.stage === 'chapter' && onStage) {
+      const node = { id: 'evolve', role: 'evolution' as const, objective: '依据刚写好的正文，记下这一场里人物与环境的状态变化。', dependsOn: ['write'],
+        acceptance: '每条变化都有正文依据', ...target, sceneId: scene.id };
+      try { validatePlanTarget({ ...node, status: 'pending' }, workspace, run); nodes.push({ ...node, characterId: null, eventId: null }); } catch { /* Out of the task's scope: the passage alone is written. */ }
     }
-    return { name: 'set_plan', arguments: { summary: run.stage === 'rewrite' ? '在目标位置改写或续写，审阅后交作者批准。' : `写作「${clipText(scene.title, 30)}」，审阅后交作者批准。`, nodes } };
+    const title = new StoryView(workspace).label(passage.id);
+    return { name: 'set_plan', arguments: { summary: run.stage === 'rewrite' ? '在目标位置改写或续写，审阅后交作者批准。' : `写作「${clipText(title, 30)}」，审阅后交作者批准。`, nodes } };
   }
   private nextStep(entry: Entry): RuntimeCall | undefined {
     const state = entry.state, ready = this.readyNodes(entry);
@@ -866,39 +870,39 @@ export class PersistentAgentRuntime {
       if (saved) { candidate = saved; continue; }
       if (candidate.status !== 'draft') fail('只能审查当前草稿候选');
       const node: PlanNode = { id: `review-${candidate.hash}`, role: 'continuity', objective: '检查这组候选修改的因果、人物认知、正文与设定一致性；只报告可指出依据的实际问题。', dependsOn: [], acceptance: '给出具体问题和 pass/revise', status: 'running' };
-      const changed = candidate.changes.filter(change => change.collection === 'scenes' && change.after !== undefined).map(change => change.key);
+      const changed = candidate.changes.filter(change => change.collection === 'passages' && change.after !== undefined).map(change => change.key);
       const artifact = await this.specialist(entry, node, `review:${candidate.hash}:continuity`, candidate.workspace, changed);
       candidate.reviews = [{ candidateHash: candidate.hash, role: 'continuity', ...reviewOutcome(artifact.structured), sources: artifact.sources, stepId: artifact.stepId }];
       const story = this.story(candidate.workspace);
-      const scenes = candidate.workspace.scenes.filter(scene => candidate.changes.some(change => change.collection === 'scenes' && change.key === scene.id
-        && (change.before as { text?: string } | undefined)?.text !== scene.text && scene.text.trim()))
+      const passages = candidate.workspace.passages.filter(passage => candidate.changes.some(change => change.collection === 'passages' && change.key === passage.id
+        && (change.before as { text?: string } | undefined)?.text !== passage.text && passage.text.trim()))
         .sort((a, b) => story.positionOf(a.id) - story.positionOf(b.id));
-      if (scenes.length) {
-        // A reader sees a chapter up to its target scene, so the last rewritten scene of each chapter covers the ones before it.
-        const lastPerChapter = [...new Map(scenes.map(scene => [scene.chapterId, scene])).values()].slice(-READER_REVIEW_CHAPTERS);
-        for (const [index, scene] of lastPerChapter.entries()) {
-          const readerNode: PlanNode = { ...node, id: `reader-${candidate.hash}${index ? `-${index}` : ''}`, role: 'reader', sceneId: scene.id, chapterId: scene.chapterId };
-          const reader = await this.specialist(entry, readerNode, `review:${candidate.hash}:reader${index ? `:${scene.chapterId}` : ''}`, candidate.workspace);
+      if (passages.length) {
+        // A reader sees a chapter up to its target passage, so the last rewritten passage of each chapter covers the ones before it.
+        const lastPerChapter = [...new Map(passages.map(passage => [passage.chapterId, passage])).values()].slice(-READER_REVIEW_CHAPTERS);
+        for (const [index, passage] of lastPerChapter.entries()) {
+          const readerNode: PlanNode = { ...node, id: `reader-${candidate.hash}${index ? `-${index}` : ''}`, role: 'reader', passageId: passage.id, chapterId: passage.chapterId };
+          const reader = await this.specialist(entry, readerNode, `review:${candidate.hash}:reader${index ? `:${passage.chapterId}` : ''}`, candidate.workspace);
           candidate.reviews.push({ candidateHash: candidate.hash, role: 'reader', ...reviewOutcome(reader.structured), sources: reader.sources, stepId: reader.stepId });
         }
         // The author's voice is reviewed separately from story logic: does this read like them?
-        const styleNode: PlanNode = { ...node, id: `style-${candidate.hash}`, role: 'stylist', sceneId: scenes[0]!.id, chapterId: scenes[0]!.chapterId };
-        const stylist = await this.specialist(entry, styleNode, `review:${candidate.hash}:style`, candidate.workspace, scenes.map(item => item.id));
+        const styleNode: PlanNode = { ...node, id: `style-${candidate.hash}`, role: 'stylist', passageId: passages[0]!.id, chapterId: passages[0]!.chapterId };
+        const stylist = await this.specialist(entry, styleNode, `review:${candidate.hash}:style`, candidate.workspace, passages.map(item => item.id));
         candidate.reviews.push({ candidateHash: candidate.hash, role: 'style', ...reviewOutcome(stylist.structured), sources: stylist.sources, stepId: stylist.stepId });
       }
       const needsRevision = candidate.reviews.some(review => review.verdict === 'revise');
       const remaining = Math.max(0, entry.state.budget.maxRevisions - entry.state.budget.revisions);
       // One automatic pass on the must-fix issues; anything still open goes to the author with the reviews rather than another rewrite.
-      if (!needsRevision || !scenes.length || !remaining || entry.state.budget.revisions >= AUTO_REVISIONS) return { candidateId: candidate.id, hash: candidate.hash, candidateHash: candidate.hash, reviews: candidate.reviews,
-        revisionsRemaining: remaining, nextAction: needsRevision && !scenes.length && remaining ? 'revise_candidate' : 'commit_candidate' };
-      const writers: PlanNode[] = scenes.map(scene => ({ id: `write-${scene.id}`, role: 'writer', objective: entry.run.objective, mode: 'patch',
-        sceneId: scene.id, chapterId: scene.chapterId, dependsOn: [], acceptance: '落实当前候选的自动审查意见，保留授权范围以外的正文', status: 'pending' }));
-      await this.reviseCandidate(entry, candidate, writers, '按 candidateReviews 中【必须】的意见局部修订本场正文：只改被指出的句段，保留其余原文、成立的情节与作者方向；【建议】的意见有把握才改。', revisionCall);
+      if (!needsRevision || !passages.length || !remaining || entry.state.budget.revisions >= AUTO_REVISIONS) return { candidateId: candidate.id, hash: candidate.hash, candidateHash: candidate.hash, reviews: candidate.reviews,
+        revisionsRemaining: remaining, nextAction: needsRevision && !passages.length && remaining ? 'revise_candidate' : 'commit_candidate' };
+      const writers: PlanNode[] = passages.map(passage => ({ id: `write-${passage.id}`, role: 'writer', objective: entry.run.objective, mode: 'patch',
+        passageId: passage.id, chapterId: passage.chapterId, dependsOn: [], acceptance: '落实当前候选的自动审查意见，保留授权范围以外的正文', status: 'pending' }));
+      await this.reviseCandidate(entry, candidate, writers, '按 candidateReviews 中【必须】的意见局部修订本段正文：只改被指出的句段，保留其余原文、成立的情节与作者方向；【建议】的意见有把握才改。', revisionCall);
       candidate = entry.state.candidates.at(-1)!;
     }
   }
 
-  private async specialist(entry: Entry, node: PlanNode, slot: string, workspace = this.workspace(entry), focusSceneIds?: string[], upstream?: UpstreamResult[]): Promise<AgentArtifact> {
+  private async specialist(entry: Entry, node: PlanNode, slot: string, workspace = this.workspace(entry), focusPassageIds?: string[], upstream?: UpstreamResult[]): Promise<AgentArtifact> {
     const previous = entry.state.artifacts.find(artifact => artifact.id === `artifact-${fingerprint(`${entry.run.id}:${slot}`).slice(0, 24)}`);
     if (previous) return previous;
     const reservations = entry.state.reservedChildren ??= [];
@@ -907,18 +911,19 @@ export class PersistentAgentRuntime {
       entry.state.budget.children++; reservations.push(slot); this.publish(entry);
     }
     let specialistRequest = entry.run;
-    const candidateScene = node.sceneId ? workspace.scenes.find(scene => scene.id === node.sceneId) : undefined;
-    if (node.role === 'writer' && entry.run.stage === 'chapter' && candidateScene?.text.trim()
-      && !entry.state.baseWorkspace.scenes.find(scene => scene.id === candidateScene.id)?.text.trim()) {
-      specialistRequest = { ...entry.run, stage: 'rewrite', sceneId: candidateScene.id, selection: undefined };
+    // A writer revising what this task already wrote: the passage now has prose, so it is rewritten rather than written afresh.
+    const candidatePassage = node.role === 'writer' ? workspace.passages.find(passage => passage.id === (node.passageId ?? entry.run.passageId)) : undefined;
+    if (candidatePassage && entry.run.stage === 'chapter' && candidatePassage.text.trim()
+      && !entry.state.baseWorkspace.passages.find(passage => passage.id === candidatePassage.id)?.text.trim()) {
+      specialistRequest = { ...entry.run, stage: 'rewrite', passageId: candidatePassage.id, selection: undefined };
     }
-    if (node.role === 'writer' && entry.run.stage === 'rewrite' && entry.run.selection && candidateScene) {
-      const original = entry.state.baseWorkspace.scenes.find(scene => scene.id === candidateScene.id)!;
-      specialistRequest = { ...entry.run, selection: { ...entry.run.selection, end: entry.run.selection.end + candidateScene.text.length - original.text.length } };
+    if (candidatePassage && entry.run.stage === 'rewrite' && entry.run.selection) {
+      const original = entry.state.baseWorkspace.passages.find(passage => passage.id === candidatePassage.id)!;
+      specialistRequest = { ...entry.run, selection: { ...entry.run.selection, end: entry.run.selection.end + candidatePassage.text.length - original.text.length } };
     }
     // Author rules go wherever author material may go; character, reader and stylist views stay bounded.
     const authorRules = canReadAuthor(node.role) ? selectAuthorRules(this.memories(entry.run.projectId)).rules.map(memory => ({ kind: memory.kind, content: memory.content })) : undefined;
-    const specification = specialistDefinition({ role: node.role, node, project: workspace, request: specialistRequest, story: this.story(workspace), focusSceneIds, authorRules, upstream });
+    const specification = specialistDefinition({ role: node.role, node, project: workspace, request: specialistRequest, story: this.story(workspace), focusPassageIds, authorRules, upstream });
     if (canProposeCommands(node.role)) {
       const candidate = [...entry.state.candidates].reverse().find(candidate => candidate.workspace === workspace);
       const reviews = candidate?.reviews.filter(review => review.candidateHash === candidate.hash);
@@ -968,19 +973,24 @@ export class PersistentAgentRuntime {
     }
   }
 
-  /** Zoom levels between the overview and raw text: chapter / scene digests for a range, or an entity's timeline. */
+  /** Zoom levels between the overview and raw text: chapter / passage digests for a range, or an entity's timeline with the state
+   * changes the author recorded for it. */
   private storyMemory(workspace: Workspace, args: Record<string, unknown>) {
     const view = this.story(workspace);
     const entityId = args.entityId ? String(args.entityId) : undefined;
     if (entityId) {
       const object = workspace.objects.find(item => item.id === entityId) ?? fail('对象不存在');
-      const appearances = view.order.filter(scene => scene.povId === entityId || scene.eventIds.includes(entityId) || sceneMentions(view.index, scene.id).has(entityId));
+      const onStage = (sceneId: string) => { const scene = view.scene(sceneId); return !!scene && (scene.povId === entityId || scene.eventIds.includes(entityId)
+        || !!scene.castIds?.includes(entityId) || !!scene.settingIds?.includes(entityId)); };
+      const appearances = view.order.filter(passage => onStage(passage.sceneId) || passageMentions(view.index, passage.id).has(entityId));
       const picked = appearances.length > 40 ? [...appearances.slice(0, 10), ...appearances.slice(-30)] : appearances;
-      return { notice: '故事记忆是辅助摘要，不是正式事实。', entity: { id: object.id, name: object.name }, appearances: appearances.length,
+      const history = object.event ? [] : storyTimeline(workspace).history(entityId);
+      return { notice: '故事记忆是辅助摘要，不是正式事实；stateChanges 是作者记下的状态变化，按生效顺序。', entity: { id: object.id, name: object.name }, appearances: appearances.length,
         ...(appearances.length > 40 ? { omitted: `中间 ${appearances.length - 40} 次出场未列出，可用 chapterFrom/chapterTo 查看` } : {}),
-        timeline: picked.map(scene => { const memory = view.sceneMemory(scene.id), mention = sceneMentions(view.index, scene.id).get(entityId);
-          return { sceneId: scene.id, chapter: view.chapters[view.chapterIndex(scene.chapterId)]?.title, ...memory, summary: memory.summary.slice(0, 200), mentions: mention?.count ?? 0,
-            changes: memory.changes?.filter(change => objectNames(object).some(name => change.who.includes(name) || name.includes(change.who))) }; }) };
+        timeline: picked.map(passage => { const memory = view.passageMemory(passage.id), mention = passageMentions(view.index, passage.id).get(entityId);
+          return { passageId: passage.id, chapter: view.chapters[view.chapterIndex(passage.chapterId)]?.title, ...memory, summary: memory.summary.slice(0, 200), mentions: mention?.count ?? 0,
+            changes: memory.changes?.filter(change => objectNames(object).some(name => change.who.includes(name) || name.includes(change.who))) }; }),
+        stateChanges: history.slice(-30).map(change => ({ id: change.id, place: changePlace(workspace, change), becomes: labelledAspects(change.aspects), ...(change.note ? { note: change.note.slice(0, 300) } : {}) })) };
     }
     const from = args.chapterFrom ? view.chapterIndex(String(args.chapterFrom)) : Math.max(0, view.chapterIndex(view.frontierChapterId() ?? '') - 2);
     const to = args.chapterTo ? view.chapterIndex(String(args.chapterTo)) : from + 2;
@@ -988,8 +998,8 @@ export class PersistentAgentRuntime {
     const chapters = view.chapters.slice(Math.min(from, to), Math.min(Math.max(from, to), Math.min(from, to) + 9) + 1);
     return boundedContext({ notice: '故事记忆是辅助摘要，不是正式事实；一次最多 10 章。', book: view.bookSummary(),
       chapters: chapters.map(chapter => ({ id: chapter.id, title: chapter.title, ...view.chapterSummary(chapter.id),
-        scenes: view.order.filter(scene => scene.chapterId === chapter.id).map(scene => ({ id: scene.id, writtenChars: scene.text.length, ...view.sceneMemory(scene.id) })) })),
-      openThreadsAfter: chapters.length ? view.ledgerBefore(view.order.filter(scene => view.chapterIndex(scene.chapterId) > view.chapterIndex(chapters.at(-1)!.id))[0]?.id).map(thread => thread.title).slice(-15) : [] }, 16_000);
+        passages: view.order.filter(passage => passage.chapterId === chapter.id).map(passage => ({ id: passage.id, sceneId: passage.sceneId, writtenChars: passage.text.length, ...view.passageMemory(passage.id) })) })),
+      openThreadsAfter: chapters.length ? view.ledgerBefore(view.order.filter(passage => view.chapterIndex(passage.chapterId) > view.chapterIndex(chapters.at(-1)!.id))[0]?.id).map(thread => thread.title).slice(-15) : [] }, 16_000);
   }
 
   getMemories(projectId: string) { return this.memories(projectId); }

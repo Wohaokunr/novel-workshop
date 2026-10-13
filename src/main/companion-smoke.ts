@@ -5,6 +5,15 @@ import { setTimeout as delay } from 'node:timers/promises';
 import type { BrowserWindow } from 'electron';
 import type { NovelStore } from './store.js';
 import { cardRect } from '../shared/canvas.js';
+import { orderedPassages } from '../shared/structure.js';
+import type { Command, NarrativeScene, Workspace } from '../shared/types.js';
+
+/** A scene read in one chapter: the scene and its one passage, sharing the id. */
+function scene(id: string, chapterId: string, order: number, text: string, value: Omit<NarrativeScene, 'id'>): Command[] {
+  return [{ type: 'putScene', value: { id, ...value } }, { type: 'putPassage', value: { id, sceneId: id, chapterId, order, text } }];
+}
+/** The prose of a scene, all its passages in reading order. */
+const prose = (workspace: Workspace, sceneId: string) => orderedPassages(workspace).filter(passage => passage.sceneId === sceneId).map(passage => passage.text).join('');
 
 /** Desktop acceptance for the creative partner: every surface summons it, adoption writes undoable AI batches, threads persist. */
 export async function runCompanionSmoke(window: BrowserWindow, store: NovelStore) {
@@ -102,9 +111,9 @@ export async function runCompanionSmoke(window: BrowserWindow, store: NovelStore
     { type: 'putObject', value: { id: 'lin', typeId: 'character', name: '林舟', fields: { description: '修钟学徒' } } },
     { type: 'putObject', value: { id: 'shen', typeId: 'character', name: '沈卿', fields: { description: '信使' } } },
     { type: 'putObject', value: { id: 'bell', typeId: 'event', name: '第十三声', fields: {}, event: { worldOrder: 1, timeLabel: '第一夜', thread: '钟楼', participants: ['lin', 'shen'], causes: [], critical: true, observations: {} } } },
-    { type: 'putScene', value: { id: 'scene-a', chapterId: chapter.id, order: 1, title: '铜片', povId: 'lin', eventIds: [], outline: '林舟捡到铜片', text: '雾从门缝里挤进来。' } },
-    { type: 'putScene', value: { id: 'scene-b', chapterId: chapter.id, order: 2, title: '钟声', povId: 'shen', eventIds: ['bell'], outline: '第十三声响起', text: '' } },
-    { type: 'putScene', value: { id: 'scene-c', chapterId: chapter.id, order: 3, title: '钥匙', povId: 'lin', eventIds: [], outline: '决定是否相信', text: '' } },
+    ...scene('scene-a', chapter.id, 1, '雾从门缝里挤进来。', { title: '铜片', povId: 'lin', eventIds: [], outline: '林舟捡到铜片' }),
+    ...scene('scene-b', chapter.id, 2, '', { title: '钟声', povId: 'shen', eventIds: ['bell'], outline: '第十三声响起' }),
+    ...scene('scene-c', chapter.id, 3, '', { title: '钥匙', povId: 'lin', eventIds: [], outline: '决定是否相信' }),
     { type: 'putCard', value: { id: 'anchor', kind: 'note', title: '第十三声', content: '报时钟多响了一声', x: 200, y: 200 } },
   ] });
   window.webContents.reload();
@@ -166,7 +175,7 @@ export async function runCompanionSmoke(window: BrowserWindow, store: NovelStore
   await clickText('.companion-popover [data-testid="adopt-proposal"]', '采纳所选');
   const outlined = await until(() => { const value = store.getProject(project.id); return value.acts?.length === 2 ? value : null; }, '部分采纳两幕');
   assert.ok(outlined.chapters.filter(item => item.actId).length >= 4);
-  assert.equal(outlined.scenes.find(scene => scene.id === 'scene-a')!.text, '雾从门缝里挤进来。', '已有正文不变');
+  assert.equal(prose(outlined, 'scene-a'), '雾从门缝里挤进来。', '已有正文不变');
   await closePopover();
   await until(() => ui<boolean>(`document.querySelectorAll('[data-testid="outline-act"]').length === 2`), '大纲树显示两幕');
   await capture('companion-04-outline-tree.png');
@@ -179,8 +188,8 @@ export async function runCompanionSmoke(window: BrowserWindow, store: NovelStore
   await until(() => ui<boolean>(`!!document.querySelector('.companion-popover .structure-preview')`), '结构前后对比');
   await capture('companion-05-structure.png');
   await ui(`document.querySelector('.companion-popover [data-testid="adopt-proposal"]').click()`);
-  await until(() => { const value = store.getProject(project.id); const first = value.scenes.filter(scene => scene.chapterId === chapter.id).sort((a, b) => a.order - b.order)[0]; return first?.id === 'scene-c'; }, '采纳重排');
-  assert.equal(store.getProject(project.id).scenes.find(scene => scene.id === 'scene-a')!.text, '雾从门缝里挤进来。');
+  await until(() => { const value = store.getProject(project.id); const first = value.passages.filter(passage => passage.chapterId === chapter.id).sort((a, b) => a.order - b.order)[0]; return first?.sceneId === 'scene-c'; }, '采纳重排');
+  assert.equal(prose(store.getProject(project.id), 'scene-a'), '雾从门缝里挤进来。');
   await closePopover();
 
   // 3b. The diagnosis wants a scene the outline has no chapter for: the proposal opens the chapter itself.
@@ -191,11 +200,11 @@ export async function runCompanionSmoke(window: BrowserWindow, store: NovelStore
   const flashback = `[...document.querySelectorAll('.companion-popover [data-testid="companion-proposal"]')].find(e => e.querySelector('.proposal-title strong')?.textContent === '插入一章插叙')`;
   await until(() => ui<boolean>(`!!(${flashback})?.querySelector('.structure-preview')?.textContent.includes('新章')`), '新章出现在前后对比里');
   await ui(`(${flashback}).querySelector('[data-testid="adopt-proposal"]').click()`);
-  const opened = await until(() => { const value = store.getProject(project.id); const created = value.chapters.find(item => item.title === '插叙 · 三十年前'); return created && value.scenes.some(scene => scene.chapterId === created.id && scene.title === '旧案') ? value : null; }, '新章与新场景一起采纳');
+  const opened = await until(() => { const value = store.getProject(project.id); const created = value.chapters.find(item => item.title === '插叙 · 三十年前'); return created && value.passages.some(passage => passage.chapterId === created.id && value.scenes.find(scene => scene.id === passage.sceneId)?.title === '旧案') ? value : null; }, '新章与新场景一起采纳');
   assert.equal(opened.chapters.length, chaptersBefore + 1);
   const ordered = [...opened.chapters].sort((a, b) => a.order - b.order);
   assert.equal(ordered[ordered.findIndex(item => item.id === chapter.id) + 1]!.title, '插叙 · 三十年前', '新章紧跟在锚点场景所在章之后');
-  assert.equal(opened.scenes.find(scene => scene.title === '旧案')!.text, '');
+  assert.equal(prose(opened, opened.scenes.find(scene => scene.title === '旧案')!.id), '');
   await closePopover();
 
   // 3c. 人物与设定 is split into the three elements; settings are designed like the cast.
@@ -223,7 +232,7 @@ export async function runCompanionSmoke(window: BrowserWindow, store: NovelStore
   await ui(`document.querySelector('[data-testid="nav-write"]').click()`); await delay(200);
   await until(() => ui<boolean>(`document.querySelector('.app').classList.contains('view-write')`), '进入写作');
   await click('writer-beat'); await idle();
-  const sceneId = store.getProject(project.id).scenes.sort((a, b) => a.order - b.order)[0]!.id;
+  const sceneId = orderedPassages(store.getProject(project.id))[0]!.sceneId;
   const outlineBefore = store.getProject(project.id).scenes.length;
   await ui(`document.querySelector('.companion-popover [data-testid="adopt-idea-outline"]').click()`);
   await until(() => store.getProject(project.id).scenes.some(scene => scene.outline.includes('· ')), '下一拍补进场景大纲');
@@ -233,6 +242,11 @@ export async function runCompanionSmoke(window: BrowserWindow, store: NovelStore
   await click('show-details-panel');
   await until(() => ui<boolean>(`!!document.querySelector('.writer-details [data-testid="scene-elements"]')`), '场景三要素小结');
   await capture('companion-07b-scene-elements.png');
+  // Where the scene is read, and how it changes its people and places.
+  await ui(`document.querySelector('[data-testid="scene-passages"]').scrollIntoView({block:'start'})`); await delay(300);
+  await capture('companion-07c-scene-passages.png');
+  await ui(`document.querySelector('[data-testid="scene-changes"]').scrollIntoView({block:'start'})`); await delay(300);
+  await capture('companion-07d-scene-changes.png');
   await click('show-details-panel');
   const rows = await ui<number[]>(`[...document.querySelectorAll('.scene-row')].map(e => Math.round(e.getBoundingClientRect().height))`);
   assert.ok(Math.max(...rows) < 60, `空白场景目录行高度正常 ${JSON.stringify(rows)}`);
@@ -254,7 +268,7 @@ export async function runCompanionSmoke(window: BrowserWindow, store: NovelStore
   await until(() => ui<boolean>(`!!document.querySelector('.story-memory .story-memory-stats')`), '故事记忆面板');
   await ui(`[...document.querySelectorAll('.story-memory button')].find(e => e.textContent === '立即整理')?.click()`);
   await until(() => ui<boolean>(`document.querySelector('.story-memory .pill')?.textContent === '已是最新'`), '故事记忆整理完成');
-  assert.ok(store.getStoryDigests(project.id).some(digest => digest.kind === 'scene' && digest.sceneId === 'scene-a'), '已写场景生成摘要');
+  assert.ok(store.getStoryDigests(project.id).some(digest => digest.kind === 'passage' && digest.passageId === 'scene-a'), '已写场景生成摘要');
   await capture('companion-10-story-memory.png');
   assert.deepEqual(errors, []);
   writeFileSync(reportPath, JSON.stringify({ projectId: project.id, threads, sceneId, consoleErrors: errors, callsRealModel: false }, null, 2));

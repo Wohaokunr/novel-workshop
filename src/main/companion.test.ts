@@ -13,6 +13,7 @@ import { StyleLearningService } from './agent/style-learning.js';
 import { DemoStyleTransport } from './agent/style-learning.js';
 import { DemoCompanionTransport } from './agent/companion-demo.js';
 import { companionCommands, selectCompanionItems } from '../shared/companion.js';
+import { chapterPassages, orderedChapters, scenePassages } from '../shared/structure.js';
 import type { AgentEvent, ProviderSecret, Workspace } from '../shared/types.js';
 import type { CompanionAnchor, CompanionOp, CompanionResponse, CompanionThread, CompanionTurn } from '../shared/companion-types.js';
 import type { ModelRequest, ResponseTransport } from './responses.js';
@@ -41,13 +42,18 @@ function sample(): Workspace {
     { type: 'putObject', value: { id: 'shen', typeId: 'character', name: '沈卿', fields: {} } },
     { type: 'putObject', value: { id: 'e1', typeId: 'event', name: '钟响', fields: {}, event: { worldOrder: 1, timeLabel: '', thread: '钟楼', participants: ['lin'], causes: [], critical: false, observations: {} } } },
     { type: 'putObject', value: { id: 'e2', typeId: 'event', name: '开门', fields: {}, event: { worldOrder: 2, timeLabel: '', thread: '钟楼', participants: ['lin'], causes: ['e1'], critical: false, observations: {} } } },
-    { type: 'putScene', value: { id: 's1', chapterId: chapter.id, order: 1, title: '铜片', povId: 'lin', eventIds: [], outline: '捡到铜片', text: '已经写好的正文。' } },
-    { type: 'putScene', value: { id: 's2', chapterId: chapter.id, order: 2, title: '钟声', povId: 'shen', eventIds: [], outline: '第十三声', text: '' } },
-    { type: 'putScene', value: { id: 's3', chapterId: chapter.id, order: 3, title: '钥匙', povId: 'lin', eventIds: [], outline: '选择', text: '' } },
+    { type: 'putScene', value: { id: 's1', title: '铜片', povId: 'lin', eventIds: [], outline: '捡到铜片' } },
+    { type: 'putScene', value: { id: 's2', title: '钟声', povId: 'shen', eventIds: [], outline: '第十三声' } },
+    { type: 'putScene', value: { id: 's3', title: '钥匙', povId: 'lin', eventIds: [], outline: '选择' } },
+    { type: 'putPassage', value: { id: 's1', sceneId: 's1', chapterId: chapter.id, order: 1, text: '已经写好的正文。' } },
+    { type: 'putPassage', value: { id: 's2', sceneId: 's2', chapterId: chapter.id, order: 2, text: '' } },
+    { type: 'putPassage', value: { id: 's3', sceneId: 's3', chapterId: chapter.id, order: 3, text: '' } },
     { type: 'putCard', value: { id: 'anchor', kind: 'note', title: '第十三声', content: '异常钟声', x: 100, y: 100 } },
   ]);
 }
 const canvasAnchor: CompanionAnchor = { surface: 'canvas', references: [{ kind: 'card', id: 'anchor' }] };
+/** Scene titles of a chapter in reading order, as its passages are read. */
+const titles = (workspace: Workspace, chapterId: string) => chapterPassages(workspace, chapterId).map(passage => workspace.scenes.find(scene => scene.id === passage.sceneId)!.title);
 
 test('大纲幕/卷：章节归属校验，删除幕清空归属，撤销恢复', t => {
   const store = temporaryStore(t);
@@ -78,10 +84,13 @@ test('正文任务不能附带修改大纲；写作上下文带上章节与幕�
   const chapter = before.chapters[0]!;
   const after = applyCommands(before, [{ type: 'putAct', value: { id: 'a', title: '建置', order: 1, purpose: '让主角离开日常', summary: '' } }, { type: 'putChapter', value: { ...chapter, actId: 'a', summary: '发现异常' } }]);
   const changes = [{ collection: 'acts', key: 'a', before: undefined, after: after.acts![0] }, { collection: 'chapters', key: chapter.id, before: chapter, after: after.chapters[0] }];
-  assert.throws(() => assertWriteScope({ projectId: before.id, stage: 'chapter', objective: '写', sceneId: 's2' }, before, after, changes), /WRITE_SCOPE/);
+  assert.throws(() => assertWriteScope({ projectId: before.id, stage: 'chapter', objective: '写', passageId: 's2' }, before, after, changes), /WRITE_SCOPE/);
   const context = buildWriterContext(after, 's2');
   assert.equal(context.outlinePlan.chapter.summary, '发现异常');
-  assert.equal(context.outlinePlan.act?.purpose, '让主角离开日常');
+  assert.equal(context.outlinePlan.volume?.purpose, '让主角离开日常');
+  assert.equal(context.outlinePlan.chapter.targetChars, 3500);
+  assert.equal(context.outlinePlan.chapter.writtenChars, '已经写好的正文。'.length);
+  assert.deepEqual(context.outlinePlan.chapter.passages.map(item => 'current' in item), [false, true, false]);
 });
 
 test('点子围绕锚点卡片放射排布并连线，可包进新分组', () => {
@@ -125,8 +134,7 @@ test('大纲草案：沿用空白第一章、解析 ref、新场景正文为空�
   assert.equal(next.chapters.length, 1, '空白第一章被大纲接管');
   assert.equal(next.chapters[0]!.title, '雾中来信');
   assert.equal(next.chapters[0]!.actId, next.acts![0]!.id);
-  assert.equal(next.scenes[0]!.chapterId, next.chapters[0]!.id);
-  assert.equal(next.scenes[0]!.text, '');
+  assert.deepEqual(next.passages.map(passage => [passage.sceneId, passage.chapterId, passage.text]), [[next.scenes[0]!.id, next.chapters[0]!.id, '']]);
   const full = applyCommands(blank, companionCommands(blank, selectCompanionItems(draft, ['p1']), { mode: 'outline', anchor: { surface: 'outline', references: [] }, newId }).commands);
   const ordered = [...full.chapters].sort((a, b) => a.order - b.order);
   assert.deepEqual(ordered.map(chapter => chapter.title), ['雾中来信', '第十三声']);
@@ -143,10 +151,9 @@ test('结构方案只重排与改大纲，不改正文；无法对应的建议�
   const { commands, skipped } = companionCommands(project, selectCompanionItems(plan, ['p1']), { mode: 'structure', anchor: { surface: 'story', references: [] }, newId });
   assert.equal(skipped.length, 1);
   const next = applyCommands(project, commands);
-  const order = next.scenes.filter(scene => scene.chapterId === project.chapters[0]!.id).sort((a, b) => a.order - b.order).map(scene => scene.id);
-  assert.deepEqual(order, ['s3', 's1', 's2']);
+  assert.deepEqual(chapterPassages(next, project.chapters[0]!.id).map(passage => passage.sceneId), ['s3', 's1', 's2']);
+  assert.equal(next.passages.find(passage => passage.id === 's1')!.text, '已经写好的正文。');
   const s1 = next.scenes.find(scene => scene.id === 's1')!;
-  assert.equal(s1.text, '已经写好的正文。');
   assert.equal(s1.outline, '新的大纲');
   assert.equal(s1.povId, 'shen');
 });
@@ -155,7 +162,8 @@ test('结构方案可以在方案里新建章节：新章紧跟目标章，勾�
   const base = sample(), first = base.chapters[0]!;
   const project = applyCommands(base, [
     { type: 'putChapter', value: { id: 'ch2', title: '第二章', order: 1 } },
-    { type: 'putScene', value: { id: 's4', chapterId: 'ch2', order: 1, title: '码头', povId: null, eventIds: [], outline: '', text: '' } },
+    { type: 'putScene', value: { id: 's4', title: '码头', povId: null, eventIds: [], outline: '' } },
+    { type: 'putPassage', value: { id: 's4', sceneId: 's4', chapterId: 'ch2', order: 1, text: '' } },
     { type: 'putObject', value: { id: 'tower', typeId: 'setting', name: '钟楼', fields: {} } },
   ]);
   const plan = response({ proposals: [{ id: 'p1', title: '插叙', summary: '', ops: [
@@ -173,19 +181,17 @@ test('结构方案可以在方案里新建章节：新章紧跟目标章，勾�
   assert.deepEqual(ordered, ['第一章', '插叙 · 三十年前', '第二章']);
   const flashback = next.chapters.find(chapter => chapter.title === '插叙 · 三十年前')!;
   const scene = next.scenes.find(item => item.title === '旧案')!;
-  assert.equal(scene.chapterId, flashback.id);
-  assert.equal(scene.text, '');
+  assert.deepEqual(scenePassages(next, scene.id).map(passage => [passage.chapterId, passage.text]), [[flashback.id, '']]);
   assert.equal(scene.povId, 'shen');
   assert.deepEqual(scene.castIds, ['lin'], '视角人物不重复列为出场人物');
   assert.deepEqual(scene.settingIds, ['tower']);
   assert.deepEqual(scene.eventIds, ['e1']);
   const whole = applyCommands(project, companionCommands(project, selectCompanionItems(plan, ['p1']), { mode: 'structure', anchor, newId }).commands);
-  const moved = whole.scenes.filter(item => item.chapterId === whole.chapters.find(chapter => chapter.title === '插叙 · 三十年前')!.id).sort((a, b) => a.order - b.order);
-  assert.deepEqual(moved.map(item => item.id === 's3' ? 's3' : item.title), ['s3', '旧案']);
-  assert.equal(whole.scenes.find(item => item.id === 's1')!.text, '已经写好的正文。');
+  assert.deepEqual(titles(whole, whole.chapters.find(chapter => chapter.title === '插叙 · 三十年前')!.id), ['钥匙', '旧案']);
+  assert.equal(whole.passages.find(item => item.id === 's1')!.text, '已经写好的正文。');
 });
 
-test('新场景找不到章节时自动建章：同一未知句柄只建一章，按标题能对上已有章节', () => {
+test('新场景找不到章节时自动建章：同一未知句柄只建一章，按标题能对上已有章节，没写章节的放进作者正在看的那一章', () => {
   const project = sample(), first = project.chapters[0]!;
   const plan = response({ proposals: [{ id: 'p1', title: '补场景', summary: '', ops: [
     op({ id: 'o1', op: 'addScene', parentId: '第二章 雨夜', title: '甲' }),
@@ -198,13 +204,14 @@ test('新场景找不到章节时自动建章：同一未知句柄只建一章�
   assert.equal(skipped.length, 1, '未知人物会被报告');
   assert.match(skipped[0]!, /不存在的人/);
   const next = applyCommands(project, commands);
-  const ordered = [...next.chapters].sort((a, b) => a.order - b.order);
-  assert.deepEqual(ordered.map(chapter => chapter.title), ['第一章', '第二章 雨夜', '丙'], '新章按提出顺序排在锚点章之后');
-  const titles = (chapterId: string) => next.scenes.filter(scene => scene.chapterId === chapterId).sort((a, b) => a.order - b.order).map(scene => scene.title);
-  assert.deepEqual(titles(ordered[1]!.id), ['甲', '乙']);
-  assert.deepEqual(titles(ordered[2]!.id), ['丙']);
-  assert.ok(titles(first.id).includes('丁'));
+  const ordered = orderedChapters(next);
+  assert.deepEqual(ordered.map(chapter => chapter.title), ['第一章', '第二章 雨夜'], '新章排在锚点章之后');
+  assert.deepEqual(titles(next, ordered[1]!.id), ['甲', '乙']);
+  assert.deepEqual(titles(next, first.id), ['铜片', '钟声', '钥匙', '丙', '丁']);
   assert.equal(refs['p1:第二章 雨夜'], ordered[1]!.id, '后续部分采纳沿用同一章');
+  // Nowhere to go: a scene with no chapter named and no scene in view gets a chapter of its own, at the end.
+  const alone = applyCommands(project, companionCommands(project, selectCompanionItems(plan, ['p1#o3']), { mode: 'structure', anchor: { surface: 'story', references: [] }, newId }).commands);
+  assert.deepEqual(orderedChapters(alone).map(chapter => chapter.title), ['第一章', '丙']);
 });
 
 test('环境是一等公民：addSetting 同名沿用，updateScene 只追加三要素，设定点子可以设为环境', () => {
@@ -248,6 +255,53 @@ test('因果推演：后果晚于原因，前因插入到结果之前并接入�
   const cause = next.objects.find(object => object.name === '暗中交易')!;
   assert.ok(cause.event!.worldOrder > 1 && cause.event!.worldOrder < 2);
   assert.ok(next.objects.find(object => object.id === 'e2')!.event!.causes.includes(cause.id));
+});
+
+test('跨章延续与状态变化：continueScene 在下一章开新的一段，changeState 记在场景、场景段或事件上，同一处合并', () => {
+  const base = sample();
+  const project = applyCommands(base, [{ type: 'putObject', value: { id: 'tower', typeId: 'setting', name: '钟楼', fields: {} } },
+    { type: 'putScene', value: { ...base.scenes.find(scene => scene.id === 's2')!, eventIds: ['e1'], settingIds: ['tower'] } }]);
+  const plan = response({ proposals: [{ id: 'p1', title: '钟声未尽', summary: '', ops: [
+    op({ id: 'o1', op: 'continueScene', ref: 'part2', targetId: 's2', content: '钟声停下之后的对峙' }),
+    op({ id: 'o2', op: 'continueScene', targetId: 's2', parentId: base.chapters[0]!.id }),
+    op({ id: 'o3', op: 'changeState', targetId: '林舟', field: '心理', content: '开始怀疑师父', parentId: 's2', events: ['钟响'], purpose: '钟声是暗号' }),
+    op({ id: 'o4', op: 'changeState', targetId: 'lin', field: 'cognition', content: '知道钟声是信号', parentId: 's2', events: ['钟响'] }),
+    op({ id: 'o5', op: 'changeState', targetId: '钟楼', field: '氛围', content: '死寂', parentRef: 'part2' }),
+    op({ id: 'o6', op: 'changeState', targetId: '沈卿', field: '境界', content: '筑基', events: ['开门'] }),
+    op({ id: 'o7', op: 'changeState', targetId: '沈卿', field: '动机', content: '想离开钟楼' }),
+    op({ id: 'o8', op: 'changeState', targetId: 'e1', field: '心理', content: '事件不会有心理' }),
+  ] }] });
+  const anchor: CompanionAnchor = { surface: 'writer', references: [{ kind: 'scene', id: 's2' }], sceneId: 's2', passageId: 's2' };
+  const { commands, skipped, refs } = companionCommands(project, selectCompanionItems(plan, ['p1']), { mode: 'beat', anchor, newId });
+  assert.equal(skipped.length, 2);
+  assert.ok(skipped.some(item => /已经有场景段/.test(item)) && skipped.some(item => /人物或环境不存在/.test(item)), skipped.join('；'));
+  const next = applyCommands(project, commands);
+  // The last chapter goes on into a new one, which opens with the scene's next part.
+  const chapters = orderedChapters(next);
+  assert.deepEqual(chapters.map(chapter => chapter.title), ['第一章', '第2章']);
+  const parts = scenePassages(next, 's2');
+  assert.deepEqual(parts.map(part => [part.chapterId, part.text, part.beat]), [[chapters[0]!.id, '', undefined], [chapters[1]!.id, '', '钟声停下之后的对峙']]);
+  assert.equal(refs['p1:part2'], parts[1]!.id);
+  const change = (subjectId: string, place: { sceneId?: string; passageId?: string; eventId?: string }) =>
+    next.stateChanges.find(item => item.subjectId === subjectId && item.sceneId === place.sceneId && item.passageId === place.passageId && item.eventId === place.eventId);
+  assert.deepEqual(change('lin', { sceneId: 's2', eventId: 'e1' })?.aspects, { psychology: '开始怀疑师父', cognition: '知道钟声是信号' }, '同一处的变化合并成一条');
+  assert.equal(change('lin', { sceneId: 's2', eventId: 'e1' })?.note, '钟声是暗号');
+  assert.deepEqual(change('tower', { sceneId: 's2', passageId: parts[1]!.id })?.aspects, { atmosphere: '死寂' }, '指向一段时记在那一段');
+  assert.deepEqual(change('shen', { eventId: 'e2' })?.aspects, { 境界: '筑基' }, '作者自己的方面名也可以');
+  assert.deepEqual(change('shen', { sceneId: 's2' })?.aspects, { motivation: '想离开钟楼' }, '没写在哪时记在作者正在写的这一场');
+  assert.equal(next.stateChanges.length, 4);
+  // A scene that runs through several chapters moves one passage at a time.
+  const continued = applyCommands(next, [{ type: 'putScene', value: { id: 'fresh', title: '新场景', povId: null, eventIds: [], outline: '' } },
+    { type: 'putPassage', value: { id: 'fresh-1', sceneId: 'fresh', chapterId: chapters[0]!.id, order: 9, text: '' } },
+    { type: 'putPassage', value: { id: 'fresh-2', sceneId: 'fresh', chapterId: chapters[1]!.id, order: 9, text: '' } }]);
+  const move = response({ proposals: [{ id: 'p2', title: '挪', summary: '', ops: [op({ id: 'm1', op: 'moveScene', targetId: 'fresh', order: 1 }),
+    op({ id: 'm2', op: 'moveScene', targetId: 'fresh-2', parentId: chapters[0]!.id }), op({ id: 'm3', op: 'moveScene', targetId: 's2', order: 1 })] }] });
+  const moved = companionCommands(continued, selectCompanionItems(move, ['p2']), { mode: 'structure', anchor: { surface: 'story', references: [] }, newId });
+  assert.equal(moved.skipped.length, 1);
+  assert.match(moved.skipped[0]!, /跨了几章/);
+  const after = applyCommands(continued, moved.commands);
+  assert.equal(after.passages.find(part => part.id === 'fresh-2')!.chapterId, chapters[0]!.id, '指明场景段时移动那一段');
+  assert.equal(chapterPassages(after, chapters[0]!.id)[0]!.id, 's2', '旧作品里第一段与场景同 id，指的就是那一段');
 });
 
 test('下一拍可以补进当前场景大纲；流式 JSON 只取 reply', () => {
@@ -333,8 +387,9 @@ test('大纲分次采纳：先采纳场景会带上父级，再采纳整份草�
   const acts = proposal.ops.filter(op => op.op === 'addAct').length, scenes = proposal.ops.filter(op => op.op === 'addScene').length;
   assert.equal(current.acts!.length, acts);
   assert.equal(current.scenes.length, scenes);
-  assert.ok(current.chapters.every(chapter => chapter.actId), '每章都归入了幕');
-  assert.ok(current.scenes.every(item => item.text === ''));
+  assert.ok(current.chapters.every(chapter => chapter.actId), '每章都归入了卷');
+  assert.ok(current.scenes.every(item => current.passages.some(passage => passage.sceneId === item.id)), '每个新场景都放进了章节');
+  assert.ok(current.passages.every(item => item.text === ''));
   service.undo(project.id, thread.id, whole.batchId!);
   assert.equal(store.getProject(project.id).scenes.length, 1);
 });

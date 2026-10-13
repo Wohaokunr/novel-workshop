@@ -24,7 +24,7 @@ export const learnSchema = objectSchema({ suggestions: { type: 'array', items: o
 }) } });
 
 
-export { authoredScenes, deletedWords, editHunks, editPairs } from '../../shared/style-provenance.js';
+export { authoredPassages, deletedWords, editHunks, editPairs } from '../../shared/style-provenance.js';
 
 const key = (...parts: string[]) => createHash('sha256').update(parts.join('\u0000')).digest('hex').slice(0, 24);
 function stamp() { return new Date().toISOString(); }
@@ -103,7 +103,7 @@ export class StyleLearningService {
       provider = await this.getProvider();
       if (provider.mode === 'live' && !provider.apiKey) throw new Error('请先在模型设置中填写 API Key');
       const summary = StoryMemoryService.summaryProvider(provider);
-      const hunks = edits.flatMap(pair => pair.hunks.map(hunk => ({ scene: pair.sceneTitle, ...hunk }))).slice(-MAX_HUNKS);
+      const hunks = edits.flatMap(pair => pair.hunks.map(hunk => ({ scene: pair.title, ...hunk }))).slice(-MAX_HUNKS);
       const step = await runAgent({ id: 'style:learn', label: '文风 · 改稿偏好', instructions: learnPrompt.text, outputSchema: learnSchema }, {
         transport: this.transportFactory(summary), signal: controller.signal, contextSources: [], objective: '归纳作者的文风偏好建议。',
         context: { current: { rules: profile.rules.map(rule => `${rule.kind === 'do' ? '要' : '不要'}：${rule.content}`), avoidWords: profile.avoidWords, preferWords: profile.preferWords },

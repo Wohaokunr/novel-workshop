@@ -1,9 +1,10 @@
-import type { Act, CanvasCard, CanvasLink, Chapter, Command, NarrativeScene, NovelObject, Workspace } from './types.js';
+import type { Act, CanvasCard, CanvasLink, Chapter, Command, NarrativeScene, NovelObject, Passage, StateChange, Workspace } from './types.js';
 import type { CompanionAnchor, CompanionIdea, CompanionMode, CompanionNovelField, CompanionOp, CompanionProposal, CompanionResponse } from './companion-types.js';
 import { cardRect, createdGroup, placeCards } from './canvas.js';
 import { companionNovelFields, ideaKindNames } from './companion-types.js';
 import { personNames, STYLE_LIMITS, STYLE_SCALES, styleProfile, type StyleScale, type StylePerson, type StyleScaleId } from './style-types.js';
 import { isSettingLike } from './story-elements.js';
+import { ASPECT_KEY_CHARS, ASPECT_VALUE_CHARS, aspectKey, MAX_STATE_ASPECTS } from './story-state.js';
 
 export interface CompanionSelection { ideas: CompanionIdea[]; ops: Array<{ proposal: CompanionProposal; op: CompanionOp }> }
 export interface CompanionPlacement {
@@ -68,7 +69,7 @@ const titleLike = (value: string) => /\p{Script=Han}/u.test(value) && Array.from
 
 /**
  * Convert persisted companion suggestions into domain commands.
- * Guards: never deletes, never touches written scene text, new scenes start empty, unknown targets are skipped and reported;
+ * Guards: never deletes, never touches written prose, new scenes and passages start empty, unknown targets are skipped and reported;
  * a scene whose chapter does not exist yet gets a new chapter instead of being dropped.
  */
 export function companionCommands(workspace: Workspace, selection: CompanionSelection, options: CompanionPlacement): { commands: Command[]; skipped: string[]; skippedOps: Array<{ proposalId: string; opId: string; reason: string }>; refs: Record<string, string> } {
@@ -77,6 +78,8 @@ export function companionCommands(workspace: Workspace, selection: CompanionSele
   const acts: Act[] = structuredClone(workspace.acts ?? []);
   const chapters: Chapter[] = structuredClone(workspace.chapters);
   const scenes: NarrativeScene[] = structuredClone(workspace.scenes);
+  const passages: Passage[] = structuredClone(workspace.passages);
+  const stateChanges: StateChange[] = structuredClone(workspace.stateChanges);
   const objects: NovelObject[] = structuredClone(workspace.objects);
   let cards: CanvasCard[] = structuredClone(workspace.cards);
   const links: CanvasLink[] = [];
@@ -91,7 +94,7 @@ export function companionCommands(workspace: Workspace, selection: CompanionSele
   const isCharacter = (id: string | undefined) => !!id && objects.some(object => object.id === id && object.typeId === 'character');
 
   // A brand-new project starts with one empty "第一章"; let the first proposed chapter take it over.
-  let placeholder = chapters.length === 1 && !scenes.length && !chapters[0]!.summary && !chapters[0]!.actId ? chapters[0] : undefined;
+  let placeholder = chapters.length === 1 && !passages.length && !chapters[0]!.summary && !chapters[0]!.actId ? chapters[0] : undefined;
 
   const refs = new Map<string, string>(Object.entries(options.knownRefs ?? {}));
   const known = new Set(refs.keys());
@@ -124,9 +127,18 @@ export function companionCommands(workspace: Workspace, selection: CompanionSele
   const resolveAll = (proposal: CompanionProposal, values: readonly string[] | undefined, find: (proposal: CompanionProposal, value: string | null) => string | null, missing: string[]) =>
     [...new Set((values ?? []).flatMap(value => { const id = find(proposal, value); if (!id && clean(value)) missing.push(clean(value)); return id ? [id] : []; }))];
 
+  const sortedChapters = () => [...chapters].sort((a, b) => a.order - b.order);
+  /** A scene's passages in reading order, as this batch has placed them so far. */
+  const partsOf = (sceneId: string | undefined) => {
+    const rank = new Map(sortedChapters().map((chapter, index) => [chapter.id, index]));
+    return passages.filter(passage => passage.sceneId === sceneId).sort((a, b) => (rank.get(a.chapterId) ?? Infinity) - (rank.get(b.chapterId) ?? Infinity) || a.order - b.order);
+  };
+  /** Order for a passage at a 1-based position among a chapter's passages (null appends). */
+  const passageOrder = (chapterId: string, position: number | null, movingId?: string) =>
+    orderAt(passages.filter(passage => passage.chapterId === chapterId && passage.id !== movingId).map(passage => passage.order).sort((a, b) => a - b), position);
   /** Reading order for a chapter placed right after `afterId`, or after the last chapter. */
   const orderAfter = (afterId: string | undefined) => {
-    const sorted = [...chapters].sort((a, b) => a.order - b.order), index = afterId ? sorted.findIndex(chapter => chapter.id === afterId) : -1;
+    const sorted = sortedChapters(), index = afterId ? sorted.findIndex(chapter => chapter.id === afterId) : -1;
     if (index < 0) return (sorted.at(-1)?.order ?? 0) + 1;
     const next = sorted[index + 1];
     return next ? (sorted[index]!.order + next.order) / 2 : sorted[index]!.order + 1;
@@ -142,15 +154,32 @@ export function companionCommands(workspace: Workspace, selection: CompanionSele
     }
     return undefined;
   };
+  /** A scene by proposal ref, real id or exact title; a passage id (or the ref of a passage this batch added) names its scene and that
+   * passage. A scene's id names the whole scene, even where its first passage shares the id (books from before scenes ran across chapters). */
+  const sceneAt = (proposal: CompanionProposal, ...values: Array<string | null>): { scene?: NarrativeScene; passage?: Passage } => {
+    for (const value of values.map(clean)) {
+      if (!value) continue;
+      const id = refs.get(scope(proposal, value)) ?? value;
+      const whole = scenes.find(item => item.id === id);
+      if (whole) return { scene: whole };
+      const passage = passages.find(item => item.id === id);
+      const scene = passage ? scenes.find(item => item.id === passage.sceneId) : scenes.find(item => item.title.trim() === value);
+      if (scene) return { scene, ...(passage ? { passage } : {}) };
+    }
+    return {};
+  };
   /** An act a scene op pointed at by mistake; the chapter opened for the scene then joins that act. */
   const actOf = (proposal: CompanionProposal, op: CompanionOp) => {
     const id = resolve(proposal, op.parentRef, op.parentId);
     return id && acts.some(act => act.id === id) ? id : undefined;
   };
-  // A scene proposed where no chapter exists yet gets a new chapter, right after the chapter the author pointed at.
-  const anchorScene = options.anchor.sceneId ?? options.anchor.references.flatMap(reference => reference.kind === 'scene' ? [reference.id]
+  // Where the author is: the passage being written, or the scene they pointed at (its last chapter so far).
+  const anchorPassage = passages.find(passage => passage.id === options.anchor.passageId);
+  const anchorScene = anchorPassage?.sceneId ?? options.anchor.sceneId ?? options.anchor.references.flatMap(reference => reference.kind === 'scene' ? [reference.id]
     : reference.kind === 'card' ? cards.filter(card => card.id === reference.id && card.kind === 'scene' && card.refId).map(card => card.refId!) : [])[0];
-  let autoAfter = scenes.find(scene => scene.id === anchorScene)?.chapterId;
+  const anchorChapter = anchorPassage?.chapterId ?? partsOf(anchorScene).at(-1)?.chapterId;
+  // A scene proposed where no chapter exists yet gets a new chapter, right after the chapter the author pointed at.
+  let autoAfter = anchorChapter;
   const autoChapters = new Map<string, string>();
   /** One chapter per unresolved handle; a scene without any handle gets a chapter named after itself. */
   const autoChapter = (proposal: CompanionProposal, handleText: string, sceneTitle: string, actId?: string) => {
@@ -160,7 +189,7 @@ export function companionCommands(workspace: Workspace, selection: CompanionSele
     let chapter: Chapter;
     if (placeholder) { chapter = placeholder; placeholder = undefined; Object.assign(chapter, { title, ...(actId ? { actId } : {}) }); }
     else {
-      const sorted = [...chapters].sort((a, b) => a.order - b.order);
+      const sorted = sortedChapters();
       const after = actId ? sorted.filter(item => item.actId === actId).at(-1) : chapters.find(item => item.id === autoAfter);
       const inAct = actId ?? after?.actId;
       chapter = { id: newId(), title, order: orderAfter(after?.id), ...(inAct ? { actId: inAct } : {}) };
@@ -170,8 +199,8 @@ export function companionCommands(workspace: Workspace, selection: CompanionSele
     autoAfter = chapter.id;
     if (handleText) {
       autoChapters.set(handleText, chapter.id);
-      // Later partial adoptions of the same turn that name this handle reuse the chapter.
-      refs.set(scope(proposal, handleText), chapter.id);
+      // Later partial adoptions of the same turn that name this handle reuse the chapter; a handle naming something else keeps it.
+      if (!refs.has(scope(proposal, handleText))) refs.set(scope(proposal, handleText), chapter.id);
     }
     return chapter.id;
   };
@@ -274,7 +303,7 @@ export function companionCommands(workspace: Workspace, selection: CompanionSele
       case 'addChapter': {
         const actId = resolve(proposal, op.parentRef, op.parentId);
         if (actId && !acts.some(act => act.id === actId)) { skip('所属幕/卷不存在'); break; }
-        const sorted = [...chapters].sort((a, b) => a.order - b.order);
+        const sorted = sortedChapters();
         // targetId names the chapter this one follows, so a restructure can open a chapter between two existing ones.
         const afterId = clean(op.targetId) ? chapterOf(proposal, op.targetId) : undefined;
         let chapter: Chapter;
@@ -320,20 +349,20 @@ export function companionCommands(workspace: Workspace, selection: CompanionSele
         break;
       }
       case 'addScene': {
-        // A scene always lands in a chapter: the named one, the anchor scene's, or a new chapter opened for it.
+        // A new scene opens in a chapter (as its first, empty passage): the named one, the anchor's, or a new chapter opened for it.
         const named = clean(op.parentRef) || clean(op.parentId);
         const chapterId = chapterOf(proposal, op.parentRef, op.parentId)
-          ?? (!named && options.anchor.sceneId ? scenes.find(item => item.id === options.anchor.sceneId)?.chapterId : undefined)
+          ?? (!named ? anchorChapter : undefined)
           ?? autoChapter(proposal, named, label, actOf(proposal, op));
         const missing: string[] = [];
         const povId = personId(proposal, op.povName);
         const castIds = resolveAll(proposal, op.people, personId, missing).filter(id => id !== povId);
         const settingIds = resolveAll(proposal, op.places, placeId, missing);
-        const siblings = scenes.filter(item => item.chapterId === chapterId).map(item => item.order).sort((a, b) => a - b);
-        const scene: NarrativeScene = { id: newId(), chapterId, order: orderAt(siblings, op.order), title: label, povId, eventIds: resolveAll(proposal, op.events, eventRef, missing),
-          outline: clean(op.content), text: '', ...(castIds.length ? { castIds } : {}), ...(settingIds.length ? { settingIds } : {}) };
+        const scene: NarrativeScene = { id: newId(), title: label, povId, eventIds: resolveAll(proposal, op.events, eventRef, missing),
+          outline: clean(op.content), ...(castIds.length ? { castIds } : {}), ...(settingIds.length ? { settingIds } : {}) };
         if (missing.length) skip(`${missing.map(value => `「${value}」`).join('、')}不在作品中，未关联`);
         scenes.push(scene);
+        passages.push({ id: newId(), sceneId: scene.id, chapterId, order: passageOrder(chapterId, op.order), text: '' });
         if (op.ref) refs.set(scope(proposal, op.ref), scene.id);
         if (onCanvas) cardFor(scene.id, true);
         break;
@@ -354,12 +383,71 @@ export function companionCommands(workspace: Workspace, selection: CompanionSele
         break;
       }
       case 'moveScene': {
-        const scene = scenes.find(item => item.id === op.targetId);
+        // A scene read in one chapter moves whole; one that runs through several chapters moves the passage targetId names.
+        const { scene, passage: named } = sceneAt(proposal, op.targetId);
         if (!scene) { skip('场景不存在'); break; }
-        const named = clean(op.parentRef) || clean(op.parentId);
-        const chapterId = chapterOf(proposal, op.parentRef, op.parentId) ?? (named ? autoChapter(proposal, named, scene.title, actOf(proposal, op)) : scene.chapterId);
-        const siblings = scenes.filter(item => item.chapterId === chapterId && item.id !== scene.id).map(item => item.order).sort((a, b) => a - b);
-        scene.chapterId = chapterId; scene.order = orderAt(siblings, op.order);
+        // The whole scene cannot move once it runs through several chapters; its first passage may share its id and is then the one meant.
+        const parts = partsOf(scene.id), passage = named ?? (parts.length === 1 ? parts[0] : parts.find(part => part.id === scene.id && part.id === clean(op.targetId)));
+        if (!passage && parts.length > 1) { skip('这一场跨了几章，请指明移动哪一个场景段'); break; }
+        const handleText = clean(op.parentRef) || clean(op.parentId);
+        const chapterId = chapterOf(proposal, op.parentRef, op.parentId) ?? (handleText ? autoChapter(proposal, handleText, scene.title, actOf(proposal, op)) : passage?.chapterId);
+        if (!chapterId) { skip('没有指明放进哪一章'); break; }
+        const order = passageOrder(chapterId, op.order, passage?.id);
+        // A scene not placed in any chapter yet gets its first passage there.
+        if (passage) Object.assign(passage, { chapterId, order }); else passages.push({ id: newId(), sceneId: scene.id, chapterId, order, text: '' });
+        break;
+      }
+      case 'continueScene': {
+        // The scene goes on in another chapter: a new, empty passage of it there; content is what this part covers.
+        const { scene } = sceneAt(proposal, op.targetId);
+        if (!scene) { skip('场景不存在'); break; }
+        const handleText = clean(op.parentRef) || clean(op.parentId);
+        let chapterId = chapterOf(proposal, op.parentRef, op.parentId) ?? (handleText ? autoChapter(proposal, handleText, scene.title, actOf(proposal, op)) : undefined);
+        if (!chapterId) {
+          // Unnamed: the chapter after the one where the scene was last read, opened when that is the last chapter.
+          const sorted = sortedChapters(), last = partsOf(scene.id).at(-1), at = last ? sorted.findIndex(chapter => chapter.id === last.chapterId) : -1;
+          if (at < 0) { skip('这一场还没有放进任何章节，请指明章节'); break; }
+          chapterId = sorted[at + 1]?.id;
+          if (!chapterId) {
+            const actId = sorted[at]!.actId;
+            const chapter: Chapter = { id: newId(), title: `第${chapters.length + 1}章`, order: sorted[at]!.order + 1, ...(actId ? { actId } : {}) };
+            chapters.push(chapter); chapterId = chapter.id;
+          }
+        }
+        if (passages.some(passage => passage.sceneId === scene.id && passage.chapterId === chapterId)) { skip('这一场在该章已经有场景段'); break; }
+        // A scene carried over usually opens the chapter.
+        const passage: Passage = { id: newId(), sceneId: scene.id, chapterId, order: passageOrder(chapterId, op.order ?? 1), text: '', ...(clean(op.content) ? { beat: clean(op.content) } : {}) };
+        passages.push(passage);
+        if (op.ref) refs.set(scope(proposal, op.ref), passage.id);
+        break;
+      }
+      case 'changeState': {
+        // targetId: who or what changes; parentId/parentRef: the scene (or one passage of it) where; events: the world event it follows.
+        const subjectId = entityId(proposal, op.targetId, object => !object.event);
+        if (!subjectId) { skip('人物或环境不存在'); break; }
+        const handleText = clean(op.parentRef) || clean(op.parentId);
+        const located = sceneAt(proposal, op.parentRef, op.parentId);
+        if (handleText && !located.scene) { skip('场景不存在'); break; }
+        const missing: string[] = [];
+        const eventIds = resolveAll(proposal, op.events, eventRef, missing);
+        const scene = located.scene ?? (!eventIds.length ? scenes.find(item => item.id === anchorScene) : undefined);
+        // Inside a scene, only an event the scene shows can date the change.
+        const eventId = scene ? eventIds.find(id => scene.eventIds.includes(id)) : eventIds[0];
+        if (!scene && !eventId) { skip('没有指明在哪一场或哪个事件发生变化'); break; }
+        if (eventIds.some(id => id !== eventId) || missing.length) skip(`${[...missing, ...eventIds.filter(id => id !== eventId).map(id => objects.find(object => object.id === id)?.name ?? id)].map(value => `「${value}」`).join('、')}未用作这次变化的时间`);
+        const key = aspectKey(clean(op.field)), value = clean(op.content).slice(0, ASPECT_VALUE_CHARS), note = clean(op.purpose);
+        if (!key || key.length > ASPECT_KEY_CHARS) { skip(`状态方面须为 1–${ASPECT_KEY_CHARS} 字`); break; }
+        if (!value) { skip('内容为空'); break; }
+        // A change on one passage only matters when the scene runs through several.
+        const passageId = scene && located.passage && partsOf(scene.id).length > 1 ? located.passage.id : undefined;
+        const same = (change: StateChange) => change.subjectId === subjectId && change.sceneId === scene?.id && change.passageId === passageId && change.eventId === eventId;
+        const existing = stateChanges.find(same);
+        if (existing) {
+          if (!(key in existing.aspects) && Object.keys(existing.aspects).length >= MAX_STATE_ASPECTS) { skip(`一条状态变化最多 ${MAX_STATE_ASPECTS} 个方面`); break; }
+          existing.aspects[key] = value;
+          if (note && !(existing.note ?? '').includes(note)) existing.note = existing.note ? `${existing.note}\n${note}` : note;
+        } else stateChanges.push({ id: newId(), subjectId, ...(scene ? { sceneId: scene.id } : {}), ...(passageId ? { passageId } : {}), ...(eventId ? { eventId } : {}),
+          aspects: { [key]: value }, ...(note ? { note } : {}) });
         break;
       }
       case 'addEvent': {
@@ -511,11 +599,13 @@ export function companionCommands(workspace: Workspace, selection: CompanionSele
   // Characters before events, so new participants are readable in order.
   for (const value of changed(workspace.objects, objects).sort((a, b) => Number(!!a.event) - Number(!!b.event))) commands.push({ type: 'putObject', value });
   for (const value of changed(workspace.chapters, chapters)) commands.push({ type: 'putChapter', value });
-  for (const value of changed(workspace.scenes, scenes)) {
-    const original = workspace.scenes.find(item => item.id === value.id);
+  for (const value of changed(workspace.scenes, scenes)) commands.push({ type: 'putScene', value });
+  for (const value of changed(workspace.passages, passages)) {
+    const original = workspace.passages.find(item => item.id === value.id);
     if ((original && original.text !== value.text) || (!original && value.text)) throw new Error('创作伙伴不能修改正文');
-    commands.push({ type: 'putScene', value });
+    commands.push({ type: 'putPassage', value });
   }
+  for (const value of changed(workspace.stateChanges, stateChanges)) commands.push({ type: 'putStateChange', value });
   // Groups must exist before members reference them; validation runs on the whole batch, but keep the order readable.
   const changedCards = changed(workspace.cards, cards).sort((a, b) => Number(b.kind === 'group') - Number(a.kind === 'group'));
   for (const value of changedCards) commands.push({ type: 'putCard', value });

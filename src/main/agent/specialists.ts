@@ -1,12 +1,14 @@
-import { randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import type { AgentRole, EvidenceSource, SpecialistRequest, UpstreamResult } from '../../shared/agent-types.js';
-import type { AgentStep, CharacterState, Command, RunRequest, Workspace } from '../../shared/types.js';
+import type { AgentStep, Command, NarrativeScene, Passage, RunRequest, StateChange, Workspace } from '../../shared/types.js';
 import { buildCharacterContext, buildReaderContext, buildWriterContext, WRITER_CONTEXT_CHARS, WRITER_PRIORITY } from '../context.js';
 import { applyCommands, DomainValidationError } from '../domain.js';
 import { objectSchema, validateSchema, type AgentDefinition, type JsonSchema } from '../responses.js';
 import { boundedContext, collectContext, sourceFor, sourcesForLabels } from './memory.js';
-import { UPSTREAM_ROLES, validatePlanTarget } from './policy.js';
-import { sceneMentions } from './story-index.js';
+import { nodeTarget, UPSTREAM_ROLES, validatePlanTarget } from './policy.js';
+import { passageMentions } from './story-index.js';
+import { ASPECT_KEY_CHARS, ASPECT_VALUE_CHARS, aspectKey, labelledAspects, MAX_STATE_ASPECTS, sceneSubjects, STATE_ASPECTS, storyTimeline, type StatePoint } from '../../shared/story-state.js';
+import { orderedChapters } from '../../shared/structure.js';
 import { STORY_OPS, storyOpsCommands } from './story-ops.js';
 import { characterPrompt, commandHelpPrompt, continuityPrompt, evolutionPrompt, proposalPrompts, readerPrompt, reviewFormatPrompt, stylistPrompt, themePrompt, writerPrompt, writerScopePrompts } from '../prompts/specialists.js';
 import type { CompanionOpKind } from '../../shared/companion-types.js';
@@ -18,10 +20,12 @@ import { styleBaseline, styleLint } from '../../shared/style-metrics.js';
 
 export const READER_TEXT_CHARS = 12_000;
 export const EVIDENCE_TEXT_CHARS = 6_000;
-/** Prose a stylist or continuity review reads in full, shared among its target scenes; longer text keeps its head and tail. */
+/** Prose a stylist or continuity review reads in full, shared among its target passages; longer text keeps its head and tail. */
 export const REVIEW_TEXT_CHARS = 18_000;
-/** Prose around the cursor a continuation sees beside the whole scene: what it must follow, and what it must lead into. */
+/** Prose around the cursor a continuation sees beside the whole passage: what it must follow, and what it must lead into. */
 const CURSOR_BEFORE_CHARS = 2000, CURSOR_AFTER_CHARS = 800;
+/** People and places an evolution step may record changes for in one scene. */
+export const EVOLUTION_SUBJECTS = 12;
 
 // Match the established agents.ts result schemas; no transport or provider-specific API is introduced.
 const string = { type: 'string' }, strings = { type: 'array', items: string };
@@ -55,13 +59,23 @@ export function applyEdits(text: string, edits: Array<{ quote: string; replaceme
   for (const edit of located) { result += text.slice(cursor, edit.at) + edit.replacement; cursor = edit.at + edit.quote.length; }
   return result + text.slice(cursor);
 }
-/** A scene's prose within a review budget: whole when it fits, otherwise head and tail around a marked gap. */
+/** A passage's prose within a review budget: whole when it fits, otherwise head and tail around a marked gap. */
 function reviewText(text: string, limit: number): string {
   return text.length > limit ? `${text.slice(0, limit / 2)}\n……（中间 ${text.length - limit} 字略）……\n${text.slice(-limit / 2)}` : text;
 }
 const themeSchema = objectSchema({ question: string, choices: string, cost: string, expression: string });
-const stateSchema = objectSchema({ perspective: string, psychology: string, motivation: string, evidence: string });
+export const evolutionSchema = objectSchema({ changes: { type: 'array', items: objectSchema({
+  subjectId: string, eventId: string, aspects: { type: 'array', items: objectSchema({ aspect: string, value: string }) }, note: string,
+}) } });
+interface EvolutionOutput { changes: Array<{ subjectId: string; eventId: string; aspects: Array<{ aspect: string; value: string }>; note: string }> }
 const proposalSchema = objectSchema({ summary: string, commandsJson: string, opsJson: string });
+
+/** A recorded change keeps one id per subject and place, so recording the same scene again updates it instead of adding another. */
+export function stateChangeId(change: Pick<StateChange, 'subjectId' | 'sceneId' | 'passageId' | 'eventId'>): string {
+  return `change-${createHash('sha1').update(JSON.stringify([change.subjectId, change.sceneId ?? null, change.passageId ?? null, change.eventId ?? null]), 'utf8').digest('hex').slice(0, 20)}`;
+}
+const sameAnchor = (a: Pick<StateChange, 'subjectId' | 'sceneId' | 'passageId' | 'eventId'>, b: typeof a) =>
+  a.subjectId === b.subjectId && a.sceneId === b.sceneId && a.passageId === b.passageId && a.eventId === b.eventId;
 
 export interface SpecialistDefinition {
   definition: AgentDefinition;
@@ -76,8 +90,8 @@ type ProposalRole = 'planner' | 'world' | 'narrative' | 'canvas' | 'cast';
 /** Story ops each proposing role may use; ops-derived commands are checked by op, not by command type. */
 const roleOps: Record<ProposalRole, readonly CompanionOpKind[]> = {
   planner: STORY_OPS, canvas: STORY_OPS,
-  world: ['addEvent', 'addCause', 'addCharacter', 'updateCharacter', 'addSetting', 'updateSetting', 'link', 'addCard'],
-  narrative: ['addAct', 'updateAct', 'addChapter', 'updateChapter', 'addScene', 'updateScene', 'moveScene', 'link'],
+  world: ['addEvent', 'addCause', 'addCharacter', 'updateCharacter', 'addSetting', 'updateSetting', 'changeState', 'link', 'addCard'],
+  narrative: ['addAct', 'updateAct', 'addChapter', 'updateChapter', 'addScene', 'updateScene', 'moveScene', 'continueScene', 'changeState', 'link'],
   cast: ['addCharacter', 'updateCharacter', 'link', 'addCard'],
 };
 function definition(id: string, label: string, instructions: string, outputSchema?: JsonSchema): AgentDefinition {
@@ -92,11 +106,10 @@ function result<T>(step: AgentStep, schema: JsonSchema): T {
   validateSchema(step.structured, schema);
   return step.structured as T;
 }
-function readerTarget(project: Workspace, request: RunRequest, sceneId?: string, chapterId?: string) {
-  const scene = sceneId ? project.scenes.find(item => item.id === sceneId) : undefined;
-  const targetChapter = chapterId ?? scene?.chapterId ?? request.chapterId ?? [...project.chapters].sort((a, b) => b.order - a.order)[0]?.id;
+function readerTarget(project: Workspace, request: RunRequest, passage?: Passage, chapterId?: string) {
+  const targetChapter = chapterId ?? passage?.chapterId ?? request.chapterId ?? orderedChapters(project).at(-1)?.id;
   if (!targetChapter) throw new DomainValidationError('读者审阅需要章节');
-  return { sceneId, chapterId: targetChapter };
+  return { passageId: passage && passage.chapterId === targetChapter ? passage.id : undefined, chapterId: targetChapter };
 }
 function novelSources(project: Workspace): EvidenceSource[] { return [sourceFor(project, 'novel', project.id)!]; }
 function validateProposal(project: Workspace, role: ProposalRole, step: AgentStep, request: RunRequest): Command[] {
@@ -107,10 +120,10 @@ function validateProposal(project: Workspace, role: ProposalRole, step: AgentSte
   if (!Array.isArray(commands) || commands.length > 32) throw new DomainValidationError('候选须是至多 32 条命令的数组');
   const shared = ['putCard', 'deleteCard', 'putCanvasLink', 'deleteCanvasLink'];
   const allowed: Record<ProposalRole, string[]> = {
-    planner: [...shared, 'updateNovel', 'putObjectType', 'deleteObjectType', 'putObject', 'deleteObject', 'putChapter', 'deleteChapter', 'putScene', 'deleteScene', 'putFact', 'deleteFact', 'putKnowledge', 'deleteKnowledge'],
-    world: [...shared, 'putObjectType', 'deleteObjectType', 'putObject', 'deleteObject', 'putFact', 'deleteFact', 'putKnowledge', 'deleteKnowledge', 'putScene'],
-    narrative: [...shared, 'putChapter', 'deleteChapter', 'putScene', 'deleteScene'],
-    canvas: [...shared, 'putObjectType', 'putObject', 'putFact', 'putKnowledge', 'putChapter', 'putScene'],
+    planner: [...shared, 'updateNovel', 'putObjectType', 'deleteObjectType', 'putObject', 'deleteObject', 'putAct', 'deleteAct', 'putChapter', 'deleteChapter', 'putScene', 'deleteScene', 'putPassage', 'deletePassage', 'putFact', 'deleteFact', 'putKnowledge', 'deleteKnowledge', 'putStateChange', 'deleteStateChange'],
+    world: [...shared, 'putObjectType', 'deleteObjectType', 'putObject', 'deleteObject', 'putFact', 'deleteFact', 'putKnowledge', 'deleteKnowledge', 'putScene', 'putStateChange'],
+    narrative: [...shared, 'putAct', 'deleteAct', 'putChapter', 'deleteChapter', 'putScene', 'deleteScene', 'putPassage', 'deletePassage', 'putStateChange'],
+    canvas: [...shared, 'putObjectType', 'putObject', 'putFact', 'putKnowledge', 'putChapter', 'putScene', 'putPassage'],
     cast: [],
   };
   for (const command of commands) {
@@ -126,29 +139,29 @@ function validateProposal(project: Workspace, role: ProposalRole, step: AgentSte
   const ops = storyOpsCommands(direct.length ? applyCommands(project, direct) : project, proposal.opsJson === '[]' ? '' : proposal.opsJson, { references: request.references, allowed: roleOps[role] });
   const typed = [...direct, ...ops.commands];
   const preview = applyCommands(project, typed);
-  // Catch cascaded deletion as well as explicit putScene text changes.
-  for (const scene of project.scenes) {
-    const next = preview.scenes.find(item => item.id === scene.id);
-    if (scene.text.trim() && (!next || scene.text !== next.text)) throw new DomainValidationError('编排专家不能删除或改写已有正式正文');
+  // Catch cascaded deletion as well as explicit text changes (a putScene in the old shape carries prose too).
+  for (const passage of project.passages) {
+    const next = preview.passages.find(item => item.id === passage.id);
+    if (passage.text.trim() && (!next || passage.text !== next.text)) throw new DomainValidationError('编排专家不能删除或改写已有正式正文');
   }
-  for (const scene of preview.scenes) if (!project.scenes.some(item => item.id === scene.id) && scene.text.trim()) throw new DomainValidationError('编排专家新建场景的正文必须为空');
+  for (const passage of preview.passages) if (!project.passages.some(item => item.id === passage.id) && passage.text.trim()) throw new DomainValidationError('编排专家新建场景段的正文必须为空');
   return typed;
 }
 
 /** Which roles build on earlier specialists' conclusions is ROLE_CAPABILITIES.upstream. Evolution reads the written prose of its
- * event, which dependency folding already places in its workspace. */
+ * scene, which dependency folding already places in its workspace. */
 const UPSTREAM_NOTICE = '本任务中已完成的前置专长结论，在此基础上继续。角色代入是人物当时的主观理解，可能有误；与正式原文或作者设定冲突时以原文和设定为准。前置修改已并入工作区的，会直接体现在资料中，不要重复创建。';
 
-/** story: stored digests over this (possibly candidate) workspace; focusSceneIds: scenes a review must examine;
+/** story: stored digests over this (possibly candidate) workspace; focusPassageIds: passages a review must examine;
  * upstream: conclusions of the plan node's finished dependencies, dropped for roles outside UPSTREAM_ROLES. */
-export function specialistDefinition(specialist: SpecialistRequest & { story?: StoryView; focusSceneIds?: string[]; authorRules?: Array<{ kind: string; content: string }>; upstream?: UpstreamResult[] }): SpecialistDefinition {
+export function specialistDefinition(specialist: SpecialistRequest & { story?: StoryView; focusPassageIds?: string[]; authorRules?: Array<{ kind: string; content: string }>; upstream?: UpstreamResult[] }): SpecialistDefinition {
   const { role, node, project, request } = specialist;
   const authorRules = specialist.authorRules ?? [];
   const upstream = UPSTREAM_ROLES.has(role) && specialist.upstream?.length ? { notice: UPSTREAM_NOTICE, results: specialist.upstream } : undefined;
   const story = specialist.story ?? new StoryView(project);
   if (role !== node.role) throw new DomainValidationError('专家角色与计划节点不一致');
   validatePlanTarget(node, project, request);
-  const sceneId = node.sceneId ?? request.sceneId;
+  const target = nodeTarget(node, project, request);
   const objective = node.objective;
 
   if (role === 'character') {
@@ -158,9 +171,9 @@ export function specialistDefinition(specialist: SpecialistRequest & { story?: S
       sources: sourcesForLabels(project, context.sources, role) };
   }
   if (role === 'reader') {
-    const target = readerTarget(project, request, sceneId, node.chapterId);
-    const context = buildReaderContext(project, target.chapterId, target.sceneId);
-    const chapters = [...project.chapters].filter(chapter => chapter.order <= project.chapters.find(item => item.id === target.chapterId)!.order);
+    const reading = readerTarget(project, request, target.passage, node.chapterId);
+    const context = buildReaderContext(project, reading.chapterId, reading.passageId);
+    const chapters = [...project.chapters].filter(chapter => chapter.order <= project.chapters.find(item => item.id === reading.chapterId)!.order);
     return { definition: proseDefinition('reader', '读者 · 正文审阅', `${readerPrompt.text}\n${reviewFormatPrompt.text}`, reviewSchema),
       context: boundedContext({ title: context.title, earlierStory: readerEarlierStory(story, context.sources, context.text.length), text: context.text.slice(-READER_TEXT_CHARS),
         omitted: { earlierVisibleChars: Math.max(0, context.text.length - READER_TEXT_CHARS), notice: '这里只包含已呈现正文；earlierStory 是较早已读正文的摘要。未读后文和作者目标/设定未提供。' } }, undefined, ['text']),
@@ -168,75 +181,45 @@ export function specialistDefinition(specialist: SpecialistRequest & { story?: S
       sources: [sourceFor(project, 'novel:title', project.id)!, ...chapters.map(chapter => sourceFor(project, 'chapter:title', chapter.id)!), ...sourcesForLabels(project, context.sources, role)] };
   }
   if (role === 'writer') {
-    const scene = structuredClone(project.scenes.find(item => item.id === sceneId)!);
-    const selection = request.stage === 'rewrite' && request.sceneId === scene.id ? request.selection : undefined;
+    const passage = structuredClone(target.passage!), title = story.label(passage.id);
+    const selection = request.stage === 'rewrite' && request.passageId === passage.id ? request.selection : undefined;
     // An empty selection is a cursor: continue the prose there instead of replacing anything.
     const insert = !!selection && selection.start === selection.end;
-    const { sources: labels, ...context } = buildWriterContext(project, scene.id, request.references, story);
-    const patch = node.mode === 'patch' && !selection && !!scene.text.trim();
-    if (patch) return { definition: proseDefinition('patch', `${scene.title} · 局部修订`, `${writerPrompt.text}\n${writerScopePrompts.patch.text}`, patchSchema),
+    const { sources: labels, ...context } = buildWriterContext(project, passage.id, request.references, story);
+    const patch = node.mode === 'patch' && !selection && !!passage.text.trim();
+    if (patch) return { definition: proseDefinition('patch', `${title} · 局部修订`, `${writerPrompt.text}\n${writerScopePrompts.patch.text}`, patchSchema),
       context: boundedContext({ ...context, authorRules, ...(upstream ? { upstream } : {}) }, WRITER_CONTEXT_CHARS, WRITER_PRIORITY), objective,
       sources: [...novelSources(project), ...sourcesForLabels(project, labels, role)],
       toCommands: step => {
         const { edits } = result<{ edits: Array<{ quote: string; replacement: string }> }>(step, patchSchema);
-        return [{ type: 'putScene', value: { ...structuredClone(scene), text: applyEdits(scene.text, edits) } }];
+        return [{ type: 'putPassage', value: { ...structuredClone(passage), text: applyEdits(passage.text, edits) } }];
       } };
-    return { definition: proseDefinition(request.stage === 'rewrite' ? 'rewrite' : 'writer', `${scene.title} · ${insert ? '续写' : '正文写作'}`, `${writerPrompt.text}\n${(insert ? writerScopePrompts.insert : selection ? writerScopePrompts.selection : writerScopePrompts.scene).text}`),
-      context: boundedContext({ ...context, authorRules, ...(upstream ? { upstream } : {}), selectedText: selection && !insert ? scene.text.slice(selection.start, selection.end) : null,
-        ...(insert ? { cursor: { before: scene.text.slice(Math.max(0, selection.start - CURSOR_BEFORE_CHARS), selection.start), after: scene.text.slice(selection.end, selection.end + CURSOR_AFTER_CHARS) } } : {}) }, WRITER_CONTEXT_CHARS, [...WRITER_PRIORITY.slice(0, 1), 'cursor', ...WRITER_PRIORITY.slice(1)]), objective,
+    return { definition: proseDefinition(request.stage === 'rewrite' ? 'rewrite' : 'writer', `${title} · ${insert ? '续写' : '正文写作'}`, `${writerPrompt.text}\n${(insert ? writerScopePrompts.insert : selection ? writerScopePrompts.selection : writerScopePrompts.passage).text}`),
+      context: boundedContext({ ...context, authorRules, ...(upstream ? { upstream } : {}), selectedText: selection && !insert ? passage.text.slice(selection.start, selection.end) : null,
+        ...(insert ? { cursor: { before: passage.text.slice(Math.max(0, selection.start - CURSOR_BEFORE_CHARS), selection.start), after: passage.text.slice(selection.end, selection.end + CURSOR_AFTER_CHARS) } } : {}) }, WRITER_CONTEXT_CHARS, [...WRITER_PRIORITY.slice(0, 1), 'cursor', ...WRITER_PRIORITY.slice(1)]), objective,
       sources: [...novelSources(project), ...sourcesForLabels(project, labels, role)],
       toCommands: step => {
         if (typeof step.output !== 'string' || !step.output.trim()) throw new DomainValidationError('模型没有生成正文');
-        const text = selection ? scene.text.slice(0, selection.start) + step.output + scene.text.slice(selection.end) : step.output;
-        return [{ type: 'putScene', value: { ...structuredClone(scene), text } }];
+        const text = selection ? passage.text.slice(0, selection.start) + step.output + passage.text.slice(selection.end) : step.output;
+        return [{ type: 'putPassage', value: { ...structuredClone(passage), text } }];
       } };
   }
-  if (role === 'evolution') {
-    const character = buildCharacterContext(project, node.characterId!, node.eventId!);
-    const event = project.objects.find(item => item.id === node.eventId)!;
-    const scenes = project.scenes.filter(scene => scene.eventIds.includes(event.id) && scene.eventIds.every(id => id === event.id
-      || (project.objects.find(item => item.id === id)?.event?.worldOrder ?? Infinity) < event.event!.worldOrder));
-    // A chapter/scene-scoped task cannot propose a state backed by another scene.
-    const scoped = request.stage === 'chapter' ? scenes.filter(scene => request.sceneId ? scene.id === request.sceneId
-      : scene.chapterId === (request.chapterId ?? [...project.chapters].sort((a, b) => a.order - b.order)[0]?.id)) : scenes;
-    const written = scoped.filter(scene => scene.text.trim()), evidenceScenes = written.length ? written : scoped;
-    const acquiredKnowledge = project.knowledge.filter(item => item.characterId === character.characterId && item.learnedAt === event.id)
-      .map(item => ({ id: item.id, content: item.content, source: item.source, learnedAt: item.learnedAt }));
-    const existing = project.characterStates?.find(state => state.characterId === character.characterId && state.eventId === event.id);
-    const stateId = existing?.id ?? randomUUID();
-    return { definition: definition(`evolution:${character.characterId}`, `${character.name} · 人物演进`, evolutionPrompt.text, stateSchema),
-      context: boundedContext({ character, ...(authorRules.length ? { authorRules } : {}), acquiredKnowledge, event: { id: event.id, name: event.name, worldOrder: event.event!.worldOrder },
-        sceneEvidence: evidenceScenes.map(scene => ({ id: scene.id, title: scene.title, povId: scene.povId, eventIds: scene.eventIds,
-          ...(written.length ? { actualText: scene.text.length > EVIDENCE_TEXT_CHARS ? `${scene.text.slice(0, EVIDENCE_TEXT_CHARS / 2)}\n……\n${scene.text.slice(-EVIDENCE_TEXT_CHARS / 2)}` : scene.text, isPlan: false } : { outline: scene.outline, actualText: '', isPlan: true }) })) }),
-      objective: '跟进这个事件后的角色视角、心理和动机，提供可核对的论据。acquiredKnowledge 是该人物在本事件中明确获知的内容快照，可进入事件结束后的状态；允许它是误解或谎言。',
-      sources: [...sourcesForLabels(project, character.sources, 'character'), sourceFor(project, 'event:time', event.id)!,
-        ...acquiredKnowledge.map(item => sourceFor(project, 'knowledge', item.id)!),
-        ...evidenceScenes.map(scene => sourceFor(project, written.length ? 'scene:text' : 'scene:outline', scene.id)!),
-        ...(existing ? [sourceFor(project, 'characterState', existing.id)!] : [])],
-      toCommands: step => {
-        const state = result<Pick<CharacterState, 'perspective' | 'psychology' | 'motivation' | 'evidence'>>(step, stateSchema);
-        const value: CharacterState = { ...state, id: stateId, characterId: character.characterId, eventId: event.id, sceneIds: evidenceScenes.map(scene => scene.id),
-          evidence: written.length || state.evidence.startsWith('计划：') ? state.evidence : `计划：${state.evidence}` };
-        const commands: Command[] = [{ type: 'putCharacterState', value }];
-        applyCommands(project, commands);
-        return commands;
-      } };
-  }
+  if (role === 'evolution') return evolutionDefinition(project, request, story, target.scene!, target.passage, node.characterId, authorRules);
 
   if (role === 'stylist') {
-    const focus = specialist.focusSceneIds?.length ? specialist.focusSceneIds : sceneId ? [sceneId] : [];
-    const scenes = focus.map(id => project.scenes.find(scene => scene.id === id)).filter((scene): scene is NonNullable<typeof scene> => !!scene?.text.trim()).slice(0, 3);
-    if (!scenes.length) throw new DomainValidationError('文风审阅需要已有正文的场景');
+    const focus = specialist.focusPassageIds?.length ? specialist.focusPassageIds : target.passage ? [target.passage.id] : [];
+    const passages = focus.map(id => story.passage(id)).filter((passage): passage is Passage => !!passage?.text.trim()).slice(0, 3);
+    if (!passages.length) throw new DomainValidationError('文风审阅需要已有正文的场景段');
     const profile = styleProfile(project), baseline = styleBaseline(profile);
-    const before = story.order[story.positionOf(scenes[0]!.id) - 1];
-    const { notice: _notice, ...style } = writerStyle(project, scenes[0]!);
+    const before = story.order[story.positionOf(passages[0]!.id) - 1];
+    const { notice: _notice, ...style } = writerStyle(project, story.sceneOf(passages[0]!.id)!, passages[0]!.text);
     return { definition: proseDefinition('stylist', '文风 · 笔触审阅', `${stylistPrompt.text}\n${reviewFormatPrompt.text}`, reviewSchema),
       context: boundedContext({ style,
-        targetScenes: scenes.map(scene => ({ id: scene.id, title: scene.title, text: reviewText(scene.text, Math.floor(REVIEW_TEXT_CHARS / scenes.length)),
-          lint: styleLint(scene.text, profile, baseline).issues.map(issue => ({ message: issue.message, excerpt: issue.excerpt })) })),
-        precedingText: before?.text.slice(-1500) ?? '' }, undefined, ['style', 'targetScenes']),
+        targetPassages: passages.map(passage => ({ id: passage.id, title: story.label(passage.id), text: reviewText(passage.text, Math.floor(REVIEW_TEXT_CHARS / passages.length)),
+          lint: styleLint(passage.text, profile, baseline).issues.map(issue => ({ message: issue.message, excerpt: issue.excerpt })) })),
+        precedingText: before?.text.slice(-1500) ?? '' }, undefined, ['style', 'targetPassages']),
       objective: '审阅这些正文与作者文风的贴合度，给出 pass/revise、具体问题与修改方向。',
-      sources: [sourceFor(project, 'style', project.id)!, ...scenes.map(scene => sourceFor(project, 'scene:text', scene.id)!)] };
+      sources: [sourceFor(project, 'style', project.id)!, ...passages.map(passage => sourceFor(project, 'passage:text', passage.id)!)] };
   }
 
   const overview = { ...collectContext(project, request, [], story) as Record<string, unknown>, ...(authorRules.length ? { authorRules } : {}), ...(upstream ? { upstream } : {}) };
@@ -249,28 +232,34 @@ export function specialistDefinition(specialist: SpecialistRequest & { story?: S
     },
   };
   if (role === 'continuity') {
-    // Review what actually changed (or the target), wherever it sits in the book — not the first scenes created.
-    const focus = specialist.focusSceneIds?.length ? specialist.focusSceneIds : sceneId ? [sceneId]
-      : story.order.filter(scene => scene.chapterId === (request.chapterId ?? story.frontierChapterId())).map(scene => scene.id);
-    const scenes = focus.map(id => story.scene(id)).filter((scene): scene is NonNullable<typeof scene> => !!scene).slice(0, 12);
+    // Review what actually changed (or the target), wherever it sits in the book — not the first passages created.
+    const focus = specialist.focusPassageIds?.length ? specialist.focusPassageIds : target.passage ? [target.passage.id]
+      : story.order.filter(passage => passage.chapterId === (request.chapterId ?? story.frontierChapterId())).map(passage => passage.id);
+    const passages = focus.map(id => story.passage(id)).filter((passage): passage is Passage => !!passage).slice(0, 12);
+    const scenes = [...new Set(passages.map(passage => passage.sceneId))].flatMap(id => { const scene = story.scene(id); return scene ? [scene] : []; });
     const subjects = new Set<string>();
     for (const scene of scenes) {
       if (scene.povId) subjects.add(scene.povId);
+      for (const id of [...(scene.castIds ?? []), ...(scene.settingIds ?? [])]) subjects.add(id);
       for (const id of scene.eventIds) { subjects.add(id); for (const person of project.objects.find(object => object.id === id)?.event?.participants ?? []) subjects.add(person); }
-      for (const id of sceneMentions(story.index, scene.id).keys()) subjects.add(id);
     }
-    const facts = project.facts.filter(fact => subjects.has(fact.subjectId)), states = (project.characterStates ?? []).filter(state => subjects.has(state.characterId));
-    const objects = project.objects.filter(object => subjects.has(object.id));
-    const shown = new Set(scenes.map(scene => scene.id));
-    const before = [...new Set(scenes.flatMap(scene => story.order.slice(Math.max(0, story.positionOf(scene.id) - 3), story.positionOf(scene.id))))].filter(scene => !shown.has(scene.id));
-    const perScene = Math.max(3000, Math.floor(REVIEW_TEXT_CHARS / Math.max(1, scenes.length)));
+    for (const passage of passages) for (const id of passageMentions(story.index, passage.id).keys()) subjects.add(id);
+    const facts = project.facts.filter(fact => subjects.has(fact.subjectId));
+    const timeline = storyTimeline(project), objects = project.objects.filter(object => subjects.has(object.id));
+    // How each person and place on stage changes through the book, in the order the changes take effect, with where they happen.
+    const stateChanges = objects.filter(object => !object.event).flatMap(object => timeline.history(object.id).slice(-8).map(change => ({ id: change.id, subject: object.name,
+      sceneId: change.sceneId, passageId: change.passageId, eventId: change.eventId, becomes: labelledAspects(change.aspects), ...(change.note ? { note: change.note.slice(0, 300) } : {}) })));
+    const shown = new Set(passages.map(passage => passage.id));
+    const before = [...new Set(passages.flatMap(passage => story.order.slice(Math.max(0, story.positionOf(passage.id) - 3), story.positionOf(passage.id))))].filter(passage => !shown.has(passage.id));
+    const perPassage = Math.max(3000, Math.floor(REVIEW_TEXT_CHARS / Math.max(1, passages.length)));
     return { definition: proseDefinition('continuity', '作者 · 连续性审阅', `${continuityPrompt.text}\n${reviewFormatPrompt.text}`, reviewSchema),
-      context: boundedContext({ targetScenes: scenes.map(scene => ({ ...scene, text: reviewText(scene.text, perScene), outline: scene.outline.slice(0, 1200) })),
-        precedingScenes: before.map(scene => ({ id: scene.id, ...story.sceneMemory(scene.id) })),
-        openThreads: scenes[0] ? openThreads(story, scenes[0].id, objects.flatMap(objectNames), 12).map(thread => thread.title) : [],
-        authorFacts: facts.slice(0, 40), characterStates: states.slice(0, 20), authorObjects: objects.slice(0, 30), overview,
-        omitted: { sceneBodies: Math.max(0, project.scenes.length - scenes.length), facts: Math.max(0, facts.length - 40), objects: Math.max(0, objects.length - 30),
-          notice: '只载入审阅目标场景及其涉及人物/事件的设定；precedingScenes 为前文摘要。' } }),
+      context: boundedContext({ targetPassages: passages.map(passage => ({ id: passage.id, sceneId: passage.sceneId, chapterId: passage.chapterId, title: story.label(passage.id), ...(passage.beat ? { beat: passage.beat } : {}), text: reviewText(passage.text, perPassage) })),
+        targetScenes: scenes.map(scene => ({ ...scene, outline: scene.outline.slice(0, 1200) })),
+        precedingPassages: before.map(passage => ({ id: passage.id, ...story.passageMemory(passage.id) })),
+        openThreads: passages[0] ? openThreads(story, passages[0].id, objects.flatMap(objectNames), 12).map(thread => thread.title) : [],
+        authorFacts: facts.slice(0, 40), stateChanges: stateChanges.slice(0, 40), authorObjects: objects.slice(0, 30), overview,
+        omitted: { passageBodies: Math.max(0, project.passages.length - passages.length), facts: Math.max(0, facts.length - 40), stateChanges: Math.max(0, stateChanges.length - 40), objects: Math.max(0, objects.length - 30),
+          notice: '只载入审阅目标场景段及其涉及人物/事件的设定；precedingPassages 为前文摘要。' } }),
       objective, sources: authorSources };
   }
   if (role === 'planner' || role === 'world' || role === 'narrative' || role === 'canvas' || role === 'cast') return {
@@ -280,21 +269,94 @@ export function specialistDefinition(specialist: SpecialistRequest & { story?: S
   throw new DomainValidationError(`不支持的专家角色：${role as AgentRole}`);
 }
 
-/** Earlier visible prose as chapter digests: only chapters / scenes the reader has already read, never volume or book rollups. */
+/** Earlier visible prose as chapter digests: only chapters / passages the reader has already read, never volume or book rollups. */
 function readerEarlierStory(story: StoryView, visibleSources: string[], visibleChars: number) {
   if (visibleChars <= READER_TEXT_CHARS) return [];
   const sources = new Set(visibleSources);
-  const visible = story.order.filter(scene => sources.has(`scene:${scene.id}:text`));
+  const visible = story.order.filter(passage => sources.has(`passage:${passage.id}:text`));
   let tail = 0, cut = visible.length;
   while (cut > 0 && tail < READER_TEXT_CHARS) tail += visible[--cut]!.text.length + 2;
   const earlier = visible.slice(0, cut);
   const lastChapter = visible.at(-1)?.chapterId, result: Array<{ chapter: string; summary: string }> = [];
   for (const chapter of story.chapters) {
-    const scenes = earlier.filter(scene => scene.chapterId === chapter.id);
-    if (!scenes.length) continue;
-    const complete = chapter.id !== lastChapter && scenes.length === story.order.filter(scene => scene.chapterId === chapter.id && scene.text.trim()).length;
-    const summary = complete ? story.chapterSummary(chapter.id, true).summary : scenes.map(scene => story.sceneMemory(scene.id, true).summary).join(' ');
+    const passages = earlier.filter(passage => passage.chapterId === chapter.id);
+    if (!passages.length) continue;
+    const complete = chapter.id !== lastChapter && passages.length === story.order.filter(passage => passage.chapterId === chapter.id && passage.text.trim()).length;
+    const summary = complete ? story.chapterSummary(chapter.id, true).summary : passages.map(passage => story.passageMemory(passage.id, true).summary).join(' ');
     result.push({ chapter: chapter.title, summary: summary.slice(0, 300) });
   }
   return result.slice(-20);
+}
+
+/** Records how the people and places of one scene change in it: on one of its passages when the scene runs through several chapters
+ * and the task writes that passage, otherwise for the scene as a whole. Each subject's change is complete for that place, so running
+ * again over the same scene updates the change it recorded before. */
+function evolutionDefinition(project: Workspace, request: RunRequest, story: StoryView, scene: NarrativeScene, passage: Passage | undefined,
+  focusId: string | undefined, authorRules: Array<{ kind: string; content: string }>): SpecialistDefinition {
+  const parts = story.scenePassages(scene.id);
+  const anchor = passage && parts.length > 1 ? passage : undefined;
+  const evidence = anchor ? [anchor] : parts, written = evidence.filter(item => item.text.trim());
+  const timeline = storyTimeline(project), point: StatePoint = anchor ? { passageId: anchor.id } : { sceneId: scene.id };
+  const events = scene.eventIds.flatMap(id => { const event = project.objects.find(object => object.id === id && object.event); return event ? [event] : []; });
+  const eventTimes = events.map(event => event.event!.worldOrder), sceneTime = eventTimes.length ? Math.min(...eventTimes) : undefined;
+  // Everyone the scene puts on stage, the people of its events, then whoever its prose names; or just the person the plan names.
+  const candidates = focusId ? [focusId] : [...sceneSubjects(project, scene).map(object => object.id), ...events.flatMap(event => event.event!.participants),
+    ...evidence.flatMap(item => [...passageMentions(story.index, item.id).keys()])];
+  const subjects = [...new Set(candidates)].flatMap(id => { const object = project.objects.find(item => item.id === id && !item.event); return object ? [object] : []; }).slice(0, EVOLUTION_SUBJECTS);
+  const recordedHere = (subjectId: string) => project.stateChanges.filter(change => change.subjectId === subjectId && change.sceneId === scene.id && change.passageId === anchor?.id);
+  const eventTime = new Map(events.map(event => [event.id, event.event!.worldOrder]));
+  const allEvents = new Map(project.objects.filter(object => object.event).map(object => [object.id, object.event!.worldOrder]));
+  const used = new Set<string>(), knowledgeIds = new Set<string>();
+  const subjectContext = subjects.map(subject => {
+    const held = [...timeline.stateAt(subject.id, point).values()], recorded = recordedHere(subject.id);
+    for (const change of [...held.map(item => item.change), ...recorded]) used.add(change.id);
+    const base = { id: subject.id, name: subject.name, kind: subject.typeId === 'character' ? '人物' : '环境',
+      before: Object.fromEntries(held.map(item => [item.label, item.value])),
+      ...(recorded.length ? { recorded: recorded.map(change => ({ eventId: change.eventId ?? '', becomes: labelledAspects(change.aspects), note: change.note ?? '' })) } : {}) };
+    if (subject.typeId !== 'character') return base;
+    // What the character can know here: from before the scene, and what the scene's events tell them.
+    const known = project.knowledge.filter(item => item.characterId === subject.id && (item.learnedAt === null || sceneTime === undefined
+      || (allEvents.get(item.learnedAt) ?? Infinity) < sceneTime)).slice(-12);
+    const learned = project.knowledge.filter(item => item.characterId === subject.id && item.learnedAt !== null && eventTime.has(item.learnedAt));
+    for (const item of [...known, ...learned]) knowledgeIds.add(item.id);
+    const perception = Object.fromEntries(events.flatMap(event => event.event!.observations[subject.id] ? [[event.name, event.event!.observations[subject.id]!]] : []));
+    return { ...base, knowledge: { selfKnowledge: typeof subject.fields.selfKnowledge === 'string' ? subject.fields.selfKnowledge : '',
+      knows: known.map(item => item.content), learnsHere: learned.map(item => item.content), ...(Object.keys(perception).length ? { perception } : {}) } };
+  });
+  const allowed = new Set(subjects.map(subject => subject.id)), title = anchor ? story.label(anchor.id) : scene.title;
+  const chapterTitle = (item: Passage) => story.chapters[story.chapterIndex(item.chapterId)]?.title ?? '';
+  // Written prose is the evidence on its own: the outline is the plan, and only stands in for prose not written yet.
+  return { definition: definition(`evolution:${scene.id}`, `${title} · 人物与环境演进`, evolutionPrompt.text, evolutionSchema),
+    context: boundedContext({ ...(authorRules.length ? { authorRules } : {}),
+      scene: { id: scene.id, title: scene.title, ...(anchor ? { passage: { chapter: chapterTitle(anchor), part: `${parts.indexOf(anchor) + 1}/${parts.length}`, beat: anchor.beat ?? '' } } : {}) },
+      events: events.map(event => ({ id: event.id, name: event.name, worldOrder: event.event!.worldOrder, participants: event.event!.participants.map(id => project.objects.find(object => object.id === id)?.name ?? id) })),
+      aspects: STATE_ASPECTS.map(aspect => ({ name: aspect.label, hint: aspect.hint, for: aspect.subjects === 'character' ? '人物' : aspect.subjects === 'setting' ? '环境' : '人物与环境' })),
+      subjects: subjectContext, isPlan: !written.length,
+      ...(written.length ? { prose: written.map(item => ({ chapter: chapterTitle(item), text: reviewText(item.text, EVIDENCE_TEXT_CHARS) })) }
+        : { plan: { outline: scene.outline, beats: evidence.map(item => item.beat ?? '').filter(Boolean) } }) }),
+    objective: '记下这一场里人物与环境的状态变化，给出可核对的依据。',
+    sources: [...(written.length ? [] : [sourceFor(project, 'scene:outline', scene.id)!]), ...events.map(event => sourceFor(project, 'event:time', event.id)!),
+      ...written.map(item => sourceFor(project, 'passage:text', item.id)!), ...[...used].map(id => sourceFor(project, 'stateChange', id)!),
+      ...[...knowledgeIds].map(id => sourceFor(project, 'knowledge', id)!)],
+    toCommands: step => {
+      const output = result<EvolutionOutput>(step, evolutionSchema), values: StateChange[] = [];
+      for (const item of output.changes) {
+        if (!allowed.has(item.subjectId)) throw new DomainValidationError(`subjectId 必须是 subjects 中的 id：${item.subjectId}`);
+        const aspects: Record<string, string> = {};
+        for (const { aspect, value } of item.aspects) {
+          const key = aspectKey(aspect).slice(0, ASPECT_KEY_CHARS);
+          if (key && value.trim() && Object.keys(aspects).length < MAX_STATE_ASPECTS) aspects[key] = value.trim().slice(0, ASPECT_VALUE_CHARS);
+        }
+        if (!Object.keys(aspects).length) continue;
+        const eventId = item.eventId && scene.eventIds.includes(item.eventId) ? item.eventId : undefined;
+        const place = { subjectId: item.subjectId, sceneId: scene.id, ...(anchor ? { passageId: anchor.id } : {}), ...(eventId ? { eventId } : {}) };
+        const note = !item.note.trim() || written.length || item.note.startsWith('计划：') ? item.note.trim() : `计划：${item.note.trim()}`;
+        const value: StateChange = { id: project.stateChanges.find(change => sameAnchor(change, place))?.id ?? stateChangeId(place), ...place, aspects, ...(note ? { note } : {}) };
+        const index = values.findIndex(change => sameAnchor(change, value));
+        if (index >= 0) values[index] = value; else values.push(value);
+      }
+      const commands: Command[] = values.map(value => ({ type: 'putStateChange', value }));
+      applyCommands(project, commands);
+      return commands;
+    } };
 }

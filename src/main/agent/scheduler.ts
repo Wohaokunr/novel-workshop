@@ -1,5 +1,5 @@
 import type { AgentDecision, AgentMemory } from '../../shared/agent-types.js';
-import type { AgentEvent, AgentRun, ProviderSecret, RunRequest, NarrativeScene } from '../../shared/types.js';
+import type { AgentEvent, AgentRun, ProviderSecret, RunRequest, Passage } from '../../shared/types.js';
 import { NovelStore } from '../store.js';
 import { resolveReferences } from '../context.js';
 import { OpenAIResponseTransport, runAgent, type EmbeddingTransport, type ResponseTransport } from '../responses.js';
@@ -38,14 +38,16 @@ export class NovelAgentScheduler {
     resolveReferences(project, previous.references);
     const batches = this.store.history(project.id).filter(batch => batch.taskId === id && !batch.undone);
     if (previous.stage === 'rewrite') {
-      const originalText = (previous.steps.find(step => step.agentId === 'rewrite')?.input as { context?: { scene?: NarrativeScene } } | undefined)?.context?.scene?.text;
-      const first = [...batches].reverse().flatMap(batch => batch.changes).find(change => change.collection === 'scenes' && change.key === previous.sceneId);
-      const restoredText = first ? (first.before as NarrativeScene | undefined)?.text : project.scenes.find(scene => scene.id === previous.sceneId)?.text;
+      // Runs recorded before scenes were split into passages kept the prose on the scene.
+      const input = (previous.steps.find(step => step.agentId === 'rewrite')?.input as { context?: { passage?: Pick<Passage, 'text'>; scene?: { text?: string } } } | undefined)?.context;
+      const originalText = input?.passage?.text ?? input?.scene?.text;
+      const first = [...batches].reverse().flatMap(batch => batch.changes).find(change => change.collection === 'passages' && change.key === previous.passageId);
+      const restoredText = first ? (first.before as Passage | undefined)?.text : project.passages.find(passage => passage.id === previous.passageId)?.text;
       if (typeof originalText !== 'string' || restoredText !== originalText) throw new Error('原改写正文无法确认，请重新选择正文发起任务');
     }
     if (batches.length) { this.store.undo(project.id, id); this.onEvent({ type: 'projectChanged', projectId: project.id, runId: id }); }
-    const { projectId, stage, tool, objective, chapterId, sceneId, selection, references } = previous;
-    return this.start({ projectId, stage, tool, objective, chapterId, sceneId, selection, references });
+    const { projectId, stage, tool, objective, chapterId, passageId, selection, references } = previous;
+    return this.start({ projectId, stage, tool, objective, chapterId, passageId, selection, references });
   }
   async testProvider(): Promise<string> {
     const provider = await this.getProvider();

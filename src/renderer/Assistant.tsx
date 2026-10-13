@@ -1,6 +1,7 @@
 import { ArrowUpRight, BookmarkPlus, ChevronRight, CircleAlert, CircleCheck, CircleSlash, CornerDownLeft, FileText, Film, Hourglass, LoaderCircle, Plus, RefreshCw, Sparkles, Square, StickyNote, Undo2, UserRound, X } from 'lucide-react';
 import type { AgentRun, AssistTool, OperationBatch, ProviderSettings, RunRequest, SourceReference, Workspace } from '../shared/types';
-import { Callout, Combobox, Kbd, Popover, StatusPill, assistTools, finalReview, fire, isAgentRun, isRunActive, orderedChapters, orderedScenes, runStatus, stageNames, taskLabel, taskObjective, type ComboItem, type TaskDraft } from './ui';
+import { Callout, Combobox, Kbd, Popover, StatusPill, assistTools, finalReview, fire, isAgentRun, isRunActive, orderedChapters, orderedPassages, orderedScenes, runStatus, sceneChapters, stageNames, taskLabel, taskObjective, type ComboItem, type TaskDraft } from './ui';
+import { chapterPassages, passageLabel } from '../shared/structure';
 import { AgentInputForm, AgentMemoryPanel, AgentRunControls, CandidateReview, PlanStepper, ProgressBar, type AgentMemoryActions, type AgentTaskActions } from './AgentTask';
 import Markdown from './Markdown';
 import type { AgentMemory, AgentSession } from '../shared/agent-types';
@@ -30,8 +31,9 @@ export function taskReferences(workspace: Workspace, history: OperationBatch[], 
       else if (change.collection === 'scenes' && workspace.scenes.some(s => s.id === change.key)) ref = { kind: 'scene', id: change.key };
       else if (change.collection === 'facts') { const fact = workspace.facts.find(f => f.id === change.key); if (fact) ref = { kind: 'object', id: fact.subjectId }; }
       else if (change.collection === 'knowledge') { const item = workspace.knowledge.find(k => k.id === change.key); if (item) ref = { kind: 'object', id: item.characterId }; }
-      else if (change.collection === 'characterStates') { const item = workspace.characterStates?.find(k => k.id === change.key); if (item) ref = { kind: 'object', id: item.characterId }; }
-      else if (change.collection === 'chapters') { const scene = orderedScenes(workspace).find(s => s.chapterId === change.key); if (scene) ref = { kind: 'scene', id: scene.id }; }
+      else if (change.collection === 'stateChanges') { const item = workspace.stateChanges.find(k => k.id === change.key); if (item) ref = { kind: 'object', id: item.subjectId }; }
+      else if (change.collection === 'passages') { const passage = workspace.passages.find(p => p.id === change.key); if (passage && workspace.scenes.some(s => s.id === passage.sceneId)) ref = { kind: 'scene', id: passage.sceneId }; }
+      else if (change.collection === 'chapters') { const passage = chapterPassages(workspace, change.key)[0]; if (passage) ref = { kind: 'scene', id: passage.sceneId }; }
       if (ref) refs.set(`${ref.kind}:${ref.id}`, ref);
     }
   }
@@ -123,30 +125,30 @@ export default function Assistant(props: AssistantProps) {
   const companion = useCompanion();
   const streamingThreads = companion.threads.filter(thread => thread.status === 'streaming').length;
   const { stage, tool, references, selection, chapterScope } = draft;
-  const scene = workspace?.scenes.find(s => s.id === draft.sceneId);
-  const chapter = workspace?.chapters.find(c => c.id === scene?.chapterId);
+  const passage = workspace?.passages.find(p => p.id === draft.passageId);
+  const chapter = workspace?.chapters.find(c => c.id === passage?.chapterId);
   const active = runs.find(isRunActive);
   const latest = active ?? runs[0];
   const lastHuman = history.find(batch => batch.actor === 'human' && !batch.undone && batch.changes.some(change => !['layouts', 'reading'].includes(change.collection) && (change.collection !== 'cards' || ['title', 'content', 'kind', 'refId'].some(key => (change.before as Record<string, unknown> | undefined)?.[key] !== (change.after as Record<string, unknown> | undefined)?.[key]))));
   const needsFollowUp = lastHuman && (!latest?.finishedAt || lastHuman.at > latest.finishedAt) && !active;
   const followUpRefs = workspace && lastHuman ? taskReferences(workspace, [{ ...lastHuman, taskId: lastHuman.id }], lastHuman.id) : [];
-  const validSelection = !!scene && !!selection && Number.isSafeInteger(selection.start) && Number.isSafeInteger(selection.end)
-    && selection.start >= 0 && selection.end >= selection.start && selection.end <= scene.text.length
-    && scene.text.slice(selection.start, selection.end) === selection.text;
+  const validSelection = !!passage && !!selection && Number.isSafeInteger(selection.start) && Number.isSafeInteger(selection.end)
+    && selection.start >= 0 && selection.end >= selection.start && selection.end <= passage.text.length
+    && passage.text.slice(selection.start, selection.end) === selection.text;
   const continuing = stage === 'rewrite' && !!selection && selection.start === selection.end;
   const hasMissingReference = !!workspace && references.some(ref => !(ref.kind === 'card' ? workspace.cards : ref.kind === 'object' ? workspace.objects : workspace.scenes).some(item => item.id === ref.id));
   let blocker = !workspace ? '先创建或打开一部作品。' : hasMissingReference ? '引用资料已删除，请移除后继续。' : !draft.objective.trim() ? '填写本次创作目标后即可开始。' : '';
   if (!blocker && (stage === 'chapter' || stage === 'rewrite')) {
-    if (!scene || !chapter) blocker = '请选择目标章节或场景。';
-    else if (stage === 'chapter' && chapterScope === 'scene' && scene.text.trim()) blocker = '这个场景已有正文，请在正文中选中文字进行改写。';
-    else if (stage === 'chapter' && chapterScope === 'chapter' && !workspace?.scenes.some(s => s.chapterId === chapter.id && !s.text.trim())) blocker = '这章没有空白场景，可添加场景或改写已有正文。';
+    if (!passage || !chapter) blocker = '请选择目标章节或场景。';
+    else if (stage === 'chapter' && chapterScope === 'scene' && passage.text.trim()) blocker = '这个场景段已有正文，请在正文中选中文字进行改写。';
+    else if (stage === 'chapter' && chapterScope === 'chapter' && !workspace?.passages.some(p => p.chapterId === chapter.id && !p.text.trim())) blocker = '这章没有空白场景，可添加场景或改写已有正文。';
     else if (stage === 'rewrite' && !validSelection) blocker = selection ? '选段对应的正文已变化，请重新选择。' : '在正文中选中文字，再点击「改写选段」。';
   }
   const taskType = stage === 'assist' ? `assist:${tool}` : stage;
   /** Ideation belongs to the creative partner: lighter, conversational, one-click adopt with undo. */
   const ideation: { mode: 'diverge' | 'outline' | 'develop'; focus?: 'theme'; title: string; hint: string; message: string } | undefined =
     stage === 'idea' ? { mode: 'diverge', title: '和创作伙伴一起发散', hint: '多轮对话、追问与反转，喜欢的点子一键放上画布', message: '根据作品信息，往几个截然不同的方向发散。' }
-    : stage === 'outline' ? { mode: 'outline', title: '和创作伙伴逐层展开大纲', hint: '先定骨架再展开章节，可只采纳其中一部分', message: '把故事骨架展开成幕/卷。' }
+    : stage === 'outline' ? { mode: 'outline', title: '和创作伙伴逐层展开大纲', hint: '先定骨架再展开章节，可只采纳其中一部分', message: '把故事骨架展开成卷。' }
     : stage === 'assist' && tool === 'theme' ? { mode: 'develop', focus: 'theme', title: '和创作伙伴推断立意', hint: '信息不够时先问你几个选择题，再给几个版本，选中即写入立意', message: '根据我已有的信息推断几个立意方向；信息不够就先问我几个选择题。' }
     : stage === 'assist' && tool === 'canvas' ? { mode: 'diverge', title: '和创作伙伴发展灵感', hint: '围绕引用的卡片发散、补人物、连线，一键采纳到画布', message: '把这些灵感发展成可以写的人物、事件或场景，并理清它们的关系。' }
     : undefined;
@@ -154,7 +156,7 @@ export default function Assistant(props: AssistantProps) {
     if (value.startsWith('assist:')) props.onPrepare('assist', references, value.slice(7) as AssistTool, chapterScope);
     else props.onPrepare(value as RunRequest['stage'], references, undefined, chapterScope);
   };
-  const changeScene = (id: string) => props.onDraftChange({ sceneId: id, selection: undefined });
+  const changePassage = (id: string) => props.onDraftChange({ passageId: id, selection: undefined });
   const description = continuing ? '从光标处接着写，写好的内容经审阅后由你批准插入。' : stage === 'assist' ? assistTools[tool].objective : stage === 'chapter' ? (chapterScope === 'chapter' ? '依次完成本章所有空白场景，保留已有正文。' : '根据场景大纲与人物视角，为目标空白场景生成正文。') : descriptions[stage];
   const startLabel = stage === 'assist' ? `开始${assistTools[tool].label}` : continuing ? '开始续写' : { agent: '开始目标任务', idea: '开始构思', outline: '开始编排', chapter: '开始生成', rewrite: '开始改写' }[stage];
   const canStart = !blocker && !active && !props.busy;
@@ -162,7 +164,7 @@ export default function Assistant(props: AssistantProps) {
   const referenceChip = (ref: SourceReference) => workspace ? <span className="reference-chip" key={`${ref.kind}:${ref.id}`}><button onClick={() => props.onOpenReference(ref.kind, ref.id)} title="打开这项资料">{referenceLabel(workspace, ref)}</button><button aria-label={`移除${referenceLabel(workspace, ref)}`} onClick={() => props.onDraftChange({ references: references.filter(r => r.kind !== ref.kind || r.id !== ref.id) })}><X aria-hidden="true"/></button></span> : null;
   const referenceItems: ComboItem[] = workspace ? [
     ...workspace.objects.map(o => ({ id: `object:${o.id}`, label: o.name, group: o.event ? '世界事件' : workspace.objectTypes.find(t => t.id === o.typeId)?.name ?? '设定' })),
-    ...orderedScenes(workspace).map(s => ({ id: `scene:${s.id}`, label: s.title, hint: workspace.chapters.find(c => c.id === s.chapterId)?.title, group: '叙述场景' })),
+    ...orderedScenes(workspace).map(s => ({ id: `scene:${s.id}`, label: s.title, hint: sceneChapters(workspace, s.id), group: '叙述场景' })),
     ...workspace.cards.filter(c => c.kind === 'note' || c.kind === 'group').map(c => ({ id: `card:${c.id}`, label: c.title, group: c.kind === 'group' ? '画布分组' : '灵感便笺' })),
   ].sort((a, b) => a.group.localeCompare(b.group, 'zh-CN')).map(item => ({ ...item, disabled: references.some(ref => `${ref.kind}:${ref.id}` === item.id) })) : [];
   const addReference = (item: ComboItem) => {
@@ -214,9 +216,9 @@ export default function Assistant(props: AssistantProps) {
           {(stage === 'chapter' || stage === 'rewrite') && <div className="target-scene">
             {stage === 'chapter' && <label className="inline-field"><span>范围</span><select data-testid="chapter-scope" value={chapterScope} onChange={e => { const scope = e.target.value as 'scene' | 'chapter'; props.onDraftChange({ chapterScope: scope, ...(draft.objective === taskObjective(stage, tool, chapterScope) ? { objective: taskObjective(stage, tool, scope) } : {}) }); }}><option value="chapter">整章空白场景</option><option value="scene">单个空白场景</option></select></label>}
             <span>{stage === 'chapter' && chapterScope === 'chapter' ? '目标章节' : '目标场景'}</span>
-            {stage === 'chapter' && chapterScope === 'chapter' ? <select data-testid="target-chapter" aria-label="目标章节" value={scene?.chapterId || ''} onChange={e => { const target = workspace && orderedScenes(workspace).find(s => s.chapterId === e.target.value); if (target) changeScene(target.id); }}><option value="" disabled>选择章节</option>{workspace && orderedChapters(workspace).map(c => <option key={c.id} value={c.id} disabled={!workspace.scenes.some(s => s.chapterId === c.id)}>{c.title}</option>)}</select> : <select data-testid="target-scene" aria-label="目标场景" value={scene?.id || ''} onChange={e => changeScene(e.target.value)}><option value="" disabled>选择场景</option>{workspace && orderedScenes(workspace).map(s => <option key={s.id} value={s.id}>{workspace.chapters.find(c => c.id === s.chapterId)?.title} · {s.title}</option>)}</select>}
-            {stage === 'chapter' && chapterScope === 'chapter' && chapter && <small>将生成 {workspace?.scenes.filter(s => s.chapterId === chapter.id && !s.text.trim()).length} 个空白场景</small>}
-            {continuing && scene && <div className="selection-preview"><span><FileText aria-hidden="true"/>{selection!.end >= scene.text.length ? '接在本场结尾续写' : `从第 ${selection!.end.toLocaleString()} 字处续写`}</span>{!!scene.text.slice(0, selection!.end).trim() && <blockquote>…{scene.text.slice(Math.max(0, selection!.end - 120), selection!.end)}</blockquote>}</div>}
+            {stage === 'chapter' && chapterScope === 'chapter' ? <select data-testid="target-chapter" aria-label="目标章节" value={passage?.chapterId || ''} onChange={e => { const target = workspace && chapterPassages(workspace, e.target.value)[0]; if (target) changePassage(target.id); }}><option value="" disabled>选择章节</option>{workspace && orderedChapters(workspace).map(c => <option key={c.id} value={c.id} disabled={!workspace.passages.some(p => p.chapterId === c.id)}>{c.title}</option>)}</select> : <select data-testid="target-scene" aria-label="目标场景" value={passage?.id || ''} onChange={e => changePassage(e.target.value)}><option value="" disabled>选择场景</option>{workspace && orderedPassages(workspace).map(p => <option key={p.id} value={p.id}>{workspace.chapters.find(c => c.id === p.chapterId)?.title} · {passageLabel(workspace, p)}</option>)}</select>}
+            {stage === 'chapter' && chapterScope === 'chapter' && chapter && <small>将生成 {workspace?.passages.filter(p => p.chapterId === chapter.id && !p.text.trim()).length} 个空白场景</small>}
+            {continuing && passage && <div className="selection-preview"><span><FileText aria-hidden="true"/>{selection!.end >= passage.text.length ? '接在本段结尾续写' : `从第 ${selection!.end.toLocaleString()} 字处续写`}</span>{!!passage.text.slice(0, selection!.end).trim() && <blockquote>…{passage.text.slice(Math.max(0, selection!.end - 120), selection!.end)}</blockquote>}</div>}
             {stage === 'rewrite' && selection && !continuing && <div className="selection-preview"><span><FileText aria-hidden="true"/>选中 {selection.end - selection.start} 字</span><blockquote>{selection.text.slice(0, 180)}{selection.text.length > 180 ? '…' : ''}</blockquote></div>}
           </div>}
           <div className="reference-sources" data-testid="reference-sources">

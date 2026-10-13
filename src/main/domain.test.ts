@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { createWorkspace, applyCommands, DomainValidationError, validateWorkspace } from './domain.js';
 import { buildCharacterContext, buildReaderContext } from './context.js';
 import { NovelStore } from './store.js';
-import type { CanvasCard, CharacterState, NovelObject, Workspace } from '../shared/types.js';
+import type { CanvasCard, NovelObject, StateChange, Workspace } from '../shared/types.js';
 
 const character = (id: string): NovelObject => ({ id, name: id, typeId: 'character', fields: { description: '作者隐藏的终局秘密', selfKnowledge: '我是侦探' } });
 const event = (id: string, order: number, causes: string[] = []): NovelObject => ({
@@ -24,47 +24,109 @@ function fixture(): Workspace {
   ]);
 }
 
-test('人物演进校验事件与正文锚点，删除清理依赖并保持独立状态', () => {
+test('状态变化校验人物或环境、所在场景与场景段、事件，一处只有一条', () => {
   const original = fixture(), chapterId = original.chapters[0]!.id;
-  const state: CharacterState = { id: 'state', characterId: 'detective', eventId: 'earlier',
-    perspective: '证人可能不可靠', psychology: '开始迟疑', motivation: '亲自查证', evidence: '他放下证人的口供', sceneIds: ['scene'] };
+  const change: StateChange = { id: 'change', subjectId: 'detective', sceneId: 'scene', eventId: 'earlier', aspects: { psychology: '开始迟疑', perspective: '证人可能不可靠' }, note: '他放下证人的口供' };
   const workspace = applyCommands(original, [
-    { type: 'putScene', value: { id: 'scene', chapterId, order: 0, title: '迟疑', povId: 'detective', eventIds: ['earlier'], outline: '', text: '他放下证人的口供。' } },
-    { type: 'putCharacterState', value: state },
-    { type: 'putCharacterState', value: { ...state, id: 'later-state', eventId: 'future', sceneIds: [] } },
+    { type: 'putChapter', value: { id: 'next', title: '第二章', order: 1 } },
+    { type: 'putScene', value: { id: 'scene', title: '迟疑', povId: 'detective', eventIds: ['earlier'], outline: '' } },
+    { type: 'putPassage', value: { id: 'part-1', sceneId: 'scene', chapterId, order: 0, text: '他放下证人的口供。' } },
+    { type: 'putPassage', value: { id: 'part-2', sceneId: 'scene', chapterId: 'next', order: 0, text: '第二天他又拿起来。' } },
+    { type: 'putStateChange', value: change },
+    { type: 'putStateChange', value: { id: 'at-event', subjectId: 'detective', eventId: 'future', aspects: { motivation: '亲自查证' } } },
+    { type: 'putStateChange', value: { id: 'on-part', subjectId: 'detective', sceneId: 'scene', passageId: 'part-2', aspects: { cognition: '口供有假', 境界: '筑基' } } },
   ]);
-  for (const value of [{ ...state, id: 'duplicate' }, { ...state, characterId: 'missing' },
-    { ...state, eventId: 'detective' }, { ...state, sceneIds: ['missing'] }, { ...state, eventId: 'anchor' }]) {
-    assert.throws(() => applyCommands(workspace, [{ type: 'putCharacterState', value }]), DomainValidationError);
-  }
-  const withoutScene = applyCommands(workspace, [{ type: 'deleteScene', id: 'scene' }]);
-  assert.deepEqual(withoutScene.characterStates![0]!.sceneIds, []);
-  assert.equal(withoutScene.characterStates![0]!.psychology, state.psychology);
-  const detached = applyCommands(workspace, [{ type: 'putScene', value: { ...workspace.scenes[0]!, eventIds: ['anchor'] } }]);
-  assert.deepEqual(detached.characterStates![0]!.sceneIds, []);
-  assert.equal(applyCommands(workspace, [{ type: 'deleteObject', id: 'detective' }]).characterStates!.length, 0);
-  assert.deepEqual(applyCommands(workspace, [{ type: 'deleteObject', id: 'earlier' }]).characterStates!.map(item => item.id), ['later-state']);
-  assert.deepEqual(applyCommands(workspace, [{ type: 'deleteCharacterState', id: state.id }]).characterStates!.map(item => item.id), ['later-state']);
+  const invalid: StateChange[] = [
+    { ...change, id: 'same-place' },
+    { ...change, id: 'x', subjectId: 'missing' },
+    { ...change, id: 'x', subjectId: 'future' },
+    { ...change, id: 'x', sceneId: 'missing' },
+    { ...change, id: 'x', eventId: 'anchor' },
+    { id: 'x', subjectId: 'detective', aspects: { psychology: '无处安放' } },
+    { id: 'x', subjectId: 'detective', sceneId: 'scene', passageId: 'missing', aspects: { psychology: '段落不存在' } },
+    { id: 'x', subjectId: 'detective', passageId: 'part-1', eventId: 'earlier', aspects: { psychology: '段落没有场景' } },
+    { id: 'x', subjectId: 'detective', sceneId: 'scene', aspects: {} },
+    { id: 'x', subjectId: 'detective', sceneId: 'scene', aspects: { psychology: '  ' } },
+    { id: 'x', subjectId: 'detective', sceneId: 'scene', aspects: { ' 心理': '名称有空格' } },
+    { id: 'x', subjectId: 'detective', sceneId: 'scene', aspects: Object.fromEntries(Array.from({ length: 13 }, (_, index) => [`方面${index}`, '太多'])) },
+  ];
+  for (const value of invalid) assert.throws(() => applyCommands(workspace, [{ type: 'putStateChange', value }]), DomainValidationError, value.id);
+  // The same subject may change in the same scene at another passage, or without an event.
+  assert.equal(applyCommands(workspace, [{ type: 'putStateChange', value: { ...change, id: 'other-part', passageId: 'part-1' } }]).stateChanges.length, 4);
+  // Removing the event keeps a change placed in a scene, without the event; one placed only at the event goes with it.
+  const noEarlier = applyCommands(workspace, [{ type: 'deleteObject', id: 'earlier' }]);
+  assert.equal(noEarlier.stateChanges.find(item => item.id === 'change')!.eventId, undefined);
+  assert.deepEqual(applyCommands(workspace, [{ type: 'deleteObject', id: 'future' }]).stateChanges.map(item => item.id), ['change', 'on-part']);
+  assert.equal(applyCommands(workspace, [{ type: 'putScene', value: { ...workspace.scenes[0]!, eventIds: [] } }]).stateChanges.find(item => item.id === 'change')!.eventId, undefined);
+  assert.equal(applyCommands(workspace, [{ type: 'deleteObject', id: 'detective' }]).stateChanges.length, 0);
+  // A removed passage hands its changes to the scene as a whole; a removed scene takes its changes along.
+  const lifted = applyCommands(workspace, [{ type: 'deletePassage', id: 'part-2' }]).stateChanges.find(item => item.id === 'on-part')!;
+  assert.deepEqual([lifted.sceneId, lifted.passageId, lifted.aspects.境界], ['scene', undefined, '筑基']);
+  assert.deepEqual(applyCommands(workspace, [{ type: 'deleteScene', id: 'scene' }]).stateChanges.map(item => item.id), ['at-event']);
+  // A passage given to another scene leaves the old scene's change on the scene.
+  const moved = applyCommands(workspace, [{ type: 'putScene', value: { id: 'other', title: '另一场', povId: null, eventIds: [], outline: '' } },
+    { type: 'putPassage', value: { ...workspace.passages.find(item => item.id === 'part-2')!, sceneId: 'other' } }]);
+  assert.equal(moved.stateChanges.find(item => item.id === 'on-part')!.passageId, undefined);
+  assert.deepEqual(applyCommands(workspace, [{ type: 'deleteStateChange', id: 'change' }]).stateChanges.map(item => item.id), ['at-event', 'on-part']);
 });
 
-test('人物演进与立意进入语义修订和撤销，旧 schema 1 备份默认空状态', () => {
+test('场景独立于章节：一场跨章有多段，删章只带走只在这章的场景，同章场景段顺序不能重复', () => {
+  const original = fixture(), first = original.chapters[0]!.id;
+  const workspace = applyCommands(original, [
+    { type: 'putChapter', value: { id: 'second', title: '第二章', order: 1 } },
+    { type: 'putScene', value: { id: 'standoff', title: '对峙', povId: 'detective', eventIds: [], outline: '' } },
+    { type: 'putScene', value: { id: 'alley', title: '小巷', povId: null, eventIds: [], outline: '' } },
+    { type: 'putScene', value: { id: 'idea', title: '还没排进章节', povId: null, eventIds: [], outline: '' } },
+    { type: 'putPassage', value: { id: 'standoff-1', sceneId: 'standoff', chapterId: first, order: 0, text: '对峙开始。' } },
+    { type: 'putPassage', value: { id: 'alley-1', sceneId: 'alley', chapterId: first, order: 1, text: '小巷里没有人。' } },
+    { type: 'putPassage', value: { id: 'standoff-2', sceneId: 'standoff', chapterId: 'second', order: 0, text: '对峙继续。', beat: '亮出底牌' } },
+  ]);
+  assert.equal(workspace.scenes.length, 3);
+  assert.throws(() => applyCommands(workspace, [{ type: 'putPassage', value: { id: 'clash', sceneId: 'alley', chapterId: 'second', order: 0, text: '' } }]), /顺序不能重复/);
+  assert.throws(() => applyCommands(workspace, [{ type: 'putPassage', value: { id: 'lost', sceneId: 'missing', chapterId: first, order: 5, text: '' } }]), /场景不存在/);
+  assert.throws(() => applyCommands(workspace, [{ type: 'putPassage', value: { id: 'lost', sceneId: 'idea', chapterId: 'missing', order: 5, text: '' } }]), /章节不存在/);
+  // Swapping two passages in one batch is fine: the order is checked after the whole batch.
+  const swapped = applyCommands(workspace, [{ type: 'putPassage', value: { ...workspace.passages[0]!, order: 1 } }, { type: 'putPassage', value: { ...workspace.passages[1]!, order: 0 } }]);
+  assert.deepEqual(swapped.passages.filter(item => item.chapterId === first).sort((a, b) => a.order - b.order).map(item => item.id), ['alley-1', 'standoff-1']);
+  const withoutFirst = applyCommands(workspace, [{ type: 'deleteChapter', id: first }]);
+  assert.deepEqual(withoutFirst.scenes.map(item => item.id).sort(), ['idea', 'standoff']);
+  assert.deepEqual(withoutFirst.passages.map(item => item.id), ['standoff-2']);
+  const withoutScene = applyCommands(workspace, [{ type: 'deleteScene', id: 'standoff' }]);
+  assert.deepEqual(withoutScene.passages.map(item => item.id), ['alley-1']);
+  // Format 1 commands keep working: a scene with chapter, order and text writes the passage that shares its id.
+  const legacy = applyCommands(workspace, [{ type: 'putScene', value: { id: 'old', chapterId: 'second', order: 3, title: '旧格式', povId: null, eventIds: [], outline: '', text: '旧正文' } as never }]);
+  assert.deepEqual(legacy.passages.find(item => item.id === 'old'), { id: 'old', sceneId: 'old', chapterId: 'second', order: 3, text: '旧正文' });
+  assert.equal(Object.hasOwn(legacy.scenes.find(item => item.id === 'old')!, 'text'), false);
+});
+
+test('状态变化与立意进入语义修订和撤销；旧格式备份升级为场景段与状态变化', () => {
   const store = new NovelStore(':memory:');
   try {
-    const legacy = fixture(); delete legacy.characterStates; delete legacy.theme;
-    validateWorkspace(legacy);
-    let workspace = store.importProject(legacy);
-    assert.deepEqual(workspace.characterStates, []); assert.equal(workspace.theme, '');
+    const current = fixture(), chapterId = current.chapters[0]!.id;
+    const { passages: _passages, stateChanges: _changes, theme: _theme, ...rest } = current;
+    const legacy = { ...rest, schemaVersion: 1,
+      scenes: [{ id: 'scene', chapterId, order: 0, title: '迟疑', povId: 'detective', eventIds: ['earlier'], outline: '', text: '他放下证人的口供。' }],
+      characterStates: [{ id: 'state', characterId: 'detective', eventId: 'earlier', perspective: '证人可能不可靠', psychology: '开始迟疑', motivation: '', evidence: '他放下口供', sceneIds: ['scene'] },
+        { id: 'blank', characterId: 'detective', eventId: 'future', perspective: '', psychology: ' ', motivation: '', evidence: '', sceneIds: [] }] };
+    let workspace = store.importProject(legacy as never);
+    assert.equal(workspace.schemaVersion, 2); assert.equal(workspace.theme, '');
+    assert.deepEqual(workspace.scenes, [{ id: 'scene', title: '迟疑', povId: 'detective', eventIds: ['earlier'], outline: '' }]);
+    assert.deepEqual(workspace.passages, [{ id: 'scene', sceneId: 'scene', chapterId, order: 0, text: '他放下证人的口供。' }]);
+    assert.deepEqual(workspace.stateChanges, [{ id: 'state', subjectId: 'detective', sceneId: 'scene', eventId: 'earlier', aspects: { psychology: '开始迟疑', perspective: '证人可能不可靠' }, note: '他放下口供' }]);
     const revision = workspace.revision;
     workspace = store.execute({ projectId: workspace.id, actor: 'ai', taskId: 'evolution', expectedRevision: revision, commands: [
       { type: 'updateNovel', patch: { theme: '在信任破裂后学习承担责任' } },
-      { type: 'putCharacterState', value: { id: 'state', characterId: 'detective', eventId: 'earlier',
-        perspective: '我应核实证据', psychology: '由自信转为谨慎', motivation: '保护证人', evidence: '事件中的亲历', sceneIds: [] } },
+      { type: 'putStateChange', value: { id: 'trust', subjectId: 'detective', eventId: 'future', aspects: { cognition: '证人撒了谎' } } },
     ] });
     assert.equal(workspace.revision, revision + 1);
-    assert.deepEqual(store.history(workspace.id)[0]!.changes.map(change => change.collection), ['metadata', 'characterStates']);
+    assert.deepEqual(store.history(workspace.id)[0]!.changes.map(change => change.collection), ['metadata', 'stateChanges']);
     workspace = store.undo(workspace.id, 'evolution');
-    assert.equal(workspace.theme, ''); assert.deepEqual(workspace.characterStates, []);
+    assert.equal(workspace.theme, ''); assert.deepEqual(workspace.stateChanges.map(item => item.id), ['state']);
     assert.equal(workspace.revision, revision + 2);
+    // Older prompts may still send per-event character states; they arrive as state changes.
+    const converted = applyCommands(workspace, [{ type: 'putCharacterState', value: { id: 'old', characterId: 'detective', eventId: 'future', perspective: '', psychology: '决意追查', motivation: '找出真相', evidence: '', sceneIds: [] } } as never]);
+    assert.deepEqual(converted.stateChanges.find(item => item.id === 'old'), { id: 'old', subjectId: 'detective', eventId: 'future', aspects: { psychology: '决意追查', motivation: '找出真相' } });
+    assert.equal(applyCommands(converted, [{ type: 'deleteCharacterState', id: 'old' } as never]).stateChanges.some(item => item.id === 'old'), false);
   } finally { store.close(); }
 });
 
@@ -98,13 +160,15 @@ test('知识保存当时内容快照，事实变化不能改写旧记忆', () =>
 test('读者只看已写正文，多事件场景引用不暴露完整世界事实', () => {
   let workspace = fixture(); const chapterId = workspace.chapters[0].id;
   workspace = applyCommands(workspace, [
-    { type: 'putScene', value: { id: 'discovery', chapterId, order: 0, title: '发现', povId: 'detective', eventIds: ['earlier', 'future'], outline: '凶手身份应隐藏', text: '他发现一扇紧闭的门。' } },
-    { type: 'putScene', value: { id: 'revelation', chapterId, order: 1, title: '揭晓', povId: null, eventIds: ['future'], outline: '', text: '直到最后他才知道凶手身份。' } },
+    { type: 'putScene', value: { id: 'discovery', title: '发现', povId: 'detective', eventIds: ['earlier', 'future'], outline: '凶手身份应隐藏' } },
+    { type: 'putScene', value: { id: 'revelation', title: '揭晓', povId: null, eventIds: ['future'], outline: '' } },
+    { type: 'putPassage', value: { id: 'discovery', sceneId: 'discovery', chapterId, order: 0, text: '他发现一扇紧闭的门。' } },
+    { type: 'putPassage', value: { id: 'revelation', sceneId: 'revelation', chapterId, order: 1, text: '直到最后他才知道凶手身份。' } },
   ]);
   const context = buildReaderContext(workspace, chapterId, 'discovery');
   assert.match(context.text, /紧闭的门/);
   assert.doesNotMatch(JSON.stringify(context), /凶手|世界真相|秘密事件/);
-  assert.deepEqual(context.sources, ['scene:discovery:text']);
+  assert.deepEqual(context.sources, ['passage:discovery:text']);
 });
 
 test('因果时间/环与引用校验，删除清理保持正文和独立记忆', () => {
@@ -116,11 +180,12 @@ test('因果时间/环与引用校验，删除清理保持正文和独立记忆'
   const prepared = applyCommands(workspace, [
     { type: 'putFact', value: { id: 'fact', subjectId: 'detective', key: '线索', value: '脚印', fromEventId: 'earlier' } },
     { type: 'putKnowledge', value: { id: 'remember', characterId: 'detective', learnedAt: null, content: '我一直这样相信', source: 'belief' } },
-    { type: 'putScene', value: { id: 'scene', chapterId: workspace.chapters[0].id, title: '正文', order: 0, povId: 'detective', eventIds: ['earlier'], outline: '', text: '保留我的文字' } },
+    { type: 'putScene', value: { id: 'scene', title: '正文', povId: 'detective', eventIds: ['earlier'], outline: '' } },
+    { type: 'putPassage', value: { id: 'scene', sceneId: 'scene', chapterId: workspace.chapters[0].id, order: 0, text: '保留我的文字' } },
   ]);
   const deleted = applyCommands(prepared, [{ type: 'deleteObject', id: 'earlier' }]);
   assert.equal(deleted.facts.length, 0); assert.deepEqual(deleted.objects.find(item => item.id === 'anchor')!.event!.causes, []);
-  assert.deepEqual(deleted.scenes[0].eventIds, []); assert.equal(deleted.scenes[0].text, '保留我的文字');
+  assert.deepEqual(deleted.scenes[0].eventIds, []); assert.equal(deleted.passages[0].text, '保留我的文字');
   assert.equal(deleted.knowledge[0].content, '我一直这样相信');
 });
 
@@ -138,7 +203,8 @@ test('阶段撤销保留无关编辑；触及同一对象或后续依赖时原�
     assert.equal(store.getProject(workspace.id).objects[0].name, '用户新名字');
     assert.equal(store.history(workspace.id).find(batch => batch.taskId === 'conflict')!.undone, false);
     workspace = store.execute({ projectId: workspace.id, actor: 'ai', expectedRevision: workspace.revision, taskId: 'referenced', commands: [{ type: 'putObject', value: event('event', 1) }] });
-    workspace = store.execute({ projectId: workspace.id, actor: 'human', expectedRevision: workspace.revision, commands: [{ type: 'putScene', value: { id: 'scene', chapterId: workspace.chapters[0].id, order: 0, title: '依赖', povId: null, eventIds: ['event'], outline: '', text: '后来写的正文' } }] });
+    workspace = store.execute({ projectId: workspace.id, actor: 'human', expectedRevision: workspace.revision, commands: [{ type: 'putScene', value: { id: 'scene', title: '依赖', povId: null, eventIds: ['event'], outline: '' } },
+      { type: 'putPassage', value: { id: 'scene', sceneId: 'scene', chapterId: workspace.chapters[0].id, order: 0, text: '后来写的正文' } }] });
     assert.throws(() => store.undo(workspace.id, 'referenced'), /UNDO_CONFLICT/);
     assert.ok(store.getProject(workspace.id).objects.some(item => item.id === 'event'));
   } finally { store.close(); }
@@ -328,8 +394,7 @@ test('SQLite 省略可选 undefined 字段后，使用原返回卡片纯移动�
 
 test('场景三要素：出场人物只能是人物，环境不能是人物或事件，删除对象会清理场景引用', () => {
   const original = applyCommands(fixture(), [{ type: 'putObject', value: { id: 'tower', typeId: 'setting', name: '钟楼', fields: {} } }]);
-  const chapterId = original.chapters[0]!.id;
-  const scene = { id: 'scene', chapterId, order: 1, title: '钟楼', povId: null, eventIds: [], outline: '', text: '' };
+  const scene = { id: 'scene', title: '钟楼', povId: null, eventIds: [], outline: '' };
   assert.throws(() => applyCommands(original, [{ type: 'putScene', value: { ...scene, castIds: ['tower'] } }]), /出场人物/);
   assert.throws(() => applyCommands(original, [{ type: 'putScene', value: { ...scene, settingIds: ['anchor'] } }]), /场景环境/);
   assert.throws(() => applyCommands(original, [{ type: 'putScene', value: { ...scene, settingIds: ['detective'] } }]), /场景环境/);

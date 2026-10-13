@@ -1,12 +1,13 @@
 import type { TokenUsage } from './types.js';
 
-/** A thread (伏笔 / 悬念 / 承诺) the prose has opened. Ids are assigned locally, never by the model: from the opening scene and the
- * wording, kept across a re-digest of that scene, so later closures keep pointing at the same thread. major: bears on the main line. */
+/** A thread (伏笔 / 悬念 / 承诺) the prose has opened. Ids are assigned locally, never by the model: from the opening passage and the
+ * wording, kept across a re-digest of that passage, so later closures keep pointing at the same thread. major: bears on the main line. */
 export interface StoryThread { id: string; title: string; major?: boolean }
 
-/** Model-written digest of one scene. Derived from prose only, so it is safe for reader-side use up to that scene. */
-export interface SceneDigest {
-  kind: 'scene'; sceneId: string; textHash: string; chars: number;
+/** Model-written digest of one passage (a scene's prose in one chapter). Derived from prose only, so it is safe for reader-side use up
+ * to that passage. */
+export interface PassageDigest {
+  kind: 'passage'; passageId: string; textHash: string; chars: number;
   /** MinHash of the digested text, to tell a light revision (drifted) from a rewrite. */
   sketch: number[];
   summary: string; events: string[]; changes: Array<{ who: string; change: string }>;
@@ -18,10 +19,10 @@ export interface RollupDigest {
   kind: 'chapter' | 'volume' | 'book'; targetId: string; inputHash: string; title: string;
   summary: string; model: string; updatedAt: string;
 }
-export type StoryDigest = SceneDigest | RollupDigest;
+export type StoryDigest = PassageDigest | RollupDigest;
 
 export interface StoryMemoryStatus {
-  projectId: string; scenesWithText: number; fresh: number; drifted: number; pending: number; pendingChars: number;
+  projectId: string; passagesWithText: number; fresh: number; drifted: number; pending: number; pendingChars: number;
   running: boolean; auto: boolean;
   /** Auto mode found a backlog too large to spend on silently; the author starts it explicitly. */
   awaitingConfirmation: boolean;

@@ -6,8 +6,14 @@ import type { BrowserWindow, InputEvent as ElectronInputEvent } from 'electron';
 import { ProviderStore } from './providers.js';
 import type { NovelStore } from './store.js';
 import type { NovelAgentScheduler } from './agents.js';
-import type { AgentRun, AssistTool, CanvasCard, Command, RunRequest } from '../shared/types.js';
+import type { AgentRun, AssistTool, CanvasCard, Command, NarrativeScene, RunRequest } from '../shared/types.js';
 import { StoryView } from './agent/story-view.js';
+import { storyTimeline } from '../shared/story-state.js';
+
+/** A scene read in one chapter: the scene and its one passage, sharing the id. */
+function scene(id: string, chapterId: string, order: number, text: string, value: Omit<NarrativeScene, 'id'>): Command[] {
+  return [{ type: 'putScene', value: { id, ...value } }, { type: 'putPassage', value: { id, sceneId: id, chapterId, order, text } }];
+}
 
 export async function runSmoke(window: BrowserWindow, store: NovelStore, scheduler: NovelAgentScheduler) {
   if (process.env.NOVEL_SMOKE_FOCUS === 'agent') { const { runAgentSmoke } = await import('./agent-smoke.js'); return runAgentSmoke(window, store); }
@@ -201,7 +207,7 @@ export async function runSmoke(window: BrowserWindow, store: NovelStore, schedul
     else await click('show-details-panel');
     await until(() => ui<boolean>(`(${expression})===${open}`), `${panel}面板切换`);
   }
-  interface WorkflowReport { projectId: string; title: string; revision: number; cards: CanvasCard[]; outlineRunId: string; chapterRunId: string; sceneId: string; checks: string[]; screenshots: string[]; callsRealModel: boolean }
+  interface WorkflowReport { projectId: string; title: string; revision: number; cards: CanvasCard[]; outlineRunId: string; chapterRunId: string; passageId: string; checks: string[]; screenshots: string[]; callsRealModel: boolean }
   async function runWorkflow() {
     window.show(); window.focus(); window.webContents.focus();
     window.setSize(1510, 980); await delay(200);
@@ -210,7 +216,7 @@ export async function runSmoke(window: BrowserWindow, store: NovelStore, schedul
       const current = store.getProject(report.projectId);
       assert.equal(current.title, report.title); assert.equal(current.revision, report.revision);
       assert.deepEqual(current.cards, report.cards);
-      assert.equal(current.scenes.find(scene => scene.id === report.sceneId)?.text, '');
+      assert.equal(current.passages.find(passage => passage.id === report.passageId)?.text, '');
       assert.equal(store.getRun(report.outlineRunId)?.status, 'completed');
       assert.equal(store.getRun(report.chapterRunId)?.status, 'completed');
       assert.ok(store.history(report.projectId).some(batch => batch.taskId === report.chapterRunId && batch.undone));
@@ -336,15 +342,16 @@ export async function runSmoke(window: BrowserWindow, store: NovelStore, schedul
     await click('prepare-next-stage');
     await nativeSelect(element('[data-testid="chapter-scope"]'), 'scene');
     const targetId = await ui<string>(`document.querySelector('[data-testid="target-scene"]').value`);
-    assert.ok(current().scenes.some(scene => scene.id === targetId));
+    const targetScene = current().passages.find(passage => passage.id === targetId)?.sceneId;
+    assert.ok(targetScene && current().scenes.some(scene => scene.id === targetScene));
     await fill('ai-objective', '只完成当前场景，保持人物所知范围，不提前透露钟楼秘密。');
     await click('run-chapter');
     const written = await until(() => store.getRuns(project.id).find(run => run.stage === 'chapter'), '当前场景正文启动');
-    assert.equal(written.sceneId, targetId);
+    assert.equal(written.passageId, targetId);
     assert.equal((await finished(written.id)).status, 'completed');
-    assert.ok(current().scenes.find(scene => scene.id === targetId)!.text.length > 50);
-    assert.ok(current().scenes.filter(scene => scene.id !== targetId).every(scene => !scene.text.trim()), '当前场景范围不得写入其他场景');
-    await click(`open-result-${targetId}`);
+    assert.ok(current().passages.find(passage => passage.id === targetId)!.text.length > 50);
+    assert.ok(current().passages.filter(passage => passage.id !== targetId).every(passage => !passage.text.trim()), '当前场景范围不得写入其他场景');
+    await click(`open-result-${targetScene}`);
     await until(() => ui<boolean>(`document.querySelector('.app.view-write') && document.querySelector('[data-testid="prose-editor"]')?.value.length>50`), '产出定位到真实正文');
     await click('nav-idea'); await setPanel('details', true); await setPanel('ai', true);
     assert.ok(await ui<boolean>(`!!document.querySelector('.board-inspector') && !!document.querySelector('.ai-sidebar') && !document.querySelector('.main').inert`), '1510宽度详情与AI并排');
@@ -368,11 +375,11 @@ export async function runSmoke(window: BrowserWindow, store: NovelStore, schedul
     window.setSize(1510, 980); await delay(150);
     await click('nav-monitor'); await click('undo-task');
     await until(() => store.history(project.id).some(batch => batch.taskId === written.id && batch.undone), '任务撤销');
-    assert.equal(current().scenes.find(scene => scene.id === targetId)?.text, '');
+    assert.equal(current().passages.find(passage => passage.id === targetId)?.text, '');
     assert.ok(current().cards.some(card => card.id === inner.id), '撤销正文任务不能删除人工分组');
     await click('nav-idea');
     const saved = current();
-    const report: WorkflowReport = { projectId: project.id, title: saved.title, revision: saved.revision, cards: saved.cards, outlineRunId: outline.id, chapterRunId: written.id, sceneId: targetId,
+    const report: WorkflowReport = { projectId: project.id, title: saved.title, revision: saved.revision, cards: saved.cards, outlineRunId: outline.id, chapterRunId: written.id, passageId: targetId,
       checks: ['真实鼠标创建', 'Ctrl多选与Shift框选', '多选移动原子保存', '多选成组与嵌套', '父组带动后代一次', '真实手柄缩放', '折叠代理外部连线', '拖入拖出', '解散保留成员', '分组引用编排', '单场景正文', '任务产出定位', '1510与1080面板规则', '导航收起', '任务撤销', '关闭与重开持久化'],
       screenshots: ['workflow-1510.png', 'workflow-1080-details.png', 'workflow-1080-ai.png', 'workflow-reopen.png'], callsRealModel: false };
     writeFileSync(join(output, 'workflow-result.json'), JSON.stringify(report, null, 2), 'utf8');
@@ -411,14 +418,14 @@ export async function runSmoke(window: BrowserWindow, store: NovelStore, schedul
     const toastFocus=await ui<{present:boolean;focused:boolean;active:string;events:string[]}>(`({present:!!document.querySelector('.toast'),focused:document.hasFocus(),active:document.activeElement.tagName,events:window.__focusTrace})`);
     assert.ok(toastFocus.present,`键盘停留提示时暂停自动消失：${JSON.stringify(toastFocus)}`);
     await nativeKey('Enter');checks.push('提示悬停与键盘停留');
-    const first=initial.chapters[0]!.id,second='interaction-second',scene='interaction-manuscript';
+    const first=initial.chapters[0]!.id,second='interaction-second',manuscript='interaction-manuscript';
     const prose=Array.from({length:65},(_,index)=>`第${index+1}封信被放在窗边。雾从港口的石阶上漫过来，林舟把钟楼的报时写进笔记，却没有写下那封信的寄件人。`).join('\n\n');
     store.execute({projectId:project.id,expectedRevision:initial.revision,actor:'human',label:'交互验收夹具',commands:[
       {type:'updateNovel',patch:{genre:'悬疑 · 有限视角',brief:'钟楼多响了一声，一封没有寄件人的信抵达雾港。林舟必须决定：相信眼前的人，还是相信记录里的过去。'}},
       {type:'putChapter',value:{id:first,title:'第一章：雾中的来信',order:1}},
       {type:'putChapter',value:{id:second,title:'第二章：沉默的钟楼',order:2}},
-      {type:'putScene',value:{id:scene,chapterId:first,title:'窗边的信',order:1,povId:null,eventIds:[],outline:'林舟收到旧信，发现报时的矛盾。',text:prose}},
-      {type:'putScene',value:{id:'interaction-short',chapterId:second,title:'灯熄之后',order:1,povId:null,eventIds:[],outline:'',text:'钟楼的灯熄灭了。'}},
+      ...scene(manuscript,first,1,prose,{title:'窗边的信',povId:null,eventIds:[],outline:'林舟收到旧信，发现报时的矛盾。'}),
+      ...scene('interaction-short',second,1,'钟楼的灯熄灭了。',{title:'灯熄之后',povId:null,eventIds:[],outline:''}),
       {type:'setReading',value:{...initial.reading,chapterId:first,scroll:280}},
     ]});
     window.webContents.reload();
@@ -530,7 +537,7 @@ export async function runSmoke(window: BrowserWindow, store: NovelStore, schedul
       const report = JSON.parse(readFileSync(join(output, 'evolution-result.json'), 'utf8')) as { projectId: string; stateCount: number; theme: string };
       const saved = store.getProject(report.projectId);
       assert.equal(saved.theme, report.theme);
-      assert.equal(saved.characterStates?.length, report.stateCount);
+      assert.equal(saved.stateChanges.length, report.stateCount);
       await until(() => ui<boolean>(`document.querySelector('.app.view-home')?.textContent.includes('立意')`), '立意重开');
       await closeWindow(); console.log('人物演进与立意持久化检查通过。'); return;
     }
@@ -542,42 +549,48 @@ export async function runSmoke(window: BrowserWindow, store: NovelStore, schedul
       const run = await until(() => store.getRuns(project.id).find(run => !prior.has(run.id)), '启动任务');
       const result = await finished(run.id);
       assert.equal(result.status, 'completed', result.error ?? '任务未完成');
-      assert.ok(result.steps.some(step => step.agentId === 'theme' && step.status === 'completed'));
       return result;
     }
     await runTask('idea'); await runTask('outline');
-    const planned = store.getProject(project.id);
-    assert.ok(planned.theme);
-    assert.ok((planned.characterStates?.length ?? 0) >= 3);
+    const themed = await runTask('assist', 'theme');
+    assert.ok(themed.steps.some(step => step.agentId === 'theme' && step.status === 'completed'));
+    assert.ok(store.getProject(project.id).theme);
+    // Writing the chapter records how the people and places of each written scene changed, with the prose as evidence.
     await click('nav-write'); await runTask('chapter');
     const written = store.getProject(project.id);
-    assert.ok(written.characterStates?.some(state => !state.evidence.startsWith('计划：')));
-    await click('nav-objects');
+    assert.ok(written.stateChanges.some(change => change.sceneId && change.note?.startsWith('正文：')), '章节写作记下本场的状态变化');
+    // Following one character through the scenes that put them on stage, in story order.
     const character = written.objects.find(object => object.typeId === 'character')!;
+    const followed = await runTask('assist', 'character');
+    assert.ok(followed.steps.some(step => step.agentId.startsWith('evolution:')), '人物演进逐场记录');
+    const evolved = store.getProject(project.id);
+    assert.ok(storyTimeline(evolved).history(character.id).length >= 2, '人物在多场中的变化按故事时间排列');
+    await click('nav-objects');
     await ui(`[...document.querySelectorAll('.object-row')].find(el => el.querySelector('strong')?.textContent === ${JSON.stringify(character.name)}).click()`);
-    await until(() => ui<boolean>(`!!document.querySelector('[data-testid="character-evolution"] details')`), '人物演进界面');
-    await ui(`document.querySelector('[data-testid="character-evolution"]').open=true;document.querySelector('[data-testid="character-evolution"] details').open=true;document.querySelector('[data-testid="character-evolution"]').scrollIntoView({block:'start'})`);
+    await until(() => ui<boolean>(`!!document.querySelector('[data-testid="state-timeline"] [data-testid="state-change"]')`), '人物状态演进界面');
+    await ui(`document.querySelector('[data-testid="state-timeline"]').open=true;document.querySelector('[data-testid="state-timeline"]').scrollIntoView({block:'start'})`);
     await capture('evolution-character.png');
-    await clickText(written.cards.some(card => card.kind === 'object' && card.refId === character.id) ? '在画布定位' : '添加到画布', "document.querySelector('.object-inspector')");
+    await clickText(evolved.cards.some(card => card.kind === 'object' && card.refId === character.id) ? '在画布定位' : '添加到画布', "document.querySelector('.object-inspector')");
     await until(() => ui<boolean>(`!!document.querySelector('.app.view-canvas .canvas-direction')`), '画布作品方向');
-    const state = written.characterStates!.filter(state => state.characterId === character.id).at(-1)!;
-    await until(() => ui<boolean>(`document.querySelector('.flow-container')?.textContent.includes(${JSON.stringify(state.psychology.slice(0, 12))})`), '画布人物心理同步');
+    const psychology = storyTimeline(evolved).stateAt(character.id, { end: true }).get('psychology')!.value;
+    await until(() => ui<boolean>(`document.querySelector('.flow-container')?.textContent.includes(${JSON.stringify(psychology.slice(0, 12))})`), '画布人物心理同步');
     await capture('evolution-canvas.png');
     const follow = await runTask('assist', 'continuity');
-    assert.ok(follow.steps.some(step => step.agentId === 'assist:continuity'));
+    assert.ok(follow.steps.some(step => step.agentId !== 'coordinator' && step.status === 'completed'), `一致性跟进由专长执行：${follow.steps.map(step => step.agentId).join('、')}`);
+    assert.ok(store.getProject(project.id).scenes.some(scene => scene.outline.includes('正文已呈现')), '一致性跟进以正文为依据修订大纲');
     const current = store.getProject(project.id);
-    writeFileSync(join(output, 'evolution-result.json'), JSON.stringify({ projectId: project.id, stateCount: current.characterStates!.length, theme: current.theme,
-      checks: ['独立立意', '世界顺序人物演进', '正文依据更新', '人物记录界面', '引用心理同步', '专项一致性工具', '重开持久化'],
+    writeFileSync(join(output, 'evolution-result.json'), JSON.stringify({ projectId: project.id, stateCount: current.stateChanges.length, theme: current.theme,
+      checks: ['独立立意', '章节写作记下状态变化', '人物逐场演进', '状态演进界面', '画布显示当前心理', '专项一致性工具', '重开持久化'],
       screenshots: ['evolution-character.png', 'evolution-canvas.png'], callsRealModel: false }, null, 2), 'utf8');
     await closeWindow(); console.log('人物演进、立意与画布联动检查通过。'); return;
   }
   if (process.env.NOVEL_SMOKE_REOPEN) {
-    const report = JSON.parse(readFileSync(join(output, 'smoke-result.json'), 'utf8')) as { projectId: string; title: string; revision: number; regressionProjectId: string; closeSceneId: string; closeText: string; interruptedRunId: string };
+    const report = JSON.parse(readFileSync(join(output, 'smoke-result.json'), 'utf8')) as { projectId: string; title: string; revision: number; regressionProjectId: string; closePassageId: string; closeText: string; interruptedRunId: string };
     const reopened = store.getProject(report.projectId);
     assert.equal(reopened.title, report.title); assert.equal(reopened.revision, report.revision);
     assert.ok(store.getRuns(report.projectId).some(run => run.stage === 'chapter' && run.status === 'completed'));
     assert.ok(store.history(report.projectId).some(batch => batch.undone));
-    assert.equal(store.getProject(report.regressionProjectId).scenes.find(scene => scene.id === report.closeSceneId)?.text, report.closeText);
+    assert.equal(store.getProject(report.regressionProjectId).passages.find(passage => passage.id === report.closePassageId)?.text, report.closeText);
     assert.equal(store.getRun(report.interruptedRunId)?.status, 'cancelled');
     assert.ok(store.getRun(report.interruptedRunId)?.finishedAt, '关闭时尚未收尾的取消任务应在启动后补全结束时间');
     console.log('桌面重启检查通过：作品、任务、撤销记录及关闭前正文已恢复。');
@@ -616,30 +629,30 @@ export async function runSmoke(window: BrowserWindow, store: NovelStore, schedul
   assert.ok(await ui<number>(`document.querySelectorAll('.react-flow__node').length`) > 0);
   assert.ok(await ui<boolean>(`[...document.querySelectorAll('.react-flow__handle')].every(el => getComputedStyle(el).visibility === 'hidden')`), '叙述顺序图没有可绘制连线的手柄');
   const storyTarget = outlined.scenes[0]!.id;
-  const sceneOrderBeforeMove = outlined.scenes.map(({ id, chapterId, order }) => ({ id, chapterId, order }));
+  const passageOrderBeforeMove = outlined.passages.map(({ id, sceneId, chapterId, order }) => ({ id, sceneId, chapterId, order }));
   await ui(`${nodeElement(storyTarget)}.click()`);
   await until(() => ui<boolean>(`(${nodeElement(storyTarget)})?.classList.contains('selected')`), '叙述节点选中');
   await ui(`${nodeElement(storyTarget)}.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }))`);
   await until(() => store.getProject(project.id).layouts[`story:${storyTarget}`], '叙述节点移动保存布局');
-  assert.deepEqual(store.getProject(project.id).scenes.map(({ id, chapterId, order }) => ({ id, chapterId, order })), sceneOrderBeforeMove, '叙述图移动不能修改章节或阅读顺序');
+  assert.deepEqual(store.getProject(project.id).passages.map(({ id, sceneId, chapterId, order }) => ({ id, sceneId, chapterId, order })), passageOrderBeforeMove, '叙述图移动不能修改章节或阅读顺序');
   assert.equal(store.getProject(project.id).revision, outlined.revision, '叙述图布局不增加语义修订');
   await capture('story.png');
   const written: AgentRun = await stage('chapter', 'nav-write', 'run-chapter');
   const manuscript = store.getProject(project.id);
-  assert.ok(manuscript.scenes.some(scene => scene.text.trim().length > 50));
+  assert.ok(manuscript.passages.some(passage => passage.text.trim().length > 50));
   assert.ok(written.steps.some(step => /角色|代入/.test(step.label)), '缺少独立角色步骤');
   assert.ok(written.steps.some(step => /读者/.test(step.label)), '缺少读者评审');
-  assert.equal(written.sceneId, undefined, '明确选择整章生成时不发送单场景范围');
+  assert.equal(written.passageId, undefined, '明确选择整章生成时不发送单场景范围');
   await setPanel('ai', false); await until(() => ui<boolean>(`document.querySelector('[data-testid="prose-editor"]')?.value.length > 50`), '真实正文编辑器');
   await capture('writer.png'); await click('nav-home'); await capture('overview.png');
   await click('nav-read'); await capture('reader.png');
-  const firstText = manuscript.scenes.find(scene => scene.text.trim())!.text.split('\n').find(paragraph => paragraph.trim())!.slice(0, 20);
+  const firstText = manuscript.passages.find(passage => passage.text.trim())!.text.split('\n').find(paragraph => paragraph.trim())!.slice(0, 20);
   await until(() => ui<boolean>(`document.querySelector('.reader-scroll')?.textContent.includes(${JSON.stringify(firstText)})`), '阅读器显示真实正文');
   await click('nav-monitor'); await capture('monitor.png');
   await click('undo-task');
   await until(() => store.history(project.id).some(batch => batch.taskId === written.id && batch.undone), '撤销章节任务');
   const undone = store.getProject(project.id);
-  assert.ok(undone.scenes.every(scene => !scene.text.trim()), '任务正文未撤销');
+  assert.ok(undone.passages.every(passage => !passage.text.trim()), '任务正文未撤销');
 
   await click('nav-idea');
   const previousCard = store.getProject(project.id).cards[0]!;
@@ -671,9 +684,9 @@ export async function runSmoke(window: BrowserWindow, store: NovelStore, schedul
     { type: 'putCanvasLink', value: { id: ids.link, source: ids.group, target: ids.note } },
     { type: 'putChapter', value: { id: laterChapter, title: '排序靠后的章节', order: 20 } },
     { type: 'putChapter', value: { id: ids.earlyChapter, title: '排序靠前的章节', order: 10 } },
-    { type: 'putScene', value: { id: ids.laterScene, chapterId: laterChapter, order: 8, title: '数组首项但排序靠后', povId: null, eventIds: [], outline: '', text: '靠后场景正文' } },
-    { type: 'putScene', value: { id: ids.earlyScene, chapterId: ids.earlyChapter, order: 7, title: '正确的默认场景', povId: null, eventIds: [], outline: '', text: prose } },
-    { type: 'putScene', value: { id: ids.duplicateScene, chapterId: laterChapter, order: 9, title: '同章重复顺序占位', povId: null, eventIds: [], outline: '', text: '同章已有正文' } },
+    ...scene(ids.laterScene, laterChapter, 8, '靠后场景正文', { title: '数组首项但排序靠后', povId: null, eventIds: [], outline: '' }),
+    ...scene(ids.earlyScene, ids.earlyChapter, 7, prose, { title: '正确的默认场景', povId: null, eventIds: [], outline: '' }),
+    ...scene(ids.duplicateScene, laterChapter, 9, '同章已有正文', { title: '同章重复顺序占位', povId: null, eventIds: [], outline: '' }),
   ];
   store.execute({ projectId: regression.id, expectedRevision: initial.revision, commands, actor: 'human', label: '桌面回归夹具' });
   window.webContents.reload();
@@ -711,13 +724,15 @@ export async function runSmoke(window: BrowserWindow, store: NovelStore, schedul
   await until(() => { const card = current().cards.find(item => item.id === ids.note); return card?.title === '便笺编辑后选分组' && card.groupId === ids.group; }, '卡片标题与分组都保存');
   await fillField('灵感与备注', '备注编辑后移出分组'); await blurAndSelect('所属分组', '');
   await until(() => { const card = current().cards.find(item => item.id === ids.note); return card?.content === '备注编辑后移出分组' && !card.groupId; }, '卡片备注与分组都保存');
-  const convertedChapter = [...current().chapters].sort((a, b) => a.order - b.order)[0]!.id;
-  const maximumOrder = Math.max(0, ...current().scenes.filter(scene => scene.chapterId === convertedChapter).map(scene => scene.order));
+  // A converted note joins the story where it is being written: at the end of the last chapter in reading order.
+  const convertedChapter = [...current().chapters].sort((a, b) => a.order - b.order).at(-1)!.id;
+  const maximumOrder = Math.max(0, ...current().passages.filter(passage => passage.chapterId === convertedChapter).map(passage => passage.order));
   await clickText('转换为叙述场景');
   await until(() => current().cards.find(item => item.id === ids.note)?.kind === 'scene', '便笺转换');
   const convertedId = current().cards.find(item => item.id === ids.note)!.refId;
-  assert.equal(current().scenes.find(scene => scene.id === convertedId)?.chapterId, convertedChapter, '便笺转换应采用排序后的默认章节');
-  assert.equal(current().scenes.find(scene => scene.id === convertedId)?.order, maximumOrder + 1, '便笺转换应接在章内最大序号之后');
+  const converted = current().passages.find(passage => passage.sceneId === convertedId)!;
+  assert.equal(converted.chapterId, convertedChapter, '便笺转换应放进排序最后的一章');
+  assert.equal(converted.order, maximumOrder + 1, '便笺转换应接在章内最大序号之后');
 
   await setPanel('details', true); await setPanel('ai', true);
   assert.ok(await ui<boolean>(`!!document.querySelector('.ai-sidebar') && !!document.querySelector('.board-inspector') && !document.querySelector('.main').inert`), '1510宽度详情与AI并排');
@@ -765,17 +780,17 @@ export async function runSmoke(window: BrowserWindow, store: NovelStore, schedul
   assert.equal(await ui<string>(`document.querySelector('[data-testid="chapter-scope"]')?.value`), 'scene', '从写作准备生成默认单场景');
   assert.equal(await ui<string>(`document.querySelector('[data-testid="target-scene"]')?.value`), ids.earlyScene);
   assert.equal(await ui<boolean>(`document.querySelector('[data-testid="run-chapter"]')?.disabled`), true, '已有正文的场景不能重复生成');
-  await ui(setValue(element('[data-testid="target-scene"]'), convertedId!, 'change'));
+  await ui(setValue(element('[data-testid="target-scene"]'), converted.id, 'change'));
   assert.equal(await ui<string>(`document.querySelector('.writer-toolbar h2')?.textContent`), '正确的默认场景', 'AI目标选择不切换编辑器场景');
   await click('run-chapter');
   const singleSceneRun = await until(() => store.getRuns(regression.id).find(run => run.stage === 'chapter'), '指定空白场景生成');
-  assert.equal(singleSceneRun.sceneId, convertedId);
+  assert.equal(singleSceneRun.passageId, converted.id);
   assert.equal((await finished(singleSceneRun.id)).status, 'completed');
-  assert.equal(current().scenes.find(scene => scene.id === ids.earlyScene)?.text, prose, '单场景生成保留其他正文');
-  assert.equal(current().scenes.find(scene => scene.id === ids.laterScene)?.text, '靠后场景正文');
+  assert.equal(current().passages.find(passage => passage.id === ids.earlyScene)?.text, prose, '单场景生成保留其他正文');
+  assert.equal(current().passages.find(passage => passage.id === ids.laterScene)?.text, '靠后场景正文');
   await click('undo-result');
   await until(() => store.history(regression.id).some(batch => batch.taskId === singleSceneRun.id && batch.undone), '产出区域就地撤销');
-  assert.equal(current().scenes.find(scene => scene.id === convertedId)?.text, '');
+  assert.equal(current().passages.find(passage => passage.id === converted.id)?.text, '');
   await ui(setValue(element('[data-testid="target-scene"]'), ids.earlyScene, 'change'));
   await ui(setValue(element('[data-testid="chapter-scope"]'), 'chapter', 'change'));
   assert.equal(await ui<string>(`document.querySelector('[data-testid="target-chapter"]')?.value`), ids.earlyChapter);
@@ -791,9 +806,9 @@ export async function runSmoke(window: BrowserWindow, store: NovelStore, schedul
   assert.equal(store.getRuns(regression.id).length, beforeSelectRuns, '改写行动只准备任务');
   await click('run-rewrite');
   const rewrite = await until(() => store.getRuns(regression.id).find(run => run.stage === 'rewrite'), '默认场景改写启动');
-  assert.equal(rewrite.sceneId, ids.earlyScene); assert.equal((await finished(rewrite.id)).status, 'completed');
-  assert.equal(current().scenes.find(scene => scene.id === ids.laterScene)?.text, '靠后场景正文');
-  assert.ok(current().scenes.find(scene => scene.id === ids.earlyScene)!.text.endsWith(prose.slice(12)), '改写保留选区之外的正文');
+  assert.equal(rewrite.passageId, ids.earlyScene); assert.equal((await finished(rewrite.id)).status, 'completed');
+  assert.equal(current().passages.find(passage => passage.id === ids.laterScene)?.text, '靠后场景正文');
+  assert.ok(current().passages.find(passage => passage.id === ids.earlyScene)!.text.endsWith(prose.slice(12)), '改写保留选区之外的正文');
 
   await ui(`(() => { const el = document.querySelector('[data-testid="prose-editor"]'); el.focus(); el.setSelectionRange(0, 8); el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); })()`);
   await click('prepare-rewrite'); await fill('ai-objective', '不要带到另一部作品的选段指令');
@@ -818,7 +833,7 @@ export async function runSmoke(window: BrowserWindow, store: NovelStore, schedul
   await ui(`[...document.querySelectorAll('.story-memory button')].find(el => el.textContent === '立即整理')?.click()`);
   await until(() => ui<boolean>(`document.querySelector('.story-memory .pill')?.textContent === '已是最新'`), '故事记忆整理完成');
   const memory = new StoryView(current(), store.getStoryDigests(regression.id)).coverage();
-  assert.ok(memory.scenesWithText > 0 && memory.pending === 0, '故事记忆覆盖全部已写场景');
+  assert.ok(memory.passagesWithText > 0 && memory.pending === 0, '故事记忆覆盖全部已写场景');
   assert.ok(store.getStoryDigests(regression.id).some(digest => digest.kind === 'book'), '故事记忆生成全书梗概');
   await capture('story-memory.png');
 
@@ -826,29 +841,29 @@ export async function runSmoke(window: BrowserWindow, store: NovelStore, schedul
   await ui(`[...document.querySelectorAll('.scene-row > button')].find(el => el.querySelector('strong')?.textContent === '数组首项但排序靠后').click()`);
   await until(() => ui<boolean>(`document.querySelector('.writer-toolbar h2')?.textContent === '数组首项但排序靠后'`), '队列恢复场景');
   await clickText('场景大纲');
-  await fillField('阅读顺序（章内）', '9'); await ui(blurField(field('阅读顺序（章内）')));
+  await fillField('场景标题', '  '); await ui(blurField(field('场景标题')));
   editingField = undefined;
-  await until(() => ui<boolean>(`document.querySelector('.toast.error')?.textContent.includes('场景顺序不能重复')`), '重复顺序保存失败');
-  assert.equal(current().scenes.find(scene => scene.id === ids.laterScene)?.order, 8, '失败操作没有写入领域数据');
-  assert.equal(await ui<string>(`(${field('阅读顺序（章内）')})?.value`), '9', '普通字段保存失败保留输入');
+  await until(() => ui<boolean>(`document.querySelector('.toast.error')?.textContent.includes('场景标题')`), '空标题保存失败');
+  assert.equal(current().scenes.find(scene => scene.id === ids.laterScene)?.title, '数组首项但排序靠后', '失败操作没有写入领域数据');
+  assert.equal(await ui<string>(`(${field('场景标题')})?.value`), '  ', '普通字段保存失败保留输入');
   await ui(`document.querySelector('[data-testid="nav-home"]').click()`); await delay(180);
   assert.ok(await ui<boolean>(`!!document.querySelector('.app.view-write')`), '普通字段失败草稿阻止离开页面');
-  assert.equal(await ui<string>(`(${field('阅读顺序（章内）')})?.value`), '9');
-  await fillField('阅读顺序（章内）', '8'); await ui(blurField(field('阅读顺序（章内）'))); editingField = undefined;
+  assert.equal(await ui<string>(`(${field('场景标题')})?.value`), '  ');
+  await fillField('场景标题', '数组首项但排序靠后'); await ui(blurField(field('场景标题'))); editingField = undefined;
   await until(() => ui<boolean>(`!document.querySelector('.inspector-body .field-error')`), '重新编辑修复失败草稿');
   const countBeforeRecovery = current().scenes.length;
   await ui(`[...document.querySelectorAll('.chapter-block')].find(el => el.querySelector('.chapter-title input')?.value === '排序靠后的章节').querySelector('.add-scene').click()`);
   await until(() => current().scenes.length === countBeforeRecovery + 1, '失败队列后仍可新增场景');
   await ui(`[...document.querySelectorAll('.scene-row > button')].find(el => el.querySelector('strong')?.textContent === '正确的默认场景').click()`);
   await until(() => ui<boolean>(`document.querySelector('.writer-toolbar h2')?.textContent === '正确的默认场景'`), '回到冲突测试场景');
-  const savedBeforeConflict = current().scenes.find(scene => scene.id === ids.earlyScene)!.text;
+  const savedBeforeConflict = current().passages.find(passage => passage.id === ids.earlyScene)!.text;
   const draft = '这个人工草稿必须在冲突后留在编辑器。';
   await ui(`document.querySelector('[data-testid="prose-editor"]').dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }))`);
   await fill('prose-editor', draft);
-  const conflicting = scheduler.start({ projectId: regression.id, stage: 'rewrite', sceneId: ids.earlyScene, chapterId: ids.earlyChapter, selection: { start: 0, end: 12 }, objective: '模拟另一项保存与人工草稿冲突' });
+  const conflicting = scheduler.start({ projectId: regression.id, stage: 'rewrite', passageId: ids.earlyScene, chapterId: ids.earlyChapter, selection: { start: 0, end: 12 }, objective: '模拟另一项保存与人工草稿冲突' });
   assert.equal((await finished(conflicting.id)).status, 'completed');
   await until(() => ui<boolean>(`!!document.querySelector('.conflict-banner')`), '正文冲突提示');
-  assert.notEqual(current().scenes.find(scene => scene.id === ids.earlyScene)!.text, savedBeforeConflict);
+  assert.notEqual(current().passages.find(passage => passage.id === ids.earlyScene)!.text, savedBeforeConflict);
   const countBeforeConflict = current().scenes.length;
   await ui(`document.querySelector('.chapter-block .add-scene').click()`);
   await until(() => ui<boolean>(`document.querySelector('.toast.error')?.textContent.includes('冲突')`), '冲突阻止新增场景');
@@ -869,9 +884,9 @@ export async function runSmoke(window: BrowserWindow, store: NovelStore, schedul
   await ui(setValue("document.querySelector('[data-testid=\"prose-editor\"]')", closeText));
   await delay(40);
   await closeWindow();
-  assert.equal(current().scenes.find(scene => scene.id === ids.earlyScene)?.text, closeText);
+  assert.equal(current().passages.find(passage => passage.id === ids.earlyScene)?.text, closeText);
   const report = { projectId: project.id, title: undone.title, revision: undone.revision,
-    regressionProjectId: regression.id, closeSceneId: ids.earlyScene, closeText, interruptedRunId,
+    regressionProjectId: regression.id, closePassageId: ids.earlyScene, closeText, interruptedRunId,
     checks: ['SQLite', 'safeStorage', 'preload IPC', '对话框创建作品', '六项主要导航（含文风）', '构思', '双线大纲', '叙述图不改章节或顺序', '独立角色参考', '整章与单场景正文范围', '读者评审', '阅读器', '任务撤销', '表单连续编辑', '对象草稿隔离', '类型标签与类型连续修改', '便笺场景顺序', 'AI引用与选区不隐式执行', '项目切换清空AI上下文', '批量删除影响去重与整体撤销', '1510与1080单侧栏互斥', '默认改写目标与选段预览', '章节目标标签', '阅读切章计时器', '普通字段失败草稿保护与恢复', '失败队列后继续编辑', '冲突草稿拒绝新增与关闭', '关闭前保存', '中断取消任务恢复', '故事记忆整理'],
     callsRealModel: false, screenshots: ['overview.png', 'writer.png', 'world.png', 'story.png', 'reader.png', 'monitor.png', '1080.png', 'story-memory.png'] };
   writeFileSync(join(output, 'smoke-result.json'), JSON.stringify(report, null, 2), 'utf8');

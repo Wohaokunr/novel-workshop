@@ -1,12 +1,12 @@
 import { ArrowRight, Check, Clapperboard, FileText, Globe, Lightbulb, PenLine, PenTool, Sparkles, Users, Wand2 } from 'lucide-react';
 import { styleProfile } from '../../shared/style-types';
-import type { AgentRun, NarrativeScene, RunRequest, SourceReference, Workspace } from '../../shared/types';
+import type { AgentRun, Passage, RunRequest, SourceReference, Workspace } from '../../shared/types';
+import { chapterTarget, DEFAULT_CHAPTER_CHARS, passageLabel, proseChars } from '../../shared/structure';
 import { Field, StatusPill, events, runStatus, taskLabel, type Commit } from '../ui';
 import type { AssistAction, View } from '../types';
 import { useCompanion } from '../Companion';
 import { storyFlow, storyGaps, type FlowAssist } from '../../shared/story-flow';
 
-const count = (text: string) => text.replace(/\s/g, '').length;
 
 function ago(iso: string) {
   const minutes = Math.floor((Date.now() - new Date(iso).getTime()) / 60000);
@@ -24,8 +24,8 @@ const focusField = (name: string) => {
   input?.focus({ preventScroll: true });
 };
 
-export function Home({ workspace: w, scene, commit, setView, onAssist, onPrepare, runs, onMonitor }: {
-  workspace: Workspace; scene?: NarrativeScene; commit: Commit; setView: (v: View) => void; onAssist: AssistAction;
+export function Home({ workspace: w, passage, commit, setView, onAssist, onPrepare, runs, onMonitor }: {
+  workspace: Workspace; passage?: Passage; commit: Commit; setView: (v: View) => void; onAssist: AssistAction;
   onPrepare: (stage: RunRequest['stage'], refs: SourceReference[]) => void; runs: AgentRun[]; onMonitor: (id: string) => void;
 }) {
   const companion = useCompanion();
@@ -38,7 +38,7 @@ export function Home({ workspace: w, scene, commit, setView, onAssist, onPrepare
   const flow = storyFlow(w);
   const gaps = storyGaps(w);
   const flowAssist = (id: string) => flow.find(stage => stage.id === id)!.assist!;
-  const words = w.scenes.reduce((n, s) => n + count(s.text), 0);
+  const words = w.passages.reduce((n, p) => n + proseChars(p.text), 0);
   const objects = w.objects.filter(o => !o.event).length;
   const worldEvents = events(w).length;
   const stats = [
@@ -50,9 +50,11 @@ export function Home({ workspace: w, scene, commit, setView, onAssist, onPrepare
   const steps = flow.map(stage => ({ ...stage, go: () => stage.id === 'profile' ? focusField('brief') : stage.id === 'theme' ? focusField('theme') : setView(stage.view) }));
   const doneSteps = steps.filter(step => step.done).length;
   const next = steps.find(step => !step.done);
-  const chapter = w.chapters.find(chapter => chapter.id === scene?.chapterId);
-  const sceneWords = scene ? count(scene.text) : 0;
-  const tail = scene?.text.trim().slice(-90);
+  const scene = passage ? w.scenes.find(item => item.id === passage.sceneId) : undefined;
+  const chapter = w.chapters.find(chapter => chapter.id === passage?.chapterId);
+  const chapterWords = chapter ? w.passages.reduce((n, p) => n + (p.chapterId === chapter.id ? proseChars(p.text) : 0), 0) : 0;
+  const sceneWords = passage ? proseChars(passage.text) : 0;
+  const tail = passage?.text.trim().slice(-90);
   return <div className="home">
     <section className="home-hero" aria-labelledby="current-work-title">
       <div className="hero-story">
@@ -74,10 +76,10 @@ export function Home({ workspace: w, scene, commit, setView, onAssist, onPrepare
       </div>
       <div className="resume-card">
         <span className="eyebrow">{scene ? '上次写到' : '从这里开始'}</span>
-        <strong title={scene?.title}>{scene ? scene.title : '灵感画布'}</strong>
-        <small>{scene ? `${chapter?.title ?? '未分章'} · ${sceneWords.toLocaleString()} 字` : '记录灵感，再整理为人物、事件与场景'}</small>
+        <strong title={scene?.title}>{scene && passage ? passageLabel(w, passage) : '灵感画布'}</strong>
+        <small>{scene ? `${chapter?.title ?? '未分章'} · 本章 ${chapterWords.toLocaleString()} / ${chapterTarget(w).toLocaleString()} 字` : '记录灵感，再整理为人物、事件与场景'}</small>
         {scene && <blockquote className={tail ? 'resume-excerpt' : 'resume-excerpt is-empty'}>
-          {tail ? `${scene.text.trim().length > 90 ? '…' : ''}${tail}` : scene.outline.trim() ? `场景大纲：${scene.outline.trim()}` : '这一场还没有正文，从第一句开始。'}
+          {tail ? `${passage!.text.trim().length > 90 ? '…' : ''}${tail}` : passage?.beat?.trim() ? `本段要点：${passage.beat.trim()}` : scene.outline.trim() ? `场景大纲：${scene.outline.trim()}` : '这一场还没有正文，从第一句开始。'}
         </blockquote>}
         <button className="primary" data-testid="continue-writing" onClick={() => setView(scene ? 'write' : 'canvas')}>{scene ? <FileText aria-hidden="true"/> : <Lightbulb aria-hidden="true"/>}{scene && !sceneWords ? '开始写这一场' : '继续创作'}<ArrowRight aria-hidden="true"/></button>
       </div>
@@ -87,7 +89,8 @@ export function Home({ workspace: w, scene, commit, setView, onAssist, onPrepare
         <section className="panel">
           <div className="section-heading"><div><h2>作品信息</h2><p className="muted">AI 以这些信息作为创作依据。</p></div></div>
           <Field label="作品名称" value={w.title} onSave={title => commit([{ type: 'updateNovel', patch: { title } }])}/>
-          <div className="form-grid"><Field label="题材" value={w.genre} placeholder="悬疑、奇幻、现实主义…" onSave={genre => commit([{ type: 'updateNovel', patch: { genre } }])}/><Field label="目标读者" value={w.audience} placeholder="谁会喜欢这个故事？" onSave={audience => commit([{ type: 'updateNovel', patch: { audience } }])}/></div>
+          <div className="form-grid"><Field label="题材" value={w.genre} placeholder="悬疑、奇幻、现实主义…" onSave={genre => commit([{ type: 'updateNovel', patch: { genre } }])}/><Field label="目标读者" value={w.audience} placeholder="谁会喜欢这个故事？" onSave={audience => commit([{ type: 'updateNovel', patch: { audience } }])}/>
+            <Field label="每章字数" type="number" value={w.chapterTarget ?? ''} placeholder={`${DEFAULT_CHAPTER_CHARS}（默认）`} onSave={value => commit([{ type: 'updateNovel', patch: { chapterTarget: value.trim() ? Number(value) : null } }], '调整每章字数')}/></div>
           <Field className="home-field-brief" label="创作简述" multiline value={w.brief} placeholder="核心冲突、故事方向，或一个还不确定的念头。" onSave={brief => commit([{ type: 'updateNovel', patch: { brief } }])}/>
           <div className="button-row panel-actions">
             {gaps.emptyFields.length > 0 && <button className="secondary" data-testid="home-develop-profile" title={`还空着：${gaps.emptyFields.join('、')}`} onClick={event => assist(event, flowAssist('profile'))}><Wand2 aria-hidden="true"/>AI 补全作品信息</button>}

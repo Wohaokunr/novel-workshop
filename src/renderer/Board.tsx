@@ -4,7 +4,9 @@ import { AlignCenterHorizontal, AlignCenterVertical, AlignEndHorizontal, AlignEn
 import { ReactFlow, Background, BackgroundVariant, Controls, Handle, MarkerType, MiniMap, NodeResizer, Position, ViewportPortal, applyNodeChanges, type Node, type Edge, type NodeProps, type Connection, type ReactFlowInstance, type NodeChange, type NodePositionChange } from '@xyflow/react';
 import type { Workspace, Command, NovelObject, NarrativeScene, CanvasCard, SourceReference, RunRequest } from '../shared/types';
 import { alignPositions, assignedCards, canResizeGroup, cardRect, cardSize, collapsedGroupSize, containingGroup, createdGroup, distributePositions, dissolvedGroup, fitGroups, groupSize, isDescendant, layeredLayout, movedCards, orderedCards, rootCards, snapPosition, tidyCards, visibleCardId, visibleLinks, type AlignGuide, type AlignMode, type IdRect, type Placement, type Point, type Rect, type CardSizes, type Size } from '../shared/canvas';
-import { Combobox, Field, Kbd, Popover, Select, type ComboItem, type Commit, uid, fire, characters, orderedChapters, orderedScenes, events, colors } from './ui';
+import { Combobox, Field, Kbd, Popover, Select, type ComboItem, type Commit, uid, fire, characters, orderedChapters, orderedPassages, orderedScenes, sceneChapters, events, colors } from './ui';
+import { newChapter, passageOrderAt, scenePassages } from '../shared/structure';
+import { labelledAspects, storyTimeline } from '../shared/story-state';
 import { motionDuration, usePresence } from './interaction';
 import { useCompanion, type SummonRequest } from './Companion';
 import type { CompanionFocus } from '../shared/companion-types';
@@ -116,12 +118,16 @@ export default function Board({ mode, workspace: w, commit, selectedObject, sele
     return fieldId && typeof value.fields[fieldId] === 'string' ? value.fields[fieldId] as string : '';
   };
   const cardTitle = (value: CanvasCard): string => value.kind === 'object' ? w.objects.find(object => object.id === value.refId)?.name || value.title : value.kind === 'scene' ? w.scenes.find(scene => scene.id === value.refId)?.title || value.title : value.title;
+  /** A character's or setting's state by the end of the story so far; for an event, how it changes the people and places it touches. */
   const stateSummary = (value: NovelObject): string => {
-    if (value.typeId === 'character') {
-      const latest = (w.characterStates ?? []).filter(state => state.characterId === value.id).sort((a, b) => (es.find(event => event.id === b.eventId)?.event!.worldOrder ?? -1) - (es.find(event => event.id === a.eventId)?.event!.worldOrder ?? -1))[0];
-      return latest ? `心理：${latest.psychology} · 视角：${latest.perspective}` : '';
-    }
-    return value.event ? (w.characterStates ?? []).filter(state => state.eventId === value.id).map(state => `${chars.find(character => character.id === state.characterId)?.name || '人物'}：${state.psychology}`).join('；') : '';
+    const aspects = (values: Record<string, string>, count: number) => Object.entries(labelledAspects(values)).slice(0, count).map(([label, text]) => `${label}：${text}`).join(' · ');
+    if (value.event) return w.stateChanges.filter(change => change.eventId === value.id).map(change => `${w.objects.find(object => object.id === change.subjectId)?.name || '人物'} ${aspects(change.aspects, 1)}`).join('；');
+    return aspects(Object.fromEntries([...storyTimeline(w).stateAt(value.id, { end: true })].map(([key, held]) => [key, held.value])), 2);
+  };
+  /** Why a scene cannot be drafted from its outline: it has no chapter yet, or every passage of it already has prose. */
+  const draftBlocker = (value: NarrativeScene): string => {
+    const parts = scenePassages(w, value.id);
+    return !parts.length ? '这一场还没放进章节，先在场景详情里选择章节' : parts.some(part => !part.text.trim()) ? '' : '已有正文，请进入写作选择文字改写';
   };
 
   const beginGesture = () => { gesture.current = true; gestureCards.current = workspaceRef.current.cards; setMenu(null); };
@@ -191,7 +197,7 @@ export default function Board({ mode, workspace: w, commit, selectedObject, sele
     } else {
       graphNodes = scenes.map((value, index) => {
         const lane = povLane(value);
-        return { id: value.id, type: 'story', position: w.layouts[`story:${value.id}`] || storyDefault(value, index), data: { label: value.title, content: value.outline, kind: 'scene', connectable: false, tag: w.chapters.find(chapter => chapter.id === value.chapterId)?.title || '叙述场景', badge: `阅读 ${index + 1}`, tint: colors[lane % colors.length], people: [chars.find(character => character.id === value.povId)?.name || '全知 / 外部视角', ...sceneElements(w, value).places.slice(0, 2), `${value.eventIds.length} 个世界事件`] } };
+        return { id: value.id, type: 'story', position: w.layouts[`story:${value.id}`] || storyDefault(value, index), data: { label: value.title, content: value.outline, kind: 'scene', connectable: false, tag: sceneChapters(w, value.id), badge: `阅读 ${index + 1}`, tint: colors[lane % colors.length], people: [chars.find(character => character.id === value.povId)?.name || '全知 / 外部视角', ...sceneElements(w, value).places.slice(0, 2), `${value.eventIds.length} 个世界事件`] } };
       });
       edges = scenes.slice(1).map((value, index) => ({ id: `next:${scenes[index].id}:${value.id}`, source: scenes[index].id, target: value.id, type: 'smoothstep', markerEnd: { type: MarkerType.ArrowClosed }, style: { stroke: colors[(value.povId ? chars.findIndex(character => character.id === value.povId) : chars.length) % colors.length], strokeWidth: 2 } }));
     }
@@ -238,7 +244,7 @@ export default function Board({ mode, workspace: w, commit, selectedObject, sele
     setMenu(null);
   };
   const createSceneOrEvent = (point = viewCenter()) => {
-    fire((mode === 'world' ? addEvent({ x: point.x - cardSize.width / 2, y: point.y - cardSize.height / 2 }) : addScene(scene?.chapterId, { x: point.x - cardSize.width / 2, y: point.y - cardSize.height / 2 })).then(async id => { if (id) { onInspectorChange?.(true); await requestSelection([id]); } }));
+    fire((mode === 'world' ? addEvent({ x: point.x - cardSize.width / 2, y: point.y - cardSize.height / 2 }) : addScene(scene ? scenePassages(w, scene.id).at(-1)?.chapterId : undefined, { x: point.x - cardSize.width / 2, y: point.y - cardSize.height / 2 })).then(async id => { if (id) { onInspectorChange?.(true); await requestSelection([id]); } }));
     setMenu(null);
   };
   const groupSelection = () => {
@@ -292,9 +298,12 @@ export default function Board({ mode, workspace: w, commit, selectedObject, sele
         const textField = current.objectTypes.find(type => type.id === typeId)?.fields.find(field => field.kind === 'text');
         return [{ type: 'putObject', value: { id, typeId, name: value.title, fields: textField ? { [textField.id]: value.content } : {}, ...(typeId === 'event' ? { event: { worldOrder: Math.max(0, ...events(current).map(event => event.event!.worldOrder)) + 1, timeLabel: '', thread: '主线', participants: [], causes: [], critical: false, observations: {} } } : {}) } }, { type: 'putCard', value: { ...value, kind: 'object', refId: id, content: textField ? '' : value.content } }];
       }
-      const chapter = orderedChapters(current)[0] ?? { id: uid(), title: '第一章', order: 1 };
+      // Like a scene added on the story board: opened at the end of the last chapter, ready to write.
+      const chapter = orderedChapters(current).at(-1) ?? newChapter(current, uid());
       const commands: Command[] = current.chapters.length ? [] : [{ type: 'putChapter', value: chapter }];
-      commands.push({ type: 'putScene', value: { id, chapterId: chapter.id, order: Math.max(0, ...current.scenes.filter(scene => scene.chapterId === chapter.id).map(scene => scene.order)) + 1, title: value.title, povId: null, eventIds: [], outline: value.content, text: '' } }, { type: 'putCard', value: { ...value, kind: 'scene', refId: id, content: '' } });
+      commands.push({ type: 'putScene', value: { id, title: value.title, povId: null, eventIds: [], outline: value.content } },
+        { type: 'putPassage', value: { id: uid(), sceneId: id, chapterId: chapter.id, order: passageOrderAt(current, chapter.id), text: '' } },
+        { type: 'putCard', value: { ...value, kind: 'scene', refId: id, content: '' } });
       return commands;
     }, typeId ? '便笺转换为小说对象' : '便笺转换为叙述场景'));
   };
@@ -361,10 +370,13 @@ export default function Board({ mode, workspace: w, commit, selectedObject, sele
     { icon: Columns3, label: '按支线泳道', hint: '每条支线一列，按世界顺序自上而下', disabled: !es.length, run: () => arrange('按支线泳道整理', () => layoutCommands(es.map(value => ({ id: value.id, ...worldDefault(value) })))) },
   ] : [
     { icon: ListOrdered, label: '按视角泳道', hint: '每个视角人物一列，按阅读顺序自上而下', disabled: !scenes.length, run: () => arrange('按视角泳道整理', () => layoutCommands(scenes.map((value, index) => ({ id: value.id, ...storyDefault(value, index) })))) },
-    { icon: Rows3, label: '按章节分行', hint: '每章一行，场景按阅读顺序从左到右', disabled: !scenes.length, run: () => arrange('按章节整理叙述顺序', current => {
+    { icon: Rows3, label: '按章节分行', hint: '每章一行，跨章的场景排在它开始的那一章，按阅读顺序从左到右', disabled: !scenes.length, run: () => arrange('按章节整理叙述顺序', current => {
       let y = 65;
-      return layoutCommands(orderedChapters(current).flatMap(chapter => {
-        const row = orderedScenes(current).filter(value => value.chapterId === chapter.id);
+      const opens = new Map<string, string>();
+      for (const passage of orderedPassages(current)) if (!opens.has(passage.sceneId)) opens.set(passage.sceneId, passage.chapterId);
+      const ordered = orderedScenes(current);
+      const rows = [...orderedChapters(current).map(chapter => ordered.filter(value => opens.get(value.id) === chapter.id)), ordered.filter(value => !opens.has(value.id))];
+      return layoutCommands(rows.flatMap(row => {
         if (!row.length) return [];
         const top = y; y += Math.max(...row.map(value => nodeSize(value.id).height)) + 80;
         return row.map((value, column) => ({ id: value.id, x: 40 + column * 270, y: top }));
@@ -388,7 +400,7 @@ export default function Board({ mode, workspace: w, commit, selectedObject, sele
   ];
   const referenceItems: ComboItem[] = [
     ...w.objects.map(value => ({ id: `object:${value.id}`, label: value.name, group: value.event ? '世界事件' : w.objectTypes.find(type => type.id === value.typeId)?.name ?? '小说素材', hint: w.cards.some(item => item.kind === 'object' && item.refId === value.id) ? '已在画布' : undefined })),
-    ...scenes.map(value => ({ id: `scene:${value.id}`, label: value.title, group: '叙述场景', hint: w.cards.some(item => item.kind === 'scene' && item.refId === value.id) ? '已在画布' : w.chapters.find(chapter => chapter.id === value.chapterId)?.title })),
+    ...scenes.map(value => ({ id: `scene:${value.id}`, label: value.title, group: '叙述场景', hint: w.cards.some(item => item.kind === 'scene' && item.refId === value.id) ? '已在画布' : sceneChapters(w, value.id) })),
   ];
   const addReference = (item: ComboItem, point?: Point) => { const [kind, ...id] = item.id.split(':'); createCard(kind as CanvasCard['kind'], id.join(':'), point); };
   /** Board-wide actions: the light partner first (in place, one-click adopt); multi-step work goes to the agent. */
@@ -526,7 +538,7 @@ export default function Board({ mode, workspace: w, commit, selectedObject, sele
         {mode === 'canvas' && selectedIds.length > 1 && <button className="small ghost ai-action" data-testid="selection-link" onClick={event => summon(above(event), sourceReferences(selectedIds), linkMessage, `连线 · 已选 ${selectedIds.length} 张`)}><Link2 aria-hidden="true" />自动连线</button>}
         {mode === 'world' && <button className="small ghost ai-action" onClick={event => summon(above(event), sourceReferences(selectedIds), `「${nodeTitle(selectedIds[0]!)}」背后还缺什么前因？给我几个可能的起点。`, '补前因')}><Sparkles aria-hidden="true" />补前因</button>}
         {(hasSelectedGroup || mode === 'world') && <button className="small ghost ai-action" onClick={event => summon(above(event), sourceReferences(selectedIds), mode === 'world' ? '根据选中的世界事件，安排读者看到的章节与场景。' : '根据选中分组里的素材展开大纲。', '展开大纲', 'outline')}>{mode === 'world' ? '据此展开场景' : '据分组展开大纲'}</button>}
-        {selectedStoryScene && <button className="small ghost ai-action" disabled={!!selectedStoryScene.text.trim()} title={selectedStoryScene.text.trim() ? '已有正文，请进入写作选择文字改写' : '根据当前场景大纲生成正文'} onClick={() => onPrepare('chapter', [{ kind: 'scene', id: selectedStoryScene.id }])}>生成当前场景</button>}
+        {selectedStoryScene && <button className="small ghost ai-action" disabled={!!draftBlocker(selectedStoryScene)} title={draftBlocker(selectedStoryScene) || '根据当前场景大纲生成正文'} onClick={() => onPrepare('chapter', [{ kind: 'scene', id: selectedStoryScene.id }])}>生成当前场景</button>}
         <button className="small ghost ai-action" data-testid="selection-agent-task" title="多步骤目标：交给编排智能体完成，修改经你批准后写入" onClick={() => onPrepare('agent', sourceReferences(selectedIds))}><Bot aria-hidden="true" />交给智能体…</button>
         <span className="toolbar-sep" aria-hidden="true" />
         <button className="small ghost-danger" title="删除选中内容（Delete）" onClick={deleteSelection}><Trash2 aria-hidden="true" />删除选中内容</button>
@@ -574,7 +586,7 @@ export default function Board({ mode, workspace: w, commit, selectedObject, sele
       {card.kind === 'note' && <div className="subsection"><h3>将便笺转为创作内容</h3><div className="convert-row"><select aria-label="便笺转换为小说素材" value="" onChange={event => convertNote(event.target.value)}><option value="">转换为素材类型…</option>{w.objectTypes.map(value => <option key={value.id} value={value.id}>{value.name}</option>)}</select><button className="small" onClick={() => convertNote()}>转换为叙述场景</button></div></div>}
       <div className="subsection"><h3>关联素材</h3>{w.canvasLinks.filter(link => link.source === card.id || link.target === card.id || (card.kind === 'group' && (isDescendant(w.cards, link.source, card.id) || isDescendant(w.cards, link.target, card.id)))).map(link => { const linkedCard = w.cards.find(value => value.id === (link.source === card.id || isDescendant(w.cards, link.source, card.id) ? link.target : link.source)); return <div className="linked-row" key={link.id}><span>{linkedCard && cardTitle(linkedCard)}</span><button className="small ghost" aria-label="移除素材关联" onClick={() => fire(commit([{ type: 'deleteCanvasLink', id: link.id }]))}><Unlink aria-hidden="true" />移除关联</button></div>; })}{!w.canvasLinks.some(link => link.source === card.id || link.target === card.id) && card.kind !== 'group' && <p className="muted">从卡片底部的圆点拖到另一张卡片即可建立关联。</p>}</div>
     </> : mode === 'world' && object?.event ? <><div className="section-heading inspector-head"><div><span className="eyebrow">世界事件 · #{object.event.worldOrder}</span><h3>事件详情</h3></div><button className="icon-button small text-danger" title="删除事件" aria-label="删除事件" onClick={() => fire(askDelete({ type: 'deleteObject', id: object.id }, `删除世界事件「${object.name}」`))}><Trash2 aria-hidden="true" /></button></div><div className="reference-actions"><button className="small" onClick={event => summon(below(event), [{ kind: 'object', id: object.id }], `「${object.name}」之前缺什么前因、之后会引发什么？`, object.name)}><Sparkles aria-hidden="true" />推演事件因果</button><button className="small" onClick={event => summon(below(event), [{ kind: 'object', id: object.id }], `根据「${object.name}」安排读者看到的场景。`, '展开场景', 'outline')}>据此展开场景</button><button className="small ghost" onClick={() => onOpenCanvas('object', object.id)}>{canvasLabel('object', object.id)}<ArrowRight aria-hidden="true" /></button></div>{renderObjectForm(object)}</>
-    : mode === 'story' && scene ? <><div className="section-heading inspector-head"><div><span className="eyebrow">叙述场景</span><h3>场景详情</h3></div><button className="icon-button small text-danger" title="删除场景" aria-label="删除场景" onClick={() => fire(askDelete({ type: 'deleteScene', id: scene.id }, `删除场景「${scene.title}」`))}><Trash2 aria-hidden="true" /></button></div><div className="reference-actions"><button className="small primary" onClick={() => onOpenReference('scene', scene.id)}>进入正文写作<ArrowRight aria-hidden="true" /></button><button className="small" onClick={event => { setMenu(null); const rect = event.currentTarget.getBoundingClientRect(); companion.summon({ mode: 'outline', anchor: { surface: 'outline', references: [{ kind: 'scene', id: scene.id }], outlineNode: { kind: 'scene', id: scene.id } }, screen: { x: rect.left, y: rect.bottom }, message: `完善「${scene.title}」的场景大纲：这一场发生什么、谁的视角、结束时有什么变化。`, label: scene.title }); }}><Sparkles aria-hidden="true" />完善场景大纲</button><button className="small" disabled={!!scene.text.trim()} title={scene.text.trim() ? '已有正文，请进入写作选择文字改写' : '根据场景大纲生成正文'} onClick={() => onPrepare('chapter', [{ kind: 'scene', id: scene.id }])}>生成当前场景</button><button className="small ghost" onClick={() => onOpenCanvas('scene', scene.id)}>{canvasLabel('scene', scene.id)}<ArrowRight aria-hidden="true" /></button></div>{renderSceneForm(scene)}</>
+    : mode === 'story' && scene ? <><div className="section-heading inspector-head"><div><span className="eyebrow">叙述场景</span><h3>场景详情</h3></div><button className="icon-button small text-danger" title="删除场景" aria-label="删除场景" onClick={() => fire(askDelete({ type: 'deleteScene', id: scene.id }, `删除场景「${scene.title}」`))}><Trash2 aria-hidden="true" /></button></div><div className="reference-actions"><button className="small primary" onClick={() => onOpenReference('scene', scene.id)}>进入正文写作<ArrowRight aria-hidden="true" /></button><button className="small" onClick={event => { setMenu(null); const rect = event.currentTarget.getBoundingClientRect(); companion.summon({ mode: 'outline', anchor: { surface: 'outline', references: [{ kind: 'scene', id: scene.id }], outlineNode: { kind: 'scene', id: scene.id } }, screen: { x: rect.left, y: rect.bottom }, message: `完善「${scene.title}」的场景大纲：这一场发生什么、谁的视角、结束时有什么变化。`, label: scene.title }); }}><Sparkles aria-hidden="true" />完善场景大纲</button><button className="small" disabled={!!draftBlocker(scene)} title={draftBlocker(scene) || '根据场景大纲生成正文'} onClick={() => onPrepare('chapter', [{ kind: 'scene', id: scene.id }])}>生成当前场景</button><button className="small ghost" onClick={() => onOpenCanvas('scene', scene.id)}>{canvasLabel('scene', scene.id)}<ArrowRight aria-hidden="true" /></button></div>{renderSceneForm(scene)}</>
     : <div className="inspector-empty"><Network aria-hidden="true" /><p>选择一个{noun}<br />查看与编辑详情</p></div>}</aside>, inspectorHost)}
   </div>;
 }

@@ -19,8 +19,10 @@ export const companionCommonPrompt = prompt('companion.common', `你是小说作
 - 引用已有实体时 targetId/parentId 必须使用 catalog 里的真实 id；新建条目用 ref（如 "a1"、"c1"）并在子条目的 parentRef 中引用。不需要的字段填 null，数组填 []。不要输出删除操作。
 - 人物与连线的操作：addCharacter（title=人物名，content=作者设定：身份、性格、秘密，purpose=他在故事里推动什么，ref 可被 addEvent.people、addScene.povName、link 引用）；updateCharacter（targetId=人物 id，content/purpose 给完整新值）；link（parentId 或 parentRef 与 targetId 是两端，可以是卡片、人物、事件、场景的 id 或 ref，title 写关系，例如“师徒，互相隐瞒”），会在灵感画布上连线；addCause（targetId=结果事件，causes=更早的前因事件）。作品缺人物或点子依赖新人物时就用 addCharacter，已有同名人物直接引用，不要重复创建。
 - 环境（地点、组织、物件与世界规则）与人物同等重要：addSetting（title=环境名，content=环境设定：样貌、氛围、谁在这里，purpose=世界规则或限制，ref 可被 addScene.places、link 引用）；updateSetting（targetId=环境 id，content/purpose 给完整新值）。已有同名环境直接引用，不要重复创建。
-- 场景要有三要素：人物（povName 视角人物 + people 出场人物）、情节（content 写这一场发生什么、冲突与结束时的变化，events 填它呈现的世界事件 id 或名称）、环境（places 填发生地点的环境名、id 或 ref）。addScene/updateScene 尽量补齐；updateScene 的 people/places/events 只会追加，不会删除已有关联。其他操作的 places、events 填 []。
-- 新场景必须归入章节：放进已有章节用 parentId=章节 id；需要新章节时先 addChapter（ref，targetId=插在哪一章之后的章节 id 或 ref），再在 addScene/moveScene 的 parentRef 中引用它的 ref。
+- 作品的结构：卷（act）是数十到数百章组成的情节阶段；章是一次连载，约 project.chapterTarget 字；场景独立于章节，一章可以有几场，一场也可以跨几章——catalog.scenes 的 passages 列出它在哪几章里（每章一个场景段，order 是这一段在那一章里的位置）。
+- 场景要有三要素：人物（povName 视角人物 + people 出场人物）、情节（content 写这一场发生什么、冲突与结束时的变化，events 填它呈现的世界事件 id 或名称）、环境（places 填发生地点的环境名、id 或 ref）。addScene/updateScene 尽量补齐；updateScene 的 people/places/events 只会追加，不会删除已有关联。changeState 的 events 填伴随这次变化的世界事件（须是那一场呈现的事件，可为 []），其他操作的 places、events 填 []。
+- 新场景从一章开始：放进已有章节用 parentId=章节 id；需要新章节时先 addChapter（ref，targetId=插在哪一章之后的章节 id 或 ref），再在 addScene/moveScene 的 parentRef 中引用它的 ref。一场写不完、要在下一章接着写时用 continueScene（targetId=场景 id 或 ref，parentId/parentRef=接着写的章节，不填则接到它最后出现那一章的下一章，content 写这一段写到哪里）。
+- 人物是故事的核心，人物与环境的变化本身就是情节：用 changeState 记下关键的转变（targetId=人物或环境的 id、ref 或名字，parentId/parentRef=发生变化的场景 id 或 ref，field=心理/视角/认知/动机/状态/氛围 或作者自己的方面，content=从此以后的状态，purpose=为什么变、正文怎样体现；一个方面一个操作）。只记真正改变的方面，没有变化不要硬造。
 - updateNovel 修改作品信息：field 只能是 theme/logline/brief/genre/audience，content 是完整的新值。其他操作的 field 填 null。
 - character 类 idea 的 title 写成“人物名：一句话”，setting 类 idea 的 title 写成“地点或设定名：一句话”，方便作者一键设为人物或环境。`);
 
@@ -40,15 +42,16 @@ proposals 通常留空；只有当点子需要新人物或新环境，或作者�
 已有事件之间缺少的因果用 addCause 补上；事件需要的新人物用 addCharacter（ref）并在 people 中引用。ideas 可补充不适合直接成为事件的想法。`,
   structure: `模式：叙事结构诊断。先在 reply 中诊断当前叙述顺序：节奏是否拖沓、信息揭露是否过早或过晚、视角分布、高潮位置，引用具体场景标题作证据；再点出三要素不全的场景（catalog.scenes 的 missing 列出缺人物/情节/环境，缺冲突要你自己从大纲判断）。
 再用 proposals 给 2–3 个互相排斥的重构方案（例如换个开篇、推迟揭露、拆分视角、插入一章插叙或喘息），只能使用：
-- moveScene：targetId=场景 id，parentId=目标章节 id（或 parentRef=本方案新建章节的 ref，留在原章时都填 null），order=在目标章节中的位置，从 1 开始。
+- moveScene：targetId=场景 id（跨了几章的场景给要移动的那个场景段 id，见 catalog.scenes 的 passages），parentId=目标章节 id（或 parentRef=本方案新建章节的 ref，留在原章时都填 null），order=在目标章节场景段中的位置，从 1 开始。
+- continueScene：让一场跨到另一章接着写（targetId=场景 id，parentId/parentRef=章节，content=这一段写到哪里）。
 - updateScene：只改 title、content=场景大纲、povName，并可用 people/places/events 补齐三要素。
 - addScene：新建空白场景，content 为大纲，补齐 povName/people/places/events；放进已有章节用 parentId，放进新章节用 parentRef。
-- addChapter：大纲里还没有合适的章节时新建，ref 必填，targetId=插在哪一章之后（catalog.chapters 或 chapterSkeleton 的 id，index 是阅读位置），content 写这一章的任务，parentId=所属幕 id 或 null。
+- addChapter：大纲里还没有合适的章节时新建，ref 必填，targetId=插在哪一章之后（catalog.chapters 或 chapterSkeleton 的 id，index 是阅读位置），content 写这一章的任务，parentId=所属卷 id 或 null。章的篇幅以 chapterTarget 为准（catalog.chapters 的 writtenChars 是已写字数），一章过长时可以拆出一章，把后面的场景移过去。
 - updateChapter：targetId=章节 id，只改 title 与 content=章节概要。
 summary 说明方案带来的阅读体验变化。绝不改写已有正文。`,
-  outline: `模式：分层大纲。依据 target 展开：book → 按所选结构模板给出幕/卷（addAct）；act → 为该幕给出章节（addChapter，parentId=幕 id）；chapter → 为该章给出场景节拍（addScene，parentId=章节 id，content 写这一场发生什么、冲突、结束时的变化，povName/people/places/events 补齐人物、环境与世界事件）；fullDraft=true 时一次给出完整的幕 → 章 → 场景三层草案。
-每层都要有因果推进与情绪起伏，章节 content 写这一章要完成的任务与结尾钩子，幕的 purpose 写它在整体结构中的作用。作者要“几个版本”时给 2–3 个风格明显不同的 proposals，否则给 1 个。已有内容只用 updateAct/updateChapter/updateScene 补充，不重复新建。作品还没有人物时，可在提案开头用 addCharacter 建立主要人物，再在 povName 中引用其 ref。`,
-  beat: `模式：写作卡文时的下一拍。基于当前场景大纲与已写正文末尾，给出 3–4 个“接下来可能发生什么”的 ideas（kind=beat 或 twist/conflict），每个都能直接写成下一段；考虑人物此刻知道什么、想要什么。questions 帮作者确定这一场真正要完成的任务。proposals 留空。`,
+  outline: `模式：分层大纲。依据 target 展开：book → 按所选结构模板给出卷（addAct，每卷是数十到数百章的一个情节阶段）；act → 为该卷给出章节（addChapter，parentId=卷 id）；chapter → 为该章给出场景节拍（addScene，parentId=章节 id，content 写这一场发生什么、冲突、结束时的变化，povName/people/places/events 补齐人物、环境与世界事件；上一章没写完的场景用 continueScene 接到本章，不要另建同名场景）；scene → 补全这一场的三要素，并用 changeState 写下这一场里人物与环境的关键变化（sceneState 是这一场开始时各人的状态）；fullDraft=true 时一次给出完整的卷 → 章 → 场景三层草案。
+一章约 project.chapterTarget 字，按这个篇幅安排每章的场景数量。每层都要有因果推进与情绪起伏，章节 content 写这一章要完成的任务与结尾钩子，卷的 purpose 写它在整体结构中的作用。主要人物在关键场景里的转变（心理、视角、认知、动机）用 changeState 记下，parentRef 引用本方案新建场景的 ref。作者要“几个版本”时给 2–3 个风格明显不同的 proposals，否则给 1 个。已有内容只用 updateAct/updateChapter/updateScene 补充，不重复新建。作品还没有人物时，可在提案开头用 addCharacter 建立主要人物，再在 povName 中引用其 ref。`,
+  beat: `模式：写作卡文时的下一拍。基于当前场景大纲、本段要点（beat）与已写正文末尾，给出 3–4 个“接下来可能发生什么”的 ideas（kind=beat 或 twist/conflict），每个都能直接写成下一段；考虑人物此刻知道什么、想要什么——currentScene.state 是人物与环境在本段开始时的状态，以及作者为这一场计划的变化。questions 帮作者确定这一场真正要完成的任务。proposals 留空。`,
   develop: `模式：补全构想。作者的信息还不完整。尽可能利用已有的一切（作品名、题材、读者、简述、立意、人物、画布便笺、大纲）推断作者真正想写什么，把 target.focus 指定的部分补全。
 - target.round=ask：信息太少，先不给候选。reply 用 1–2 句说出你从已有信息里读出了什么；questions 给 2–3 个带 options 的选择题，问能决定故事方向的事（基调、主角处境、想让读者感受到什么、结局倾向），options 根据作品名与题材推断。ideas、proposals 留空。followUps 第一条写“先直接给我几个版本”。
 - target.round=draft：给 2–3 个风格明显不同的 proposals，每个都是可以直接采纳的完整版本，summary 一句话说明这个版本的侧重；再附最多 3 个带 options 的选择题，帮作者在版本之间收敛。作者已经回答过的问题不要再问，要把回答体现在版本里。

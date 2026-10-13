@@ -25,18 +25,19 @@ export function pickSamples(workspace: Workspace, names: string[], limit = STYLE
   return picked;
 }
 
-function present(workspace: Workspace, scene: NarrativeScene): Array<{ id: string; name: string }> {
-  const ids = new Set<string>([...(scene.povId ? [scene.povId] : []),
+function present(workspace: Workspace, scene: NarrativeScene, prose: string): Array<{ id: string; name: string }> {
+  const ids = new Set<string>([...(scene.povId ? [scene.povId] : []), ...(scene.castIds ?? []),
     ...scene.eventIds.flatMap(id => workspace.objects.find(object => object.id === id)?.event?.participants ?? [])]);
   const characters = workspace.objects.filter(object => object.typeId === 'character');
   // Characters named in the outline or prose are on stage too, even without an event binding.
-  for (const character of characters) if (objectNames(character).some(name => scene.outline.includes(name) || scene.text.includes(name))) ids.add(character.id);
+  for (const character of characters) if (objectNames(character).some(name => scene.outline.includes(name) || prose.includes(name))) ids.add(character.id);
   return characters.filter(character => ids.has(character.id)).map(character => ({ id: character.id, name: character.name }));
 }
 
-/** What the writer must sound like: the author's profile as directives, word lists, voices and a few exemplars. */
-export function writerStyle(workspace: Workspace, scene: NarrativeScene) {
-  const profile = styleProfile(workspace), people = present(workspace, scene);
+/** What the writer must sound like: the author's profile as directives, word lists, voices and a few exemplars. `prose` is the text
+ * being written or reviewed, whose people count as on stage. */
+export function writerStyle(workspace: Workspace, scene: NarrativeScene, prose = '') {
+  const profile = styleProfile(workspace), people = present(workspace, scene, prose);
   const samples = pickSamples(workspace, people.map(person => person.name));
   const voices = profile.voices.filter(voice => people.some(person => person.id === voice.characterId) && voice.voice.trim())
     .map(voice => ({ name: people.find(person => person.id === voice.characterId)!.name, voice: voice.voice }));
